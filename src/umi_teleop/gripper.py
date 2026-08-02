@@ -196,7 +196,11 @@ class GripperDetector:
         self.roi_top_frac = min(max(roi_top_frac, 0.0), 0.95)
         self.target_ids = tuple(target_ids)
         dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, ARUCO_DICT))
-        self._detector = cv2.aruco.ArucoDetector(dictionary, cv2.aruco.DetectorParameters())
+        parameters = cv2.aruco.DetectorParameters()
+        # The jaw tags are small and oblique near the fisheye perimeter. Sampling each bit cell
+        # more densely prevents otherwise clear candidates from failing dictionary decoding.
+        parameters.perspectiveRemovePixelPerCell = 8
+        self._detector = cv2.aruco.ArucoDetector(dictionary, parameters)
         self._cv2 = cv2
 
     def width_mm(self, rgb: np.ndarray) -> float | None:

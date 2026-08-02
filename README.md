@@ -74,7 +74,7 @@ rest:
 sudo apt update
 sudo apt install -y git curl v4l-utils python3-gi gir1.2-gstreamer-1.0 \
   gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good
-sudo usermod -aG video,dialout,gpio aq
+sudo usermod -aG video,dialout aq
 curl -LsSf https://astral.sh/uv/install.sh | sh
 git clone https://github.com/AfterQuery-Research/umi-teleop.git /home/aq/umi-teleop
 cd /home/aq/umi-teleop
@@ -123,8 +123,8 @@ ip -details -statistics link show can_yam_old
      'cd /home/aq/umi-teleop && GPIOZERO_PIN_FACTORY=lgpio .venv/bin/umi-source'
    ```
 
-   Keep this terminal open. Continue only when its logs show `enabled=False`, fresh left/right
-   `pose_age`, fresh left/right `width_mm`, and `bad_vive=0`.
+   Keep this terminal open. Continue only when its logs show `enabled=False`, left/right
+   `pose_age` and `width_age` below `0.5`, nonempty left/right `width_mm`, and `bad_vive=0`.
 
 4. Clear the full arm workspace. In a dedicated terminal, start the YAM controller:
 

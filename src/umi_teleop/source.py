@@ -248,7 +248,7 @@ def run(cfg: Config) -> None:
             if now - last_status >= 1.0:
                 log.info(
                     "enabled=%s enable_pending=%s zero_pending=%s pose_age[L=%s R=%s] "
-                    "width_mm[L=%s R=%s] bad_vive=%d",
+                    "width_mm[L=%s R=%s] width_age[L=%s R=%s] bad_vive=%d",
                     state.requested_enabled,
                     enable_guard.pending,
                     zero_guard.pending,
@@ -256,6 +256,8 @@ def run(cfg: Config) -> None:
                     _status_value(poses.get("right", {}), "age_s"),
                     _status_value(widths["left"], "width_mm"),
                     _status_value(widths["right"], "width_mm"),
+                    _status_value(widths["left"], "age_s"),
+                    _status_value(widths["right"], "age_s"),
                     vive.bad_packet_count,
                 )
                 last_status = now

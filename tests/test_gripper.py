@@ -190,6 +190,15 @@ def test_detector_returns_none_with_only_one_tag():
     assert det.width_mm(frame) is None  # only tag 0 present, need both 0 and 1
 
 
+def test_detector_samples_oblique_marker_cells_at_higher_resolution():
+    pytest.importorskip("cv2")
+    from umi_teleop.gripper import GripperDetector, GripperGeometry, identity_calib
+
+    detector = GripperDetector(identity_calib(800, 600), GripperGeometry())
+    parameters = detector._detector.getDetectorParameters()
+    assert parameters.perspectiveRemovePixelPerCell == 8
+
+
 def test_detector_uses_per_arm_target_ids():
     cv2 = pytest.importorskip("cv2")
     from umi_teleop.gripper import GripperConfig, detector_from_config
