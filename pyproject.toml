@@ -1,0 +1,53 @@
+[project]
+name = "umi-teleop"
+version = "0.1.0"
+description = "Dual-UMI Vive teleoperation for two YAM robot arms"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "numpy==2.2.6",
+    "tyro>=1.0.15",
+]
+
+[project.optional-dependencies]
+windows = [
+    "openvr>=2.5; sys_platform == 'win32'",
+]
+source = [
+    "gpiozero>=2.0; sys_platform == 'linux'",
+    "lgpio>=0.2; sys_platform == 'linux'",
+    "opencv-contrib-python-headless>=4.12; sys_platform == 'linux'",
+]
+yam = [
+    "i2rt @ https://github.com/i2rt-robotics/i2rt/archive/refs/tags/v1.2.4.tar.gz",
+]
+
+[project.scripts]
+umi-vive-sender = "umi_teleop.windows:main"
+umi-source = "umi_teleop.source:main"
+umi-yam = "umi_teleop.yam:main"
+
+[build-system]
+requires = ["uv_build>=0.11.14,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "opencv-contrib-python-headless>=4.12",
+    "pytest>=9.0.3",
+    "ruff>=0.15.16",
+]
+
+[tool.uv]
+build-constraint-dependencies = ["scikit-build-core<0.10"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "UP"]
