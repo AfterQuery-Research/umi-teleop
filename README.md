@@ -74,19 +74,18 @@ rest:
 sudo apt update
 sudo apt install -y git curl v4l-utils python3-gi gir1.2-gstreamer-1.0 \
   gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good
+sudo usermod -aG video,dialout,gpio aq
 curl -LsSf https://astral.sh/uv/install.sh | sh
 git clone https://github.com/AfterQuery-Research/umi-teleop.git /home/aq/umi-teleop
 cd /home/aq/umi-teleop
 uv venv --python /usr/bin/python3 --system-site-packages
 uv sync --locked --extra source --no-dev
-sudo install -m 0644 config/systemd/umi-teleop-source.service \
-  /etc/systemd/system/umi-teleop-source.service
-sudo systemctl daemon-reload
-sudo systemctl enable umi-teleop-source.service
 ```
 
-The unit deliberately conflicts with the old recorder/Vive/button services because they share UDP
-port `9001`, GPIO `17/27`, and both cameras.
+Reconnect to the Pi once after changing group membership.
+
+Do not run the old recorder, Vive receiver, or button programs at the same time. They share UDP
+port `9001`, GPIO `17/27`, and both cameras with `umi-source`.
 
 ### YAM controller Pi
 
@@ -117,15 +116,15 @@ ip -details -statistics link show can_yam_old
    .\.venv\Scripts\umi-vive-sender.exe
    ```
 
-3. Start the UMI source and inspect its live health:
+3. In a dedicated terminal, start the UMI source and inspect its live health:
 
    ```bash
-   ssh aq@10.103.3.43 'sudo systemctl start umi-teleop-source.service'
-   ssh aq@10.103.3.43 'journalctl -u umi-teleop-source.service -f'
+   ssh -t aq@10.103.3.43 \
+     'cd /home/aq/umi-teleop && GPIOZERO_PIN_FACTORY=lgpio .venv/bin/umi-source'
    ```
 
-   Continue only when logs show `enabled=False`, fresh left/right `pose_age`, fresh left/right
-   `width_mm`, and `bad_vive=0`.
+   Keep this terminal open. Continue only when its logs show `enabled=False`, fresh left/right
+   `pose_age`, fresh left/right `width_mm`, and `bad_vive=0`.
 
 4. Clear the full arm workspace. In a dedicated terminal, start the YAM controller:
 
@@ -169,11 +168,7 @@ and robot poses as the next references.
 
 1. Tap **E** once if the source is enabled; verify `enabled=False` in the source log.
 2. Support both YAM arms, then press Ctrl+C in the `umi-yam` terminal. Torque holding is released.
-3. Stop the source:
-
-   ```bash
-   ssh aq@10.103.3.43 'sudo systemctl stop umi-teleop-source.service'
-   ```
+3. Press Ctrl+C in the UMI source terminal.
 
 4. Press Ctrl+C in the Windows sender, then power down hardware.
 
