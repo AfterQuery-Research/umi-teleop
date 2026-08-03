@@ -63,7 +63,12 @@ cd C:\umi-teleop
 uv sync --locked --extra windows --no-dev
 ```
 
-SteamVR and both trackers must be visible before starting the sender.
+Before starting the sender:
+
+1. Plug in and power on both Vive base stations.
+2. Press the center button on each Vive tracker.
+3. Wait for each tracker light to turn green. Green means the tracker is paired and connected.
+4. Confirm that both trackers appear in SteamVR on Windows.
 
 ### UMI source Pi
 
