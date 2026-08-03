@@ -12,6 +12,7 @@ import pytest
 from umi_teleop.dataset import (
     CAMERA_NAMES,
     CAMERA_SHAPE,
+    TOP_CAMERA_CAPTURE_HEIGHT,
     YAM_SCALAR_NAMES,
     DatasetConfig,
     DatasetFrameError,
@@ -19,6 +20,7 @@ from umi_teleop.dataset import (
     build_frame,
     create_dataset_recorder,
     dataset_features,
+    normalize_camera_image,
     yam_vector,
 )
 
@@ -177,6 +179,22 @@ def test_frame_keeps_measured_state_separate_from_applied_command() -> None:
     np.testing.assert_allclose(frame["observation.state"][:6], np.arange(6))
     np.testing.assert_allclose(frame["action"][:6], np.arange(6) + 0.5)
     assert not np.shares_memory(frame["observation.images.top"], images["top"])
+
+
+def test_top_camera_native_frame_is_center_cropped_to_dataset_shape() -> None:
+    image = np.repeat(
+        np.arange(TOP_CAMERA_CAPTURE_HEIGHT, dtype=np.uint16)[:, None, None],
+        640 * 3,
+        axis=1,
+    ).reshape(TOP_CAMERA_CAPTURE_HEIGHT, 640, 3)
+    image = (image % 256).astype(np.uint8)
+
+    normalized = normalize_camera_image("top", image)
+
+    assert normalized.shape == CAMERA_SHAPE
+    np.testing.assert_array_equal(normalized, image[60:420])
+    assert normalized.flags.c_contiguous
+    assert not np.shares_memory(normalized, image)
 
 
 @pytest.mark.parametrize(

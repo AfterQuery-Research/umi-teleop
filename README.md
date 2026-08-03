@@ -245,10 +245,11 @@ export LEFT_CAMERA=LEFT_REALSENSE_SERIAL
 export RIGHT_CAMERA=RIGHT_REALSENSE_SERIAL
 ```
 
-All three cameras must support RGB `640x360` at 30 Hz. Recording validates and opens them before it
-opens CAN or constructs either robot, and requires at least 5 GiB of free dataset storage before
-each episode. Authenticate once before requesting upload; the token stays in Hugging Face's normal
-credential store and is never passed to `umi-yam`:
+The top D435 is captured at RGB `640x480` at 30 Hz and center-cropped to `640x360`. The left and
+right D405 cameras are captured natively at RGB `640x360` at 30 Hz. Recording validates and opens
+all three before it opens CAN or constructs either robot, and requires at least 5 GiB of free
+dataset storage before each episode. Authenticate once before requesting upload; the token stays
+in Hugging Face's normal credential store and is never passed to `umi-yam`:
 
 ```bash
 cd /home/yam/Documents/Repos/umi-teleop

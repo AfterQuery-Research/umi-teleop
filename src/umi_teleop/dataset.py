@@ -21,6 +21,7 @@ CAMERA_NAMES = ("top", "left", "right")
 CAMERA_HEIGHT = 360
 CAMERA_WIDTH = 640
 CAMERA_SHAPE = (CAMERA_HEIGHT, CAMERA_WIDTH, 3)
+TOP_CAMERA_CAPTURE_HEIGHT = 480
 DATASET_FPS = 30
 YAM_SCALAR_NAMES = (
     *(f"left_joint_{index}.pos" for index in range(6)),
@@ -217,6 +218,21 @@ def build_frame(
     return frame
 
 
+def normalize_camera_image(name: str, image: np.ndarray) -> np.ndarray:
+    """Return one RGB camera image in the fixed LeRobot dataset shape."""
+    image = np.asarray(image)
+    if name == "top" and image.shape == (TOP_CAMERA_CAPTURE_HEIGHT, CAMERA_WIDTH, 3):
+        crop_start = (TOP_CAMERA_CAPTURE_HEIGHT - CAMERA_HEIGHT) // 2
+        image = image[crop_start : crop_start + CAMERA_HEIGHT]
+    if image.shape != CAMERA_SHAPE:
+        raise DatasetFrameError(
+            f"{name} camera frame shape {image.shape} cannot be converted to {CAMERA_SHAPE}"
+        )
+    if image.dtype != np.uint8:
+        raise DatasetFrameError(f"{name} camera frame must be RGB uint8")
+    return np.ascontiguousarray(image).copy()
+
+
 def _normalized_features(features: Mapping[str, Mapping[str, Any]]) -> dict[str, tuple[Any, ...]]:
     return {
         key: (
@@ -345,12 +361,13 @@ def _default_camera_factory(config: DatasetConfig) -> dict[str, Camera]:
     cameras: dict[str, Camera] = {}
     try:
         for name in CAMERA_NAMES:
+            capture_height = TOP_CAMERA_CAPTURE_HEIGHT if name == "top" else CAMERA_HEIGHT
             camera = RealSenseCamera(
                 RealSenseCameraConfig(
                     serial_number_or_name=config.camera_serials[name],
                     fps=DATASET_FPS,
                     width=CAMERA_WIDTH,
-                    height=CAMERA_HEIGHT,
+                    height=capture_height,
                     use_rgb=True,
                     use_depth=False,
                     warmup_s=2,
@@ -480,7 +497,10 @@ class DatasetRecorder:
             raise DatasetRecordingError("cannot record a frame without an active episode")
         try:
             images = {
-                name: camera.read_latest(max_age_ms=self.config.camera_max_age_ms)
+                name: normalize_camera_image(
+                    name,
+                    camera.read_latest(max_age_ms=self.config.camera_max_age_ms),
+                )
                 for name, camera in self.cameras.items()
             }
         except Exception as exc:
