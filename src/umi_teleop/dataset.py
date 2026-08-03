@@ -282,8 +282,22 @@ def _default_upload_validator(config: DatasetConfig, dataset: Dataset) -> None:
     except ImportError as exc:
         raise DatasetRecordingError("cannot validate finalized dataset without LeRobot") from exc
     root = getattr(dataset, "root", config.root)
-    reopened = LeRobotDataset(config.repo_id, root=root, download_videos=False)
+    reopened = LeRobotDataset(
+        config.repo_id,
+        root=root,
+        download_videos=False,
+        video_backend="pyav",
+        return_uint8=True,
+    )
     validate_finalized_dataset(reopened)
+    for frame_index in sorted({0, reopened.meta.total_frames - 1}):
+        sample = reopened[frame_index]
+        for name in CAMERA_NAMES:
+            image = sample[f"observation.images.{name}"]
+            if tuple(image.shape) not in (CAMERA_SHAPE, (3, CAMERA_HEIGHT, CAMERA_WIDTH)):
+                raise DatasetRecordingError(
+                    f"decoded {name} frame has unexpected shape {tuple(image.shape)}"
+                )
 
 
 def validate_finalized_dataset(dataset: Dataset) -> None:

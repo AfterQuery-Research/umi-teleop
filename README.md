@@ -281,7 +281,8 @@ validates locally, and uploads privately. The local dataset is retained if login
 To append during a later run, use the same repo ID and root and add `--dataset.resume`. Omit
 `--dataset.push-to-hub` to collect and validate locally without uploading. H.264/yuv420p is the
 Raspberry Pi default; add `--dataset.video-codec libsvtav1` only when AV1 file-level parity is
-required and the slower encoder has been tested on this hardware.
+required and the slower encoder has been tested on this hardware. Final validation decodes the
+first and last saved frames with PyAV, avoiding TorchCodec's optional GPU-linked runtime on ARM64.
 
 The resulting LeRobot v3 schema matches `MolmoAct2-BimanualYAM-Dataset`: `top`, `left`, and `right`
 RGB images plus 14-value `observation.state` and `action` vectors ordered as left joints 0-5, left

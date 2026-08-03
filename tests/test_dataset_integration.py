@@ -229,7 +229,9 @@ def test_real_lerobot_v3_video_dataset_can_finalize_and_reopen(tmp_path: Path) -
     recorder.finish_episode(commit=True, reason="enable toggled off")
     recorder.close()
 
-    reopened = lerobot_dataset.LeRobotDataset(config.repo_id, root=config.root)
+    reopened = lerobot_dataset.LeRobotDataset(
+        config.repo_id, root=config.root, video_backend="pyav"
+    )
     assert reopened.meta.total_episodes == 1
     assert reopened.meta.total_frames == 3
     sample = reopened[0]
@@ -259,7 +261,9 @@ def test_real_lerobot_v3_video_dataset_can_finalize_and_reopen(tmp_path: Path) -
     resumed.finish_episode(commit=True, reason="enable toggled off")
     resumed.close()
 
-    appended = lerobot_dataset.LeRobotDataset(config.repo_id, root=config.root)
+    appended = lerobot_dataset.LeRobotDataset(
+        config.repo_id, root=config.root, video_backend="pyav"
+    )
     assert appended.meta.total_episodes == 2
     assert appended.meta.total_frames == 5
     np.testing.assert_allclose(appended[4]["observation.state"][:6], np.full(6, 0.4))
