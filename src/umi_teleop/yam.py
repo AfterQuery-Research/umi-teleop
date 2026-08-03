@@ -13,7 +13,7 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -36,6 +36,13 @@ from umi_teleop.controller import (
     pose_matrix,
     rotation_angle,
     world_frame_delta,
+)
+from umi_teleop.dataset import (
+    DatasetConfig,
+    DatasetRecordingError,
+    commit_dataset_step,
+    create_dataset_recorder,
+    prepare_dataset_step,
 )
 
 KNOWN_CONTROL_PATTERNS = (
@@ -105,6 +112,7 @@ class Config:
     simulate: bool = False
     sim_initial_joints: tuple[float, float, float, float, float, float] = DEFAULT_SIM_INITIAL_JOINTS
     confirm_clear: bool = False
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
 
 
 class SafetyStop(RuntimeError):
@@ -660,6 +668,8 @@ def monitor_only(receiver: UdpTeleopReceiver) -> None:
 def run(args: Config) -> None:
     if args.move_to_ready and args.move_to_base:
         raise SafetyStop("move-to-ready and move-to-base are mutually exclusive")
+    if args.monitor_only and args.dataset.enabled:
+        raise SafetyStop("dataset recording cannot be combined with monitor-only mode")
     if not args.monitor_only and not args.simulate and not args.confirm_clear:
         raise SafetyStop(
             "this command can move physical arms; clear the workspace and pass --confirm-clear"
@@ -672,14 +682,14 @@ def run(args: Config) -> None:
             receiver.close()
         return
 
-    for field in (
+    for config_field in (
         "left_gripper_limits",
         "right_gripper_limits",
         "left_input_width_mm",
         "right_input_width_mm",
     ):
-        if getattr(args, field) is None:
-            raise SafetyStop(f"--{field.replace('_', '-')} is required for motor control")
+        if getattr(args, config_field) is None:
+            raise SafetyStop(f"--{config_field.replace('_', '-')} is required for motor control")
 
     limits = TeleopLimits(
         max_packet_age_s=args.max_packet_age,
@@ -730,11 +740,24 @@ def run(args: Config) -> None:
             "UMI source must be disabled before an automatic startup motion; hold CANCEL"
         )
 
-    channels_by_side = resolve_arm_channels(args)
-    channels = tuple(channels_by_side[name] for name in ARM_NAMES)
+    channels: tuple[str, ...] = ()
     locks: list[Any] = []
     robots: dict[str, Any] = {}
+    recorder = None
     try:
+        try:
+            recorder = create_dataset_recorder(args.dataset, args.hz)
+        except DatasetRecordingError as exc:
+            raise SafetyStop(str(exc)) from exc
+        if recorder is not None:
+            print(
+                f"DATASET ready repo={args.dataset.repo_id} root={args.dataset.root} "
+                f"resume={args.dataset.resume} upload={args.dataset.push_to_hub}",
+                flush=True,
+            )
+
+        channels_by_side = resolve_arm_channels(args)
+        channels = tuple(channels_by_side[name] for name in ARM_NAMES)
         if not args.simulate:
             check_no_other_control_processes()
             for channel in channels:
@@ -818,14 +841,31 @@ def run(args: Config) -> None:
         while not stop:
             packet, packet_age = receiver.poll()
             if packet is None or packet_age is None:
+                was_armed = state.armed
                 state.disarm("waiting for telemetry")
+                if recorder is not None and was_armed:
+                    try:
+                        recorder.finish_episode(commit=False, reason=state.reason)
+                    except DatasetRecordingError as exc:
+                        raise SafetyStop(str(exc)) from exc
                 command_pair(robots, joints, grips)
                 time.sleep(period)
                 continue
             current_joints = {name: arm_joints(robots[name]) for name in ARM_NAMES}
+            current_grips = (
+                {name: gripper_position(robots[name]) for name in ARM_NAMES}
+                if recorder is not None
+                else None
+            )
             current_poses = {name: ik[name].fk(current_joints[name]) for name in ARM_NAMES}
+            was_armed = state.armed
             result = state.step(packet, packet_age, current_poses)
             if result.quit:
+                if recorder is not None:
+                    try:
+                        recorder.finish_episode(commit=False, reason=state.reason)
+                    except DatasetRecordingError as exc:
+                        raise SafetyStop(str(exc)) from exc
                 break
             if startup_blocked is not None:
                 message = f"startup reset incomplete: {startup_blocked}"
@@ -865,6 +905,7 @@ def run(args: Config) -> None:
                         state.reject_zero(message)
                         print(message, flush=True)
                         break
+            invalid_frame_reason = None
             if result.armed and result.targets is not None:
                 solved: dict[str, np.ndarray] = {}
                 solve_ok = True
@@ -900,12 +941,44 @@ def run(args: Config) -> None:
                             )
                             grips[name] = float(np.clip(grips[name] + grip_delta, 0.0, 1.0))
                 else:
+                    invalid_frame_reason = f"{failed_arm} {failure_detail}"
                     ik_failures += 1
                     if ik_failures >= args.max_ik_failures:
                         state.disarm(
                             f"{failed_arm} {failure_detail} for {ik_failures} consecutive cycles"
                         )
+            prepared_dataset_frame = None
+            if recorder is not None:
+                try:
+                    assert current_grips is not None
+                    prepared_dataset_frame = prepare_dataset_step(
+                        recorder,
+                        was_armed=was_armed,
+                        is_armed=state.armed,
+                        invalid_frame_reason=invalid_frame_reason,
+                        measured_joints=current_joints,
+                        measured_grippers=current_grips,
+                        commanded_joints=joints,
+                        commanded_grippers=grips,
+                    )
+                except DatasetRecordingError as exc:
+                    state.disarm(f"dataset failure: {exc}")
+                    raise SafetyStop(state.reason) from exc
+
             command_pair(robots, joints, grips)
+
+            if recorder is not None:
+                try:
+                    commit_dataset_step(
+                        recorder,
+                        prepared_dataset_frame,
+                        was_armed=was_armed,
+                        is_armed=state.armed,
+                        disarm_reason=state.reason,
+                    )
+                except DatasetRecordingError as exc:
+                    state.disarm(f"dataset failure: {exc}")
+                    raise SafetyStop(state.reason) from exc
 
             now = time.monotonic()
             if now - last_log >= 0.5:
@@ -929,14 +1002,49 @@ def run(args: Config) -> None:
                 )
                 last_log = now
             next_step += period
+            control_lag = max(0.0, time.monotonic() - next_step)
+            if (
+                recorder is not None
+                and recorder.active
+                and control_lag > args.dataset.max_control_lag_s
+            ):
+                try:
+                    recorder.finish_episode(
+                        commit=False,
+                        reason=f"control loop lagged by {control_lag:.3f}s",
+                    )
+                except DatasetRecordingError as exc:
+                    raise SafetyStop(str(exc)) from exc
             time.sleep(max(0.0, next_step - time.monotonic()))
     finally:
+        pending_exception = sys.exc_info()[0] is not None
+        cleanup_errors: list[str] = []
         for name in reversed(ARM_NAMES):
             if name in robots:
-                close_robot(robots[name])
-        receiver.close()
+                try:
+                    close_robot(robots[name])
+                except Exception as exc:
+                    cleanup_errors.append(f"failed to close {name} robot: {exc}")
+        try:
+            receiver.close()
+        except Exception as exc:
+            cleanup_errors.append(f"failed to close telemetry receiver: {exc}")
         for lock in locks:
-            lock.close()
+            try:
+                lock.close()
+            except Exception as exc:
+                cleanup_errors.append(f"failed to close CAN lock: {exc}")
+        if recorder is not None:
+            try:
+                recorder.close(upload=not pending_exception and not cleanup_errors)
+            except DatasetRecordingError as exc:
+                cleanup_errors.append(f"dataset cleanup failed: {exc}")
+        if cleanup_errors:
+            detail = "; ".join(cleanup_errors)
+            if pending_exception:
+                print(f"CLEANUP ERROR: {detail}", file=sys.stderr, flush=True)
+            else:
+                raise SafetyStop(detail)
 
 
 def main() -> None:

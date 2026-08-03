@@ -13,10 +13,14 @@ flowchart LR
     W["Windows 10.103.3.44<br/>SteamVR + umi-vive-sender"]
     S["UMI Pi 10.103.3.43<br/>trackers + cameras + buttons"]
     Y["YAM Pi 10.103.3.85<br/>safety + IK + motor control"]
+    C["3 RealSense policy cameras<br/>optional dataset recording"]
+    H["Hugging Face dataset<br/>optional private upload"]
     L["Left YAM<br/>USB serial to current canN"]
     R["Right YAM<br/>USB serial to current canN"]
     W -->|"raw tracker JSON/UDP :9001"| S
     S -->|"poses + widths + controls JSON/UDP :9140"| Y
+    C -->|"top + left + right RGB"| Y
+    Y -.->|"finalized LeRobot v3 dataset"| H
     Y --> L
     Y --> R
 ```
@@ -24,7 +28,9 @@ flowchart LR
 The Windows sender publishes raw SteamVR poses. The UMI Pi converts them to `+X` forward, `+Y`
 left, `+Z` up; measures both grippers from calibrated ArUco tags; reads the E/Z buttons; and sends
 one validated packet at 30 Hz. The YAM Pi owns zeroing, workspace limits, inverse kinematics, joint
-limits, slew limits, CAN access, and motor commands. Images never leave the UMI Pi.
+limits, slew limits, CAN access, and motor commands. The two UMI ArUco-camera images never leave
+the UMI Pi. Optional policy-dataset images come from three separate RealSense cameras connected to
+the YAM Pi and leave it only when explicit Hub upload is enabled.
 
 One root `pyproject.toml` and lockfile keep the protocol and safety code on one version. Install only
 the relevant hardware extra on each device: `windows`, `source`, or `yam`. Every CLI uses Tyro;
@@ -104,6 +110,16 @@ git clone https://github.com/AfterQuery-Research/umi-teleop.git \
 cd /home/yam/Documents/Repos/umi-teleop
 uv sync --locked --extra yam --no-dev
 ```
+
+To record MolmoAct2-compatible LeRobot datasets on this computer, install the optional Python
+3.12 recording stack as well:
+
+```bash
+uv sync --locked --extra yam --extra dataset --no-dev
+```
+
+This adds LeRobot's dataset writer and RealSense support only on the YAM computer. It is not
+needed on Windows or the UMI source Pi.
 
 #### Discover and configure CAN
 
@@ -207,6 +223,78 @@ A new source process always creates a new session ID, so the YAM controller requ
 it can enable. Z can be used again during a session; it disarms first and captures the current UMI
 and robot poses as the next references.
 
+## Record A LeRobot Dataset
+
+Recording is optional and runs inside `umi-yam`, which remains the only process allowed to own the
+YAM CAN buses. Do not run `lerobot-record`, policy inference, or another `umi-yam` at the same time.
+The UMI source Pi keeps owning its two ArUco cameras; the YAM computer separately owns three
+RealSense policy cameras.
+
+First discover and identify the RealSense cameras from the LeRobot checkout:
+
+```bash
+cd /home/yam/Documents/Repos/lerobot
+uv run lerobot-find-cameras realsense
+```
+
+Inspect the saved previews, then assign three distinct serials in the fixed MolmoAct2 view order:
+
+```bash
+export TOP_CAMERA=TOP_REALSENSE_SERIAL
+export LEFT_CAMERA=LEFT_REALSENSE_SERIAL
+export RIGHT_CAMERA=RIGHT_REALSENSE_SERIAL
+```
+
+All three cameras must support RGB `640x360` at 30 Hz. Recording validates and opens them before it
+opens CAN or constructs either robot, and requires at least 5 GiB of free dataset storage before
+each episode. Authenticate once before requesting upload; the token stays in Hugging Face's normal
+credential store and is never passed to `umi-yam`:
+
+```bash
+cd /home/yam/Documents/Repos/umi-teleop
+.venv/bin/hf auth login
+```
+
+Choose a new Hub repository ID and a new local directory, clear the robot workspace, then run:
+
+```bash
+.venv/bin/umi-yam \
+  --left-adapter-serial "$LEFT_CAN" \
+  --right-adapter-serial "$RIGHT_CAN" \
+  --dataset.repo-id AfterQuery-Research/YOUR_DATASET_NAME \
+  --dataset.root /home/yam/Datasets/YOUR_DATASET_NAME \
+  --dataset.task "Pick up the oranges and put them in the bowl" \
+  --dataset.top-camera-serial "$TOP_CAMERA" \
+  --dataset.left-camera-serial "$LEFT_CAMERA" \
+  --dataset.right-camera-serial "$RIGHT_CAMERA" \
+  --dataset.push-to-hub \
+  --confirm-clear
+```
+
+Use the normal teleoperation controls. A successful E enable starts an episode. Tapping E to stop
+saves it. Z, CANCEL, a safety disarm, camera/IK/timing failure, source restart, or Ctrl+C during an
+episode discards that incomplete episode. After the desired episode has printed `DATASET episode
+saved`, support the arms and press Ctrl+C. Both robots close first; the dataset then finalizes,
+validates locally, and uploads privately. The local dataset is retained if login or upload fails.
+
+To append during a later run, use the same repo ID and root and add `--dataset.resume`. Omit
+`--dataset.push-to-hub` to collect and validate locally without uploading. H.264/yuv420p is the
+Raspberry Pi default; add `--dataset.video-codec libsvtav1` only when AV1 file-level parity is
+required and the slower encoder has been tested on this hardware.
+
+The resulting LeRobot v3 schema matches `MolmoAct2-BimanualYAM-Dataset`: `top`, `left`, and `right`
+RGB images plus 14-value `observation.state` and `action` vectors ordered as left joints 0-5, left
+gripper, right joints 0-5, right gripper. State is measured immediately before control. Action is
+the final bounded target successfully sent to both arms.
+
+If upload fails after the robots have closed, retry it without opening cameras or CAN:
+
+```bash
+.venv/bin/umi-dataset-upload \
+  --repo-id AfterQuery-Research/YOUR_DATASET_NAME \
+  --root /home/yam/Datasets/YOUR_DATASET_NAME
+```
+
 ## Stop
 
 1. Tap **E** once if the source is enabled; verify `enabled=False` in the source log.
@@ -245,4 +333,6 @@ uv build
 The test suite covers SteamVR packet construction, OpenVR coordinate conversion, strict protocol
 validation, GPIO state guards, camera buffering, calibrated ArUco geometry, serial-based CAN
 discovery/setup, zero/enable/session behavior, Cartesian limits, gripper mapping, the I2RT
-encoder-wrap correction, and a UDP integration test across the Windows, source, and YAM layers.
+encoder-wrap correction, dataset episode and schema behavior, and UDP integration across the
+Windows, source, YAM, and recorder layers. With the `dataset` extra installed, it also writes,
+finalizes, reopens, and decodes a real local LeRobot v3 video dataset.
