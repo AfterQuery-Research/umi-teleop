@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from pathlib import Path
 from threading import Event
@@ -233,6 +234,7 @@ def test_disabled_recording_does_not_call_factories() -> None:
         ({"right_camera_serial": "left-1"}, "must be distinct"),
         ({"queue_size": 0}, "queue size must be positive"),
         ({"min_free_disk_gb": 0}, "minimum free disk space must be positive"),
+        ({"shutdown_timeout_s": 0}, "shutdown timeout must be positive"),
         ({"resume": True}, "resume requires an explicit local root"),
     ],
 )
@@ -248,7 +250,7 @@ def test_new_recording_rejects_nonempty_root(tmp_path: Path) -> None:
     root.mkdir()
     (root / "existing.txt").write_text("occupied")
 
-    with pytest.raises(DatasetRecordingError, match="root is not an empty directory"):
+    with pytest.raises(DatasetRecordingError, match="root already exists"):
         recording_config(tmp_path, root=root).validate(30.0)
 
 
@@ -354,6 +356,23 @@ def test_camera_failure_discards_active_episode_without_killing_writer(tmp_path)
     assert dataset.finalize_count == 1
 
 
+def test_disconnected_camera_is_reported_as_episode_frame_error(tmp_path) -> None:
+    class DisconnectedCamera(FakeCamera):
+        def read_latest(self, max_age_ms: int = 500) -> np.ndarray:
+            raise ConnectionError("camera disconnected")
+
+    def disconnect_top(cameras: dict[str, FakeCamera]) -> None:
+        cameras["top"] = DisconnectedCamera()
+
+    recorder, _dataset, _cameras = recorder_fixture(tmp_path, camera_mutator=disconnect_top)
+    recorder.start_episode()
+
+    with pytest.raises(DatasetFrameError, match="camera disconnected"):
+        add_frame(recorder)
+    recorder.finish_episode(commit=False, reason="camera disconnected")
+    recorder.close()
+
+
 def test_prepared_frame_is_not_written_until_bimanual_dispatch_commits(tmp_path) -> None:
     recorder, dataset, _cameras = recorder_fixture(tmp_path)
     measured_joints, measured_grippers = robot_values(0.0)
@@ -414,6 +433,38 @@ def test_queue_overflow_fails_and_close_does_not_deadlock(tmp_path) -> None:
         recorder.close()
 
     assert dataset.finalize_count == 1
+
+
+def test_hung_writer_has_bounded_shutdown(tmp_path) -> None:
+    entered = Event()
+    release = Event()
+
+    class HungDataset(FakeDataset):
+        def add_frame(self, frame: dict[str, Any]) -> None:
+            entered.set()
+            release.wait()
+            super().add_frame(frame)
+
+    config = recording_config(tmp_path, shutdown_timeout_s=0.05)
+    recorder, dataset, _cameras = recorder_fixture(
+        tmp_path,
+        config=config,
+        dataset=HungDataset(),
+    )
+    recorder.start_episode()
+    add_frame(recorder)
+    assert entered.wait(timeout=1.0)
+
+    started = time.monotonic()
+    with pytest.raises(DatasetRecordingError, match="did not stop within"):
+        recorder.close()
+    elapsed = time.monotonic() - started
+    release.set()
+    recorder._thread.join(timeout=1.0)
+
+    assert elapsed < 1.0
+    assert not recorder._thread.is_alive()
+    assert dataset.finalize_count == 0
 
 
 def test_close_discards_incomplete_episode_and_is_idempotent(tmp_path) -> None:

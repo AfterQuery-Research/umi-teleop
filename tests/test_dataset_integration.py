@@ -15,7 +15,9 @@ from umi_teleop.dataset import (
     CAMERA_NAMES,
     CAMERA_SHAPE,
     DatasetConfig,
+    DatasetRecordingError,
     create_dataset_recorder,
+    dataset_features,
     update_dataset_episode,
 )
 from umi_teleop.protocol import ButtonState, encode_teleop_packet
@@ -261,3 +263,21 @@ def test_real_lerobot_v3_video_dataset_can_finalize_and_reopen(tmp_path: Path) -
     assert appended.meta.total_episodes == 2
     assert appended.meta.total_frames == 5
     np.testing.assert_allclose(appended[4]["observation.state"][:6], np.full(6, 0.4))
+
+    wrong_fps_root = tmp_path / "wrong-fps"
+    wrong_fps = lerobot_dataset.LeRobotDataset.create(
+        "afterquery/wrong-fps",
+        15,
+        features=dataset_features(),
+        root=wrong_fps_root,
+        use_videos=True,
+    )
+    wrong_fps.finalize()
+    with pytest.raises(DatasetRecordingError, match="frame rate"):
+        create_dataset_recorder(
+            replace(config, repo_id="afterquery/wrong-fps", root=wrong_fps_root, resume=True),
+            30.0,
+            camera_factory=lambda _config: {
+                name: IntegrationCamera(index + 20) for index, name in enumerate(CAMERA_NAMES)
+            },
+        )

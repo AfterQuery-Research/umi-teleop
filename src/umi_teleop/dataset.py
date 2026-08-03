@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import shutil
 import sys
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +51,7 @@ class DatasetConfig:
     image_writer_threads_per_camera: int = 2
     encoder_threads: int = 2
     video_codec: Literal["h264", "libsvtav1"] = "h264"
+    shutdown_timeout_s: float = 60.0
 
     @property
     def enabled(self) -> bool:
@@ -94,11 +96,9 @@ class DatasetConfig:
                     f"dataset resume root is missing meta/info.json: {self.root}"
                 )
         elif self.root is not None and self.root.exists():
-            if not self.root.is_dir() or any(self.root.iterdir()):
-                raise DatasetRecordingError(
-                    "new dataset root is not an empty directory; use a new root or "
-                    f"--dataset.resume: {self.root}"
-                )
+            raise DatasetRecordingError(
+                f"new dataset root already exists; use a new path or --dataset.resume: {self.root}"
+            )
         for name, value in (
             ("min episode frames", self.min_episode_frames),
             ("queue size", self.queue_size),
@@ -112,6 +112,8 @@ class DatasetConfig:
             raise DatasetRecordingError("dataset max control lag must be positive")
         if self.min_free_disk_gb <= 0.0:
             raise DatasetRecordingError("dataset minimum free disk space must be positive")
+        if self.shutdown_timeout_s <= 0.0:
+            raise DatasetRecordingError("dataset shutdown timeout must be positive")
 
 
 class DatasetRecordingError(RuntimeError):
@@ -257,10 +259,11 @@ def _default_dataset_factory(config: DatasetConfig, features: dict[str, dict[str
     if config.resume:
         dataset = LeRobotDataset.resume(config.repo_id, **common)
         actual = getattr(dataset.meta, "features", {})
-        if not _features_match(actual, features):
+        if not _features_match(actual, features) or dataset.meta.fps != DATASET_FPS:
             dataset.finalize()
             raise DatasetRecordingError(
-                "existing dataset schema does not match the MolmoAct2 Bimanual YAM contract"
+                "existing dataset schema or frame rate does not match the 30 Hz "
+                "MolmoAct2 Bimanual YAM contract"
             )
         return dataset
     return LeRobotDataset.create(
@@ -288,6 +291,10 @@ def validate_finalized_dataset(dataset: Dataset) -> None:
     if not _features_match(dataset.meta.features, dataset_features()):
         raise DatasetRecordingError(
             "finalized dataset schema does not match the MolmoAct2 Bimanual YAM contract"
+        )
+    if dataset.meta.fps != DATASET_FPS:
+        raise DatasetRecordingError(
+            f"finalized dataset is {dataset.meta.fps} Hz; {DATASET_FPS} Hz is required"
         )
     if dataset.meta.total_episodes <= 0 or dataset.meta.total_frames <= 0:
         raise DatasetRecordingError("finalized dataset has no saved frames to upload")
@@ -386,7 +393,7 @@ class DatasetRecorder:
         self._episode_frames = 0
         self._saved_episodes = 0
         self._closed = False
-        self._thread = Thread(target=self._write_loop, name="umi-dataset-writer", daemon=False)
+        self._thread = Thread(target=self._write_loop, name="umi-dataset-writer", daemon=True)
         self._thread.start()
 
     @property
@@ -462,7 +469,7 @@ class DatasetRecorder:
                 name: camera.read_latest(max_age_ms=self.config.camera_max_age_ms)
                 for name, camera in self.cameras.items()
             }
-        except (RuntimeError, TimeoutError, ValueError) as exc:
+        except Exception as exc:
             raise DatasetFrameError(f"camera capture failed: {exc}") from exc
         return build_frame(
             images=images,
@@ -525,10 +532,11 @@ class DatasetRecorder:
         except BaseException as exc:
             self._set_worker_error(exc)
 
-    def _put_for_close(self, operation: object) -> bool:
-        while self._thread.is_alive():
+    def _put_for_close(self, operation: object, deadline: float) -> bool:
+        while self._thread.is_alive() and time.monotonic() < deadline:
             try:
-                self._queue.put(operation, timeout=0.1)
+                timeout = min(0.1, max(0.0, deadline - time.monotonic()))
+                self._queue.put(operation, timeout=timeout)
                 return True
             except Full:
                 continue
@@ -541,23 +549,33 @@ class DatasetRecorder:
             return
 
         close_errors: list[BaseException] = []
+        deadline = time.monotonic() + self.config.shutdown_timeout_s
         if self._active:
             queued = self._put_for_close(
-                _FinishOperation(False, self._episode_frames, "controller stopped mid-episode")
+                _FinishOperation(False, self._episode_frames, "controller stopped mid-episode"),
+                deadline,
             )
             if not queued and self._current_error() is None:
                 close_errors.append(RuntimeError("dataset writer stopped before episode discard"))
             self._active = False
             self._episode_frames = 0
         if self._thread.is_alive():
-            self._put_for_close(_STOP)
-            self._thread.join()
+            self._put_for_close(_STOP, deadline)
+            self._thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        writer_still_running = self._thread.is_alive()
+        if writer_still_running:
+            close_errors.append(
+                TimeoutError(
+                    f"dataset writer did not stop within {self.config.shutdown_timeout_s:.1f}s"
+                )
+            )
         if error := self._current_error():
             close_errors.append(error)
-            try:
-                self.dataset.clear_episode_buffer()
-            except BaseException as exc:
-                close_errors.append(exc)
+            if not writer_still_running:
+                try:
+                    self.dataset.clear_episode_buffer()
+                except BaseException as exc:
+                    close_errors.append(exc)
 
         for camera in reversed(tuple(self.cameras.values())):
             try:
@@ -565,10 +583,11 @@ class DatasetRecorder:
             except BaseException as exc:
                 close_errors.append(exc)
 
-        try:
-            self.dataset.finalize()
-        except BaseException as exc:
-            close_errors.append(exc)
+        if not writer_still_running:
+            try:
+                self.dataset.finalize()
+            except BaseException as exc:
+                close_errors.append(exc)
 
         if not close_errors and self._saved_episodes > 0 and self._upload_validator is not None:
             try:
@@ -671,17 +690,14 @@ def prepare_dataset_step(
         recorder.start_episode()
     if is_armed and recorder.active:
         if invalid_frame_reason is not None:
-            recorder.finish_episode(commit=False, reason=invalid_frame_reason)
+            raise DatasetFrameError(invalid_frame_reason)
         else:
-            try:
-                return recorder.prepare_frame(
-                    measured_joints=measured_joints,
-                    measured_grippers=measured_grippers,
-                    commanded_joints=commanded_joints,
-                    commanded_grippers=commanded_grippers,
-                )
-            except DatasetFrameError as exc:
-                recorder.finish_episode(commit=False, reason=str(exc))
+            return recorder.prepare_frame(
+                measured_joints=measured_joints,
+                measured_grippers=measured_grippers,
+                commanded_joints=commanded_joints,
+                commanded_grippers=commanded_grippers,
+            )
     return None
 
 

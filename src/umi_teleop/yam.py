@@ -39,6 +39,7 @@ from umi_teleop.controller import (
 )
 from umi_teleop.dataset import (
     DatasetConfig,
+    DatasetFrameError,
     DatasetRecordingError,
     commit_dataset_step,
     create_dataset_recorder,
@@ -905,6 +906,8 @@ def run(args: Config) -> None:
                         state.reject_zero(message)
                         print(message, flush=True)
                         break
+            held_joints = {name: joints[name].copy() for name in ARM_NAMES}
+            held_grips = dict(grips)
             invalid_frame_reason = None
             if result.armed and result.targets is not None:
                 solved: dict[str, np.ndarray] = {}
@@ -961,6 +964,14 @@ def run(args: Config) -> None:
                         commanded_joints=joints,
                         commanded_grippers=grips,
                     )
+                except DatasetFrameError as exc:
+                    state.disarm(f"dataset episode invalid: {exc}")
+                    joints = held_joints
+                    grips = held_grips
+                    try:
+                        recorder.finish_episode(commit=False, reason=state.reason)
+                    except DatasetRecordingError as finish_exc:
+                        raise SafetyStop(str(finish_exc)) from finish_exc
                 except DatasetRecordingError as exc:
                     state.disarm(f"dataset failure: {exc}")
                     raise SafetyStop(state.reason) from exc
@@ -1008,10 +1019,12 @@ def run(args: Config) -> None:
                 and recorder.active
                 and control_lag > args.dataset.max_control_lag_s
             ):
+                reason = f"control loop lagged by {control_lag:.3f}s"
+                state.disarm(f"dataset episode invalid: {reason}")
                 try:
                     recorder.finish_episode(
                         commit=False,
-                        reason=f"control loop lagged by {control_lag:.3f}s",
+                        reason=state.reason,
                     )
                 except DatasetRecordingError as exc:
                     raise SafetyStop(str(exc)) from exc

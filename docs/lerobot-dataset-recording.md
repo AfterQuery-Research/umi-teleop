@@ -48,7 +48,9 @@ finalized dataset to the Hugging Face Hub.
 - Previously committed episodes remain local if capture, finalization, login, or
   upload fails.
 - Finalization is mandatory and idempotent. Upload begins only after both robots
-  have been closed and the local dataset has finalized.
+  have been closed and the local dataset has finalized. Writer shutdown is
+  bounded; a hung encoder reports an error and leaves the local files untouched
+  instead of hanging robot shutdown indefinitely.
 - Hub upload is explicit, private by default, and never deletes the local copy.
 
 ## Compatibility

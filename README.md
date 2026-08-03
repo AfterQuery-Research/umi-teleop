@@ -255,7 +255,8 @@ cd /home/yam/Documents/Repos/umi-teleop
 .venv/bin/hf auth login
 ```
 
-Choose a new Hub repository ID and a new local directory, clear the robot workspace, then run:
+Choose a new Hub repository ID and a local path that does not exist yet, clear the robot workspace,
+then run:
 
 ```bash
 .venv/bin/umi-yam \

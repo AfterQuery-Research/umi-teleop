@@ -10,12 +10,13 @@ from umi_teleop.dataset_cli import UploadConfig, upload_dataset
 
 
 class UploadFake:
-    def __init__(self, *, episodes: int = 2, frames: int = 60) -> None:
+    def __init__(self, *, episodes: int = 2, frames: int = 60, fps: int = 30) -> None:
         self.meta = type(
             "Meta",
             (),
             {
                 "features": dataset_features(),
+                "fps": fps,
                 "total_episodes": episodes,
                 "total_frames": frames,
             },
@@ -54,6 +55,15 @@ def test_upload_existing_dataset_rejects_empty_dataset(tmp_path: Path) -> None:
         upload_dataset(
             UploadConfig("afterquery/empty", root),
             loader=lambda _repo_id, _root: UploadFake(episodes=0, frames=0),
+        )
+
+
+def test_upload_existing_dataset_rejects_wrong_frame_rate(tmp_path: Path) -> None:
+    root = existing_root(tmp_path)
+    with pytest.raises(DatasetRecordingError, match="15 Hz"):
+        upload_dataset(
+            UploadConfig("afterquery/wrong-fps", root),
+            loader=lambda _repo_id, _root: UploadFake(fps=15),
         )
 
 
