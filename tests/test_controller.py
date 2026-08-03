@@ -6,6 +6,7 @@ import math
 import numpy as np
 import pytest
 
+from umi_teleop.can import CANInterfaceInfo
 from umi_teleop.controller import (
     GripperMap,
     TeleopLimits,
@@ -16,10 +17,12 @@ from umi_teleop.controller import (
 )
 from umi_teleop.yam import (
     DEFAULT_SIM_INITIAL_JOINTS,
+    Config,
     SafetyStop,
     find_control_processes,
     gripper_limits_for_mode,
     gripper_position,
+    resolve_arm_channels,
     rpy_degrees_to_matrix,
     set_sim_initial_pose,
 )
@@ -98,6 +101,43 @@ def test_process_guard_ignores_own_launch_ancestors_but_not_other_controllers():
         "400     100 python   python experiments/launch_yaml.py",
         "500     100 python   python experiments/launch_vive_teleop.py --simulate",
     ]
+
+
+def test_physical_can_channels_follow_adapter_serials_not_kernel_order():
+    config = Config(left_adapter_serial="LEFT", right_adapter_serial="RIGHT")
+    interfaces = [
+        CANInterfaceInfo("can0", "RIGHT", "gs_usb", True, 1_000_000, False),
+        CANInterfaceInfo("can1", "LEFT", "gs_usb", True, 1_000_000, False),
+    ]
+
+    assert resolve_arm_channels(config, interfaces=interfaces) == {
+        "left": "can1",
+        "right": "can0",
+    }
+
+
+def test_physical_can_resolution_fails_closed_when_link_is_not_ready():
+    config = Config(left_adapter_serial="LEFT", right_adapter_serial="RIGHT")
+    interfaces = [
+        CANInterfaceInfo("can0", "LEFT", "gs_usb", False, None, False),
+        CANInterfaceInfo("can1", "RIGHT", "gs_usb", True, 1_000_000, False),
+    ]
+
+    with pytest.raises(SafetyStop, match="umi-setup-can"):
+        resolve_arm_channels(config, interfaces=interfaces)
+
+
+def test_physical_can_requires_distinct_hardware_identities():
+    with pytest.raises(SafetyStop, match="left-adapter-serial is required"):
+        resolve_arm_channels(Config(), interfaces=[])
+
+    config = Config(left_channel="can0", right_channel="can0")
+    with pytest.raises(SafetyStop, match="same SocketCAN interface"):
+        resolve_arm_channels(config, interfaces=[])
+
+
+def test_simulation_uses_default_channels_without_physical_adapters():
+    assert resolve_arm_channels(Config(simulate=True)) == {"left": "can0", "right": "can1"}
 
 
 def test_simulation_uses_normalized_gripper_limits_but_real_uses_raw_endpoints():

@@ -37,7 +37,7 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 
 @dataclass
 class Config:
-    target_host: str = "10.103.2.152"
+    target_host: str = "10.103.3.85"
     """YAM controller Pi address."""
     target_port: int = 9140
     """YAM controller UDP port."""

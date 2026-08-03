@@ -12,9 +12,9 @@ Standalone Vive teleoperation for two camera-equipped UMIs and two YAM robot arm
 flowchart LR
     W["Windows 10.103.3.44<br/>SteamVR + umi-vive-sender"]
     S["UMI Pi 10.103.3.43<br/>trackers + cameras + buttons"]
-    Y["YAM Pi 10.103.2.152<br/>safety + IK + motor control"]
-    L["Left YAM<br/>can_yam_new"]
-    R["Right YAM<br/>can_yam_old"]
+    Y["YAM Pi 10.103.3.85<br/>safety + IK + motor control"]
+    L["Left YAM<br/>USB serial to current canN"]
+    R["Right YAM<br/>USB serial to current canN"]
     W -->|"raw tracker JSON/UDP :9001"| S
     S -->|"poses + widths + controls JSON/UDP :9140"| Y
     Y --> L
@@ -35,12 +35,12 @@ run any command with `--help` to override its typed defaults.
 | Role | Address / mapping |
 |---|---|
 | Windows SteamVR host | `aq@10.103.3.44` |
-| UMI source Pi | `aq@10.103.3.43`, receives UDP `9001`, sends to `10.103.2.152:9140` |
-| YAM controller Pi | `yam@10.103.2.152`, receives UDP `9140` |
+| UMI source Pi | `aq@10.103.3.43`, receives UDP `9001`, sends to `10.103.3.85:9140` |
+| YAM controller Pi | `yam@10.103.3.85`, receives UDP `9140` |
 | Left leader | UMI2, tracker `LHR-BBAF093A`, camera tags `2/3` |
 | Right leader | UMI1, tracker `LHR-C891E882`, camera tags `0/1` |
-| Left follower | `can_yam_new` |
-| Right follower | `can_yam_old` |
+| Left follower | CAN adapter USB serial selected at startup |
+| Right follower | CAN adapter USB serial selected at startup |
 
 The calibrated camera files and the safe I2RT gripper encoder-wrap correction are included in this
 repository. No `robot-umi`, `vive-tracking`, `gello`, or patched I2RT checkout is required.
@@ -98,18 +98,48 @@ port `9001`, GPIO `17/27`, and both cameras with `umi-source`.
 sudo apt update
 sudo apt install -y git curl build-essential cmake ninja-build can-utils
 curl -LsSf https://astral.sh/uv/install.sh | sh
-git clone https://github.com/AfterQuery-Research/umi-teleop.git /home/yam/umi-teleop
-cd /home/yam/umi-teleop
+mkdir -p /home/yam/Documents/Repos
+git clone https://github.com/AfterQuery-Research/umi-teleop.git \
+  /home/yam/Documents/Repos/umi-teleop
+cd /home/yam/Documents/Repos/umi-teleop
 uv sync --locked --extra yam --no-dev
 ```
 
-Before real operation, both CAN interfaces must exist, be `UP`, report `ERROR-ACTIVE`, and have
-zero bus-error counters:
+#### Discover and configure CAN
+
+Stop robot-control processes, then list the adapters without opening a CAN bus or sending frames:
 
 ```bash
-ip -details -statistics link show can_yam_new
-ip -details -statistics link show can_yam_old
+cd /home/yam/Documents/Repos/umi-teleop
+.venv/bin/umi-setup-can
 ```
+
+The USB serial identifies an adapter even if Linux changes its `canN` name. Determine which cable
+goes to each arm and label it. Never connect or disconnect powered CAN hardware. If an adapter must
+be connected by itself to establish the mapping, first shut down the Pi and remove YAM power.
+
+Set the installation's left and right serials in the YAM shell. Replace the two example names with
+the serials reported above:
+
+```bash
+export LEFT_CAN=LEFT_ADAPTER_USB_SERIAL
+export RIGHT_CAN=RIGHT_ADAPTER_USB_SERIAL
+```
+
+Configure both adapters after every reboot or replug:
+
+```bash
+.venv/bin/umi-setup-can \
+  --left-adapter-serial "$LEFT_CAN" \
+  --right-adapter-serial "$RIGHT_CAN"
+
+ip -details -statistics link show type can
+```
+
+This performs only `ip link` setup and verification. It does not import i2rt, open a CAN bus, send
+motor frames, or move the robot. Both links must report `UP`, Classic CAN at `1000000` bit/s, and
+`ERROR-ACTIVE`. You do not need to repeat setup before each run unless the Pi rebooted or an adapter
+was replugged.
 
 ## Bring Up
 
@@ -131,15 +161,23 @@ ip -details -statistics link show can_yam_old
    Keep this terminal open. Continue only when its logs show `enabled=False`, left/right
    `pose_age` and `width_age` below `0.5`, nonempty left/right `width_mm`, and `bad_vive=0`.
 
-4. Clear the full arm workspace. In a dedicated terminal, start the YAM controller:
+4. Clear the full arm workspace. In a dedicated terminal, connect to the YAM Pi, set the same two
+   adapter serials used during CAN setup, and start the controller:
 
    ```bash
-   ssh -t yam@10.103.2.152 \
-     'cd /home/yam/umi-teleop && .venv/bin/umi-yam --confirm-clear'
+   ssh -t yam@10.103.3.85
+   cd /home/yam/Documents/Repos/umi-teleop
+   export LEFT_CAN=LEFT_ADAPTER_USB_SERIAL
+   export RIGHT_CAN=RIGHT_ADAPTER_USB_SERIAL
+   .venv/bin/umi-yam \
+     --left-adapter-serial "$LEFT_CAN" \
+     --right-adapter-serial "$RIGHT_CAN" \
+     --confirm-clear
    ```
 
-   It refuses competing controllers, validates both CAN buses, waits for fresh disabled telemetry,
-   and slowly moves both arms through a bent posture to `[0, 23, 46, 0, 0, 0]` degrees. Wait for:
+   It resolves each USB serial to its current `canN` name, refuses competing controllers, validates
+   both CAN buses, waits for fresh disabled telemetry, and slowly moves both arms through a bent
+   posture to `[0, 23, 46, 0, 0, 0]` degrees. Wait for:
 
    ```text
    robots holding current pose; tap the Pi ZERO button before enable
@@ -190,6 +228,8 @@ and robot poses as the next references.
 - **IK fails five consecutive cycles, a workspace limit is exceeded, packets go stale, or a joint
   target approaches its limit:** the controller disarms and holds its last command. It never
   automatically rearms.
+- **CAN is missing, down, in CAN FD mode, or at the wrong bitrate:** stop robot controllers and rerun
+  `umi-setup-can` with the two adapter serials. Never use `can0`/`can1` order to infer arm side.
 - **Inspect packets without motors:** run `.venv/bin/umi-yam --monitor-only` on the YAM Pi.
 
 ## Development Verification
@@ -203,6 +243,6 @@ uv build
 ```
 
 The test suite covers SteamVR packet construction, OpenVR coordinate conversion, strict protocol
-validation, GPIO state guards, camera buffering, calibrated ArUco geometry, zero/enable/session
-behavior, Cartesian limits, gripper mapping, the I2RT encoder-wrap correction, and a UDP integration
-test across the Windows, source, and YAM layers.
+validation, GPIO state guards, camera buffering, calibrated ArUco geometry, serial-based CAN
+discovery/setup, zero/enable/session behavior, Cartesian limits, gripper mapping, the I2RT
+encoder-wrap correction, and a UDP integration test across the Windows, source, and YAM layers.

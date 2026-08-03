@@ -20,6 +20,13 @@ from typing import Any, Literal
 import numpy as np
 import tyro
 
+from umi_teleop.can import (
+    YAM_CAN_BITRATE,
+    CANInterfaceInfo,
+    can_interface_readiness_error,
+    discover_can_interfaces,
+    resolve_can_interface,
+)
 from umi_teleop.controller import (
     ARM_NAMES,
     GripperMap,
@@ -60,8 +67,10 @@ class Config:
 
     bind: str = "0.0.0.0"
     port: int = 9140
-    left_channel: str = "can_yam_new"
-    right_channel: str = "can_yam_old"
+    left_adapter_serial: str | None = None
+    right_adapter_serial: str | None = None
+    left_channel: str | None = None
+    right_channel: str | None = None
     left_gripper_limits: tuple[float, float] = (6.3704509, 1.2239643)
     right_gripper_limits: tuple[float, float] = (6.3967727, 1.2010758)
     left_input_width_mm: tuple[float, float] = (40.376321, 122.999636)
@@ -154,9 +163,102 @@ def check_no_other_control_processes() -> None:
         raise SafetyStop("another robot-control process is running:\n  " + "\n  ".join(matches))
 
 
+def resolve_arm_channels(
+    args: Config,
+    *,
+    interfaces: list[CANInterfaceInfo] | None = None,
+) -> dict[str, str]:
+    if args.simulate:
+        if args.left_adapter_serial is not None or args.right_adapter_serial is not None:
+            raise SafetyStop("CAN adapter serials must not be set in simulation")
+        resolved = {
+            "left": args.left_channel or "can0",
+            "right": args.right_channel or "can1",
+        }
+    else:
+        arm_values = {
+            "left": (args.left_adapter_serial, args.left_channel),
+            "right": (args.right_adapter_serial, args.right_channel),
+        }
+        discovered = (
+            discover_can_interfaces()
+            if interfaces is None and any(serial is not None for serial, _ in arm_values.values())
+            else interfaces
+        )
+        resolved = {}
+        readiness_errors = []
+        for side, (serial, channel) in arm_values.items():
+            if serial is not None:
+                serial = serial.strip()
+                if not serial:
+                    raise SafetyStop(f"--{side}-adapter-serial must not be empty")
+            if channel is not None:
+                channel = channel.strip()
+                if not channel:
+                    raise SafetyStop(f"--{side}-channel must not be empty")
+            if serial is not None and channel is not None:
+                raise SafetyStop(
+                    f"--{side}-adapter-serial and --{side}-channel are mutually exclusive"
+                )
+            if serial is None and channel is None:
+                raise SafetyStop(
+                    f"--{side}-adapter-serial is required for a physical YAM arm "
+                    f"(or set --{side}-channel for an externally managed interface)"
+                )
+            if serial is None:
+                resolved[side] = channel
+                continue
+
+            try:
+                interface = resolve_can_interface(serial, interfaces=discovered)
+            except (RuntimeError, ValueError) as exc:
+                raise SafetyStop(str(exc)) from exc
+            readiness_error = can_interface_readiness_error(interface)
+            if readiness_error is not None:
+                readiness_errors.append(
+                    f"{side} adapter {serial} resolved to {interface.name}: {readiness_error}"
+                )
+            logging.getLogger(__name__).info(
+                "Resolved %s YAM CAN adapter %s to %s", side, serial, interface.name
+            )
+            resolved[side] = interface.name
+
+        if readiness_errors:
+            setup_flags = " ".join(
+                f"--{side}-adapter-serial {serial}"
+                for side, (serial, _channel) in arm_values.items()
+                if serial is not None
+            )
+            raise SafetyStop(
+                "SocketCAN is not ready:\n  "
+                + "\n  ".join(readiness_errors)
+                + f"\nRun `umi-setup-can {setup_flags}` before starting umi-yam."
+            )
+
+    if resolved["left"] == resolved["right"]:
+        raise SafetyStop("left and right YAM arms resolved to the same SocketCAN interface")
+    return resolved
+
+
 def check_can_interface(channel: str) -> None:
     if not (Path("/sys/class/net") / channel).exists():
         raise SafetyStop(f"CAN interface {channel!r} does not exist")
+    try:
+        interface = next(
+            (item for item in discover_can_interfaces() if item.name == channel),
+            None,
+        )
+    except RuntimeError as exc:
+        raise SafetyStop(str(exc)) from exc
+    if interface is None:
+        raise SafetyStop(f"CAN interface {channel!r} is not a SocketCAN interface")
+    readiness_error = can_interface_readiness_error(
+        interface,
+        bitrate=YAM_CAN_BITRATE,
+        use_fd=False,
+    )
+    if readiness_error is not None:
+        raise SafetyStop(f"CAN interface {channel!r} is not ready: {readiness_error}")
     proc = subprocess.run(
         ["ip", "-details", "-statistics", "link", "show", channel],
         check=True,
@@ -628,7 +730,8 @@ def run(args: Config) -> None:
             "UMI source must be disabled before an automatic startup motion; hold CANCEL"
         )
 
-    channels = (args.left_channel, args.right_channel)
+    channels_by_side = resolve_arm_channels(args)
+    channels = tuple(channels_by_side[name] for name in ARM_NAMES)
     locks: list[Any] = []
     robots: dict[str, Any] = {}
     try:
@@ -637,8 +740,12 @@ def run(args: Config) -> None:
             for channel in channels:
                 check_can_interface(channel)
             locks = acquire_locks(channels)
-        robots["left"] = make_robot(args.left_channel, args.left_gripper_limits, args.simulate)
-        robots["right"] = make_robot(args.right_channel, args.right_gripper_limits, args.simulate)
+        robots["left"] = make_robot(
+            channels_by_side["left"], args.left_gripper_limits, args.simulate
+        )
+        robots["right"] = make_robot(
+            channels_by_side["right"], args.right_gripper_limits, args.simulate
+        )
 
         if args.simulate:
             for robot in robots.values():
