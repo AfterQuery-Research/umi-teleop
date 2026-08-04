@@ -452,6 +452,48 @@ def test_finalized_dataset_rejects_mismatched_encoded_video_count(
         validate_finalized_dataset(dataset)
 
 
+def test_finalized_dataset_accepts_shared_video_files_across_episodes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "dataset"
+    root.mkdir()
+    video_keys = [f"observation.images.{name}" for name in CAMERA_NAMES]
+    relative_paths = {
+        key: Path("videos") / key / "chunk-000" / "file-000.mp4" for key in video_keys
+    }
+    for path in relative_paths.values():
+        target = root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.touch()
+
+    class SharedMediaMeta:
+        features = dataset_features()
+        fps = 30
+        total_episodes = 2
+        total_frames = 15
+        episodes = [
+            {"length": 10, "dataset_from_index": 0, "dataset_to_index": 10},
+            {"length": 5, "dataset_from_index": 10, "dataset_to_index": 15},
+        ]
+
+        @staticmethod
+        def get_video_file_path(_episode_index: int, video_key: str) -> Path:
+            return relative_paths[video_key]
+
+    dataset = type("FinalizedDataset", (), {"root": root, "meta": SharedMediaMeta()})()
+    inspected: list[Path] = []
+
+    def frame_count(path: Path) -> int:
+        inspected.append(path)
+        return 15
+
+    monkeypatch.setattr("umi_teleop.dataset._video_frame_count", frame_count)
+
+    validate_finalized_dataset(dataset)
+
+    assert sorted(inspected) == sorted(root / path for path in relative_paths.values())
+
+
 def test_enable_starts_episode_after_unrecorded_startup_motion(tmp_path) -> None:
     recorder, dataset, _cameras = recorder_fixture(tmp_path)
     measured_joints, measured_grippers = robot_values(0.25)

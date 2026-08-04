@@ -64,8 +64,9 @@ finalized dataset to the Hugging Face Hub.
 - A bimanual frame is queued only after both arm commands return successfully.
 - Previously committed episodes remain local if capture, finalization, login, or
   upload fails.
-- Final validation checks contiguous episode row ranges and requires every encoded
-  camera video to have exactly the declared episode length before Hub upload.
+- Final validation checks contiguous episode row ranges and requires every encoded camera video
+  file to have exactly the combined length of all episodes that reference it before Hub upload.
+  This covers LeRobot's multi-episode shared-video layout without weakening frame-count checks.
 - Finalization is mandatory and idempotent. Upload begins only after both robots
   have been closed and the local dataset has finalized. Writer shutdown is
   bounded; a hung encoder reports an error and leaves the local files untouched

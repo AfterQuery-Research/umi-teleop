@@ -458,6 +458,7 @@ def _validate_video_integrity(dataset: Dataset) -> None:
     if episodes is None:
         raise DatasetRecordingError("finalized dataset is missing episode metadata")
     video_keys = [key for key, feature in meta.features.items() if feature.get("dtype") == "video"]
+    video_files: dict[tuple[str, Path], dict[str, Any]] = {}
     expected_from = 0
     for episode_index, episode in enumerate(episodes):
         try:
@@ -485,12 +486,12 @@ def _validate_video_integrity(dataset: Dataset) -> None:
                 raise DatasetRecordingError(
                     f"episode {episode_index} video is missing for {video_key}: {video_path}"
                 )
-            frame_count = _video_frame_count(video_path)
-            if frame_count != length:
-                raise DatasetRecordingError(
-                    f"episode {episode_index} {video_key} has {frame_count} encoded frames; "
-                    f"expected {length}"
-                )
+            entry = video_files.setdefault(
+                (video_key, video_path),
+                {"expected_frames": 0, "episodes": []},
+            )
+            entry["expected_frames"] += length
+            entry["episodes"].append(episode_index)
         expected_from = dataset_to
     if len(episodes) != int(meta.total_episodes) or expected_from != int(meta.total_frames):
         raise DatasetRecordingError(
@@ -498,6 +499,19 @@ def _validate_video_integrity(dataset: Dataset) -> None:
             f"episodes={len(episodes)}/{meta.total_episodes} "
             f"frames={expected_from}/{meta.total_frames}"
         )
+    for (video_key, video_path), entry in video_files.items():
+        frame_count = _video_frame_count(video_path)
+        expected_frames = int(entry["expected_frames"])
+        episode_indices = entry["episodes"]
+        if frame_count != expected_frames:
+            if len(episode_indices) == 1:
+                label = f"episode {episode_indices[0]} {video_key}"
+            else:
+                joined = ",".join(str(index) for index in episode_indices)
+                label = f"{video_key} shared video for episodes [{joined}]"
+            raise DatasetRecordingError(
+                f"{label} has {frame_count} encoded frames; expected {expected_frames}"
+            )
 
 
 def _check_free_disk(config: DatasetConfig, dataset: Dataset) -> None:

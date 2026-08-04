@@ -300,8 +300,9 @@ three camera encoders can keep up with capture without starving arm control. Add
 `--dataset.video-codec libsvtav1` only when AV1 file-level parity is required and the slower encoder
 has been tested on this hardware. Final validation decodes the
 first and last saved frames with PyAV, avoiding TorchCodec's optional GPU-linked runtime on ARM64.
-It also requires every camera video to contain exactly the number of frames declared in its episode
-metadata. A streaming encoder drop discards the active episode instead of saving misaligned views.
+It also requires every camera video file to contain exactly the combined number of frames declared
+by the episodes that reference it; LeRobot may pack multiple episodes into one shared file. A
+streaming encoder drop discards the active episode instead of saving misaligned views.
 Use a new dataset root/repository for these `480x270` recordings; they cannot be appended to an
 existing `640x360` LeRobot schema.
 
