@@ -83,10 +83,14 @@ class E2ERobot:
 
 
 class E2EIk:
+    instances: list[E2EIk] = []
+
     def __init__(self, *_args: Any) -> None:
-        pass
+        self.fk_calls = 0
+        self.instances.append(self)
 
     def fk(self, _joints: np.ndarray) -> np.ndarray:
+        self.fk_calls += 1
         return np.eye(4)
 
     def solve(self, _target: np.ndarray, initial: np.ndarray) -> tuple[bool, np.ndarray]:
@@ -203,6 +207,7 @@ def test_production_yam_loop_records_final_dispatched_simulated_actions(
     monkeypatch.setattr(yam, "IkModel", E2EIk)
     monkeypatch.setattr(yam, "make_robot", make_robot)
     monkeypatch.setattr(yam.signal, "signal", lambda *_args: None)
+    E2EIk.instances.clear()
 
     sender_done = threading.Event()
     sender = threading.Thread(target=stream_source, args=(port, sender_done), daemon=True)
@@ -245,3 +250,6 @@ def test_production_yam_loop_records_final_dispatched_simulated_actions(
         not np.allclose(frame["action"][:6], yam.DEFAULT_READY_JOINTS)
         for frame in dataset.episodes[0][4:]
     )
+    # Two initial/startup FK snapshots and one ZERO snapshot per arm are sufficient; live
+    # teleoperation must not put FK back into every 30 Hz foreground cycle.
+    assert sum(model.fk_calls for model in E2EIk.instances) == 6

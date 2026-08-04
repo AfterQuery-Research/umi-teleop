@@ -946,6 +946,11 @@ def run(args: Config) -> None:
                 name=name,
             )
         joint_goals = {name: joints[name].copy() for name in ARM_NAMES}
+        # The state machine only consumes live robot FK when ZERO is captured.  Keep the latest
+        # pose that produced a valid IK result for fallback search instead of recomputing FK for
+        # both arms on every control tick.  Per-frame FK contends with the background MuJoCo IK
+        # workers and can make an otherwise short control cycle miss the dataset deadline.
+        ik_reference_poses = {name: fk_models[name].fk(joints[name]) for name in ARM_NAMES}
         ik_generation = 0
         latest_ik_results: dict[str, IkFallbackResult] = {}
         ik_holding_since: dict[str, float | None] = {name: None for name in ARM_NAMES}
@@ -993,12 +998,21 @@ def run(args: Config) -> None:
                 time.sleep(period)
                 continue
             current_joints, current_grips = read_pair_state(robots)
-            current_poses = {name: fk_models[name].fk(current_joints[name]) for name in ARM_NAMES}
+            zero_capture_requested = (
+                state.session_id == packet["session_id"]
+                and packet["seq"] > state.last_seq
+                and packet["zero_id"] > state.zero_id
+            )
+            robot_poses = (
+                {name: fk_models[name].fk(current_joints[name]) for name in ARM_NAMES}
+                if zero_capture_requested
+                else ik_reference_poses
+            )
             observation_done = time.monotonic()
             was_armed = state.armed
             previous_session_id = state.session_id
             previous_cancel_id = state.cancel_id
-            result = state.step(packet, packet_age, current_poses)
+            result = state.step(packet, packet_age, robot_poses)
             prearm_episode_fault = None
             if recorder is not None and recorder.active and not was_armed and not result.armed:
                 if previous_session_id is not None and packet["session_id"] != previous_session_id:
@@ -1048,6 +1062,10 @@ def run(args: Config) -> None:
             if result.zero_captured:
                 joints = {name: current_joints[name].copy() for name in ARM_NAMES}
                 grips = dict(current_grips)
+                ik_reference_poses = {
+                    name: np.asarray(robot_poses[name], dtype=np.float64).copy()
+                    for name in ARM_NAMES
+                }
                 invalidate_ik()
                 for name in ARM_NAMES:
                     reason = joint_limit_reason(
@@ -1065,7 +1083,7 @@ def run(args: Config) -> None:
                 for name in ARM_NAMES:
                     async_ik[name].submit(
                         result.targets[name],
-                        current_poses[name],
+                        ik_reference_poses[name],
                         current_joints[name],
                         generation=ik_generation,
                         submitted_at=request_time,
@@ -1087,6 +1105,8 @@ def run(args: Config) -> None:
                         if outcome.mode == "holding_ik"
                         else outcome.joints.copy()
                     )
+                    if outcome.mode != "holding_ik":
+                        ik_reference_poses[name] = outcome.target_pose.copy()
                 for name in ARM_NAMES:
                     outcome = latest_ik_results.get(name)
                     if outcome is None:
