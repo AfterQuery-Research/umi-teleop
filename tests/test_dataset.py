@@ -18,6 +18,7 @@ from umi_teleop.dataset import (
     DatasetConfig,
     DatasetFrameError,
     DatasetRecordingError,
+    _effective_encoder_preset,
     build_frame,
     commit_dataset_step,
     create_dataset_recorder,
@@ -278,6 +279,7 @@ def test_disabled_recording_does_not_call_factories() -> None:
         ({"right_camera_serial": "left-1"}, "must be distinct"),
         ({"queue_size": 0}, "queue size must be positive"),
         ({"encoder_queue_size": 0}, "encoder queue size must be positive"),
+        ({"encoder_gop_size": 0}, "encoder GOP size must be positive"),
         ({"min_free_disk_gb": 0}, "minimum free disk space must be positive"),
         ({"shutdown_timeout_s": 0}, "shutdown timeout must be positive"),
         ({"resume": True}, "resume requires an explicit local root"),
@@ -297,6 +299,20 @@ def test_new_recording_rejects_nonempty_root(tmp_path: Path) -> None:
 
     with pytest.raises(DatasetRecordingError, match="root already exists"):
         recording_config(tmp_path, root=root).validate(30.0)
+
+
+def test_streaming_h264_uses_realtime_encoder_defaults(tmp_path: Path) -> None:
+    config = recording_config(tmp_path, streaming_encoding=True)
+
+    assert config.encoder_gop_size == 30
+    assert _effective_encoder_preset(config) == "ultrafast"
+    assert _effective_encoder_preset(recording_config(tmp_path, encoder_preset="fast")) == "fast"
+    assert (
+        _effective_encoder_preset(
+            recording_config(tmp_path, streaming_encoding=True, video_codec="libsvtav1")
+        )
+        is None
+    )
 
 
 def test_recording_checks_disk_before_starting_writer(tmp_path: Path) -> None:

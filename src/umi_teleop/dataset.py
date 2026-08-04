@@ -54,6 +54,8 @@ class DatasetConfig:
     encoder_threads: int = 2
     streaming_encoding: bool = False
     encoder_queue_size: int = 120
+    encoder_gop_size: int = DATASET_FPS
+    encoder_preset: str | None = None
     video_codec: Literal["h264", "libsvtav1"] = "h264"
     shutdown_timeout_s: float = 60.0
 
@@ -110,6 +112,7 @@ class DatasetConfig:
             ("image writer threads per camera", self.image_writer_threads_per_camera),
             ("encoder threads", self.encoder_threads),
             ("encoder queue size", self.encoder_queue_size),
+            ("encoder GOP size", self.encoder_gop_size),
         ):
             if value <= 0:
                 raise DatasetRecordingError(f"dataset {name} must be positive")
@@ -308,6 +311,15 @@ def _features_match(
     return all(actual_normalized.get(key) == value for key, value in expected_normalized.items())
 
 
+def _effective_encoder_preset(config: DatasetConfig) -> str | None:
+    """Prefer low-latency H.264 encoding while preserving explicit overrides."""
+    if config.encoder_preset is not None:
+        return config.encoder_preset
+    if config.streaming_encoding and config.video_codec == "h264":
+        return "ultrafast"
+    return None
+
+
 def _default_dataset_factory(config: DatasetConfig, features: dict[str, dict[str, Any]]) -> Dataset:
     try:
         from lerobot.configs import RGBEncoderConfig
@@ -329,7 +341,12 @@ def _default_dataset_factory(config: DatasetConfig, features: dict[str, dict[str
         "encoder_threads": config.encoder_threads,
         "streaming_encoding": config.streaming_encoding,
         "encoder_queue_maxsize": config.encoder_queue_size,
-        "rgb_encoder": RGBEncoderConfig(vcodec=config.video_codec, pix_fmt="yuv420p"),
+        "rgb_encoder": RGBEncoderConfig(
+            vcodec=config.video_codec,
+            pix_fmt="yuv420p",
+            g=config.encoder_gop_size,
+            preset=_effective_encoder_preset(config),
+        ),
     }
     if config.resume:
         dataset = LeRobotDataset.resume(config.repo_id, **common)

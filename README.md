@@ -271,6 +271,7 @@ then run:
   --dataset.top-camera-serial "$TOP_CAMERA" \
   --dataset.left-camera-serial "$LEFT_CAMERA" \
   --dataset.right-camera-serial "$RIGHT_CAMERA" \
+  --dataset.streaming-encoding \
   --dataset.push-to-hub \
   --confirm-clear
 ```
@@ -290,8 +291,10 @@ upload fails.
 
 To append during a later run, use the same repo ID and root and add `--dataset.resume`. Omit
 `--dataset.push-to-hub` to collect and validate locally without uploading. H.264/yuv420p is the
-Raspberry Pi default; add `--dataset.video-codec libsvtav1` only when AV1 file-level parity is
-required and the slower encoder has been tested on this hardware. Final validation decodes the
+Raspberry Pi default. Streaming H.264 uses a 30-frame GOP and the `ultrafast` x264 preset so the
+three camera encoders can keep up with capture without starving arm control. Add
+`--dataset.video-codec libsvtav1` only when AV1 file-level parity is required and the slower encoder
+has been tested on this hardware. Final validation decodes the
 first and last saved frames with PyAV, avoiding TorchCodec's optional GPU-linked runtime on ARM64.
 
 The resulting LeRobot v3 schema matches `MolmoAct2-BimanualYAM-Dataset`: `top`, `left`, and `right`
