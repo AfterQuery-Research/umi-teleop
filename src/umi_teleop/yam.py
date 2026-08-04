@@ -287,13 +287,29 @@ def check_can_interface(channel: str) -> None:
     output = proc.stdout
     if "state ERROR-ACTIVE" not in output or "UP" not in output.split(">", 1)[0]:
         raise SafetyStop(f"CAN interface {channel!r} is not UP and ERROR-ACTIVE")
+    counter_error = can_error_counter_error(output)
+    if counter_error is not None:
+        raise SafetyStop(f"CAN interface {channel!r} {counter_error}")
+
+
+def can_error_counter_error(output: str) -> str | None:
+    """Return a current CAN fault while tolerating recovered cumulative transitions."""
     match = re.search(
         r"re-started\s+bus-errors\s+arbit-lost\s+error-warn\s+error-pass\s+bus-off\s*\n"
         r"\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)",
         output,
     )
-    if match is None or any(int(v) for v in match.groups()):
-        raise SafetyStop(f"CAN interface {channel!r} has unreadable/non-zero error counters")
+    if match is None:
+        return "has unreadable error counters"
+    _restarted, bus_errors, _arbitration_lost, _error_warn, _error_pass, bus_off = (
+        int(value) for value in match.groups()
+    )
+    # warning/passive are cumulative transition counters. They may remain nonzero after the bus
+    # has recovered to ERROR-ACTIVE, so treating them as current faults prevents safe reuse until
+    # a privileged interface reset. Actual bus errors and bus-off events remain fail-closed.
+    if bus_errors or bus_off:
+        return f"has bus-errors={bus_errors}, bus-off={bus_off}"
+    return None
 
 
 def acquire_locks(channels: tuple[str, str]) -> list[Any]:

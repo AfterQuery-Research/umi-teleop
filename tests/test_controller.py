@@ -21,6 +21,7 @@ from umi_teleop.yam import (
     DEFAULT_SIM_INITIAL_JOINTS,
     Config,
     SafetyStop,
+    can_error_counter_error,
     find_control_processes,
     gripper_limits_for_mode,
     gripper_position,
@@ -119,6 +120,15 @@ def test_process_guard_ignores_own_launch_ancestors_but_not_other_controllers():
         "400     100 python   python experiments/launch_yaml.py",
         "500     100 python   python experiments/launch_vive_teleop.py --simulate",
     ]
+
+
+def test_can_counter_guard_allows_recovered_warning_and_passive_transitions():
+    header = "re-started bus-errors arbit-lost error-warn error-pass bus-off\n"
+
+    assert can_error_counter_error(header + "0 0 0 0 63 0") is None
+    assert "bus-errors=2" in (can_error_counter_error(header + "0 2 0 0 63 0") or "")
+    assert "bus-off=1" in (can_error_counter_error(header + "0 0 0 0 63 1") or "")
+    assert "unreadable" in (can_error_counter_error("missing") or "")
 
 
 def test_physical_can_channels_follow_adapter_serials_not_kernel_order():
