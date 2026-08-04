@@ -25,13 +25,21 @@ finalized dataset to the Hugging Face Hub.
 
 ## Episode Contract
 
-- A successful `E` enable transition starts one episode.
-- An intentional `E` disable transition commits the episode.
-- ZERO, CANCEL, source restart, stale telemetry, tracking loss, workspace limit,
-  IK failure, camera failure, or process shutdown discards the active episode.
+- With the default automatic move to the teleop-ready pose, the first episode starts immediately
+  before the first startup-motion command. Every startup observation and bounded joint command is
+  recorded, and the first successful `E` enable continues that same episode.
+- The idle wait for ZERO and E is omitted rather than padded with duplicate frames.
+- An intentional `E` disable transition commits the active episode.
+- If automatic move-to-ready is disabled, a successful `E` enable starts an episode as before.
+- Later `E` enable/disable cycles start and commit additional episodes normally. The automatic
+  move-to-base parking operation is not recorded.
+- ZERO while armed, CANCEL, source restart, stale telemetry, tracking loss, a configured persistent
+  IK-hold timeout, camera failure, or process shutdown discards the active episode. Ordinary
+  degraded/holding IK remains armed and records the final bounded or held action actually sent.
 - Episodes shorter than the configured minimum are discarded.
 - A discarded episode must not change the count of saved episodes.
-- A new episode can start only after a new disabled-to-enabled transition.
+- Apart from the automatic startup episode, a new episode can start only after a new
+  disabled-to-enabled transition.
 
 ## Safety And Failure Contract
 

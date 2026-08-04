@@ -18,9 +18,11 @@ from umi_teleop.dataset import (
     DatasetFrameError,
     DatasetRecordingError,
     build_frame,
+    commit_dataset_step,
     create_dataset_recorder,
     dataset_features,
     normalize_camera_image,
+    prepare_dataset_step,
     yam_vector,
 )
 
@@ -313,6 +315,43 @@ def test_async_recorder_saves_only_intentional_long_enough_episode(tmp_path) -> 
     assert dataset.clear_count == 2
     assert dataset.finalize_count == 1
     assert all(camera.disconnected == 1 for camera in cameras.values())
+
+
+def test_enable_continues_episode_that_started_during_ready_motion(tmp_path) -> None:
+    recorder, dataset, _cameras = recorder_fixture(tmp_path)
+    recorder.start_episode()
+    add_frame(recorder, measured_offset=0.0, command_offset=0.25)
+    measured_joints, measured_grippers = robot_values(0.25)
+    commanded_joints, commanded_grippers = robot_values(0.5)
+
+    prepared = prepare_dataset_step(
+        recorder,
+        was_armed=False,
+        is_armed=True,
+        invalid_frame_reason=None,
+        measured_joints=measured_joints,
+        measured_grippers=measured_grippers,
+        commanded_joints=commanded_joints,
+        commanded_grippers=commanded_grippers,
+    )
+    commit_dataset_step(
+        recorder,
+        prepared,
+        was_armed=False,
+        is_armed=True,
+        disarm_reason="enabled",
+    )
+    commit_dataset_step(
+        recorder,
+        None,
+        was_armed=True,
+        is_armed=False,
+        disarm_reason="enable toggled off",
+    )
+    recorder.close()
+
+    assert len(dataset.episodes) == 1
+    assert len(dataset.episodes[0]) == 2
 
 
 def test_push_happens_after_finalize_and_is_private_by_default(tmp_path) -> None:

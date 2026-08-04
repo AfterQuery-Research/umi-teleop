@@ -40,6 +40,7 @@ from umi_teleop.controller import (
 from umi_teleop.dataset import (
     DatasetConfig,
     DatasetFrameError,
+    DatasetRecorder,
     DatasetRecordingError,
     commit_dataset_step,
     create_dataset_recorder,
@@ -481,6 +482,7 @@ def move_pair_to_ready(
     hz: float,
     margin: float,
     readback_tolerance: float = DEFAULT_STARTUP_READBACK_TOLERANCE,
+    recorder: DatasetRecorder | None = None,
 ) -> dict[str, np.ndarray]:
     """Move both arms through a safe bend to the canonical teleoperation pose."""
     bend_targets = {name: ready_joint_target(joints[name], bend_joints) for name in ARM_NAMES}
@@ -498,6 +500,7 @@ def move_pair_to_ready(
             f"J2={math.degrees(float(bend_joints[0])):.1f}deg "
             f"J3={math.degrees(float(bend_joints[1])):.1f}deg"
         ),
+        recorder=recorder,
     )
     canonical_targets = {
         name: np.asarray(DEFAULT_READY_JOINTS, dtype=np.float64).copy() for name in ARM_NAMES
@@ -512,6 +515,7 @@ def move_pair_to_ready(
         margin,
         readback_tolerance,
         label="canonical teleop-ready pose [0, 23, 46, 0, 0, 0]deg",
+        recorder=recorder,
     )
 
 
@@ -548,6 +552,7 @@ def move_pair_to_joint_targets(
     margin: float,
     readback_tolerance: float,
     label: str,
+    recorder: DatasetRecorder | None = None,
 ) -> dict[str, np.ndarray]:
     """Linearly interpolate both arms to validated joint targets."""
     if speed_rad_s <= 0.0 or hz <= 0.0 or readback_tolerance <= 0.0:
@@ -568,18 +573,20 @@ def move_pair_to_joint_targets(
         flush=True,
     )
     period = 1.0 / hz
+    next_step = time.monotonic()
     for step_index in range(1, steps + 1):
         alpha = step_index / steps
         commanded = {
             name: starts[name] + alpha * (targets[name] - starts[name]) for name in ARM_NAMES
         }
-        command_pair(robots, commanded, grips)
-        time.sleep(period)
+        command_startup_pair(robots, commanded, grips, recorder)
+        next_step += period
+        time.sleep(max(0.0, next_step - time.monotonic()))
 
     deadline = time.monotonic() + 3.0
     observed: dict[str, np.ndarray] = {}
     while True:
-        command_pair(robots, targets, grips)
+        command_startup_pair(robots, targets, grips, recorder)
         observed = {name: arm_joints(robots[name]) for name in ARM_NAMES}
         max_error = max(float(np.max(np.abs(observed[name] - targets[name]))) for name in ARM_NAMES)
         if max_error <= readback_tolerance:
@@ -590,7 +597,8 @@ def move_pair_to_joint_targets(
                 f"{math.degrees(max_error):.1f}deg",
                 observed,
             )
-        time.sleep(period)
+        next_step += period
+        time.sleep(max(0.0, next_step - time.monotonic()))
     for name in ARM_NAMES:
         values = ",".join(f"{value:+.1f}" for value in np.degrees(observed[name]))
         print(f"{label} verified {name} joints_deg=[{values}]", flush=True)
@@ -620,6 +628,27 @@ def command_pair(
         if server_thread is not None and not server_thread.is_alive():
             raise SafetyStop(f"{name} robot command thread stopped")
         robots[name].command_joint_pos(np.concatenate([joints[name], [grips[name]]]))
+
+
+def command_startup_pair(
+    robots: dict[str, Any],
+    joints: dict[str, np.ndarray],
+    grips: dict[str, float],
+    recorder: DatasetRecorder | None,
+) -> None:
+    """Capture a startup observation, dispatch both arms, then commit its action."""
+    prepared_frame = None
+    if recorder is not None:
+        prepared_frame = recorder.prepare_frame(
+            measured_joints={name: arm_joints(robots[name]) for name in ARM_NAMES},
+            measured_grippers={name: gripper_position(robots[name]) for name in ARM_NAMES},
+            commanded_joints=joints,
+            commanded_grippers=grips,
+        )
+    command_pair(robots, joints, grips)
+    if recorder is not None:
+        assert prepared_frame is not None
+        recorder.commit_frame(prepared_frame)
 
 
 def monitor_only(receiver: UdpTeleopReceiver) -> None:
@@ -787,6 +816,12 @@ def run(args: Config) -> None:
             )
         joints = {name: arm_joints(robots[name]) for name in ARM_NAMES}
         grips = {name: gripper_position(robots[name]) for name in ARM_NAMES}
+        startup_recorder = recorder if args.move_to_ready else None
+        if startup_recorder is not None:
+            initial_poses = {name: ik[name].fk(joints[name]) for name in ARM_NAMES}
+            state.step(initial_packet, 0.0, initial_poses)
+            startup_recorder.start_episode()
+            print("DATASET recording includes teleop-ready startup motion", flush=True)
         if args.move_to_base:
             try:
                 joints = move_pair_to_base(
@@ -812,11 +847,19 @@ def run(args: Config) -> None:
                     args.hz,
                     args.joint_limit_margin,
                     args.startup_readback_tolerance,
+                    recorder=startup_recorder,
                 )
                 startup_blocked = None
             except StartupReadbackError as exc:
                 joints = exc.observed
                 startup_blocked = str(exc)
+                if startup_recorder is not None:
+                    startup_recorder.finish_episode(commit=False, reason=startup_blocked)
+            except DatasetFrameError as exc:
+                joints = {name: arm_joints(robots[name]) for name in ARM_NAMES}
+                startup_blocked = f"dataset episode invalid during startup: {exc}"
+                assert startup_recorder is not None
+                startup_recorder.finish_episode(commit=False, reason=startup_blocked)
         else:
             startup_blocked = None
         command_pair(robots, joints, grips)
@@ -876,7 +919,24 @@ def run(args: Config) -> None:
             )
             current_poses = {name: ik[name].fk(current_joints[name]) for name in ARM_NAMES}
             was_armed = state.armed
+            previous_session_id = state.session_id
+            previous_cancel_id = state.cancel_id
             result = state.step(packet, packet_age, current_poses)
+            prearm_episode_fault = None
+            if recorder is not None and recorder.active and not was_armed and not result.armed:
+                if previous_session_id is not None and packet["session_id"] != previous_session_id:
+                    prearm_episode_fault = "source restarted before teleoperation enabled"
+                elif packet["cancel_id"] > previous_cancel_id:
+                    prearm_episode_fault = "cancel button"
+                elif result.reason.startswith("telemetry stale"):
+                    prearm_episode_fault = result.reason
+                elif "stale" in result.reason or result.reason.startswith("ZERO rejected"):
+                    prearm_episode_fault = result.reason
+                if prearm_episode_fault is not None:
+                    try:
+                        recorder.finish_episode(commit=False, reason=prearm_episode_fault)
+                    except DatasetRecordingError as exc:
+                        raise SafetyStop(str(exc)) from exc
             if result.quit:
                 if recorder is not None:
                     try:

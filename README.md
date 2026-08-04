@@ -275,11 +275,16 @@ then run:
   --confirm-clear
 ```
 
-Use the normal teleoperation controls. A successful E enable starts an episode. Tapping E to stop
-saves it. Z, CANCEL, a safety disarm, camera/IK/timing failure, source restart, or Ctrl+C during an
-episode discards that incomplete episode. After the desired episode has printed `DATASET episode
-saved`, support the arms and press Ctrl+C. Both robots close first; the dataset then finalizes,
-validates locally, and uploads privately. The local dataset is retained if login or upload fails.
+With the default automatic move to the teleop-ready pose, recording starts immediately before the
+arms begin that upward motion. Those startup frames and commands become the beginning of episode 1;
+the idle wait for ZERO/E is omitted, and the first successful E enable continues the same episode.
+Tapping E to stop saves it. Later E enable/disable cycles create additional episodes normally. If
+automatic move-to-ready is disabled, E enable starts the first episode as before. Z while armed,
+CANCEL, a safety disarm, camera/timing failure, source restart, or Ctrl+C during an episode discards
+that incomplete episode. Ordinary degraded or holding IK records the final bounded/held command
+without ending the episode. After the desired episode has printed `DATASET episode saved`, support
+the arms and press Ctrl+C. Both robots close first; the dataset then finalizes, validates locally,
+and uploads privately. The local dataset is retained if login or upload fails.
 
 To append during a later run, use the same repo ID and root and add `--dataset.resume`. Omit
 `--dataset.push-to-hub` to collect and validate locally without uploading. H.264/yuv420p is the

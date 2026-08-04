@@ -720,7 +720,7 @@ def prepare_dataset_step(
     commanded_grippers: Mapping[str, float],
 ) -> dict[str, Any] | None:
     """Capture a pre-command observation for one motor-loop result."""
-    if not was_armed and is_armed:
+    if not was_armed and is_armed and not recorder.active:
         recorder.start_episode()
     if is_armed and recorder.active:
         if invalid_frame_reason is not None:

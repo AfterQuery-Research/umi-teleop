@@ -10,7 +10,13 @@ import numpy as np
 import pytest
 
 import umi_teleop.yam as yam
-from umi_teleop.dataset import CAMERA_NAMES, CAMERA_SHAPE, DatasetConfig, create_dataset_recorder
+from umi_teleop.dataset import (
+    CAMERA_NAMES,
+    CAMERA_SHAPE,
+    DatasetConfig,
+    DatasetFrameError,
+    create_dataset_recorder,
+)
 from umi_teleop.protocol import ButtonState, encode_teleop_packet
 from umi_teleop.types import Event
 
@@ -85,6 +91,24 @@ class E2EIk:
 
     def solve(self, _target: np.ndarray, initial: np.ndarray) -> tuple[bool, np.ndarray]:
         return True, np.asarray(initial, dtype=np.float64) + 0.005
+
+
+def test_startup_camera_failure_prevents_arm_dispatch() -> None:
+    robots = {"left": E2ERobot(), "right": E2ERobot()}
+    joints = {name: robot.joints.copy() for name, robot in robots.items()}
+    grips = {name: robot.gripper for name, robot in robots.items()}
+
+    class FailingRecorder:
+        def prepare_frame(self, **_kwargs: Any) -> dict[str, Any]:
+            raise DatasetFrameError("camera unavailable")
+
+        def commit_frame(self, _frame: dict[str, Any]) -> None:
+            raise AssertionError("a failed startup frame must not be committed")
+
+    with pytest.raises(DatasetFrameError, match="camera unavailable"):
+        yam.command_startup_pair(robots, joints, grips, FailingRecorder())
+
+    assert all(robot.commands == [] for robot in robots.values())
 
 
 def free_udp_port() -> int:
@@ -186,7 +210,8 @@ def test_production_yam_loop_records_final_dispatched_simulated_actions(
         yam.Config(
             bind="127.0.0.1",
             port=port,
-            move_to_ready=False,
+            move_to_ready=True,
+            ready_joint_speed=100.0,
             simulate=True,
             stream_timeout=2.0,
             dataset=dataset_config,
@@ -197,7 +222,7 @@ def test_production_yam_loop_records_final_dispatched_simulated_actions(
     assert sender_done.is_set()
     assert dataset is not None and dataset.finalized
     assert len(dataset.episodes) == 1
-    assert len(dataset.episodes[0]) >= 2
+    assert len(dataset.episodes[0]) >= 6
     assert len(robots) == 2 and all(robot.closed for robot in robots)
     assert all(camera.disconnected for camera in cameras.values())
 
@@ -208,4 +233,14 @@ def test_production_yam_loop_records_final_dispatched_simulated_actions(
     assert any(
         not np.array_equal(frame["observation.state"], frame["action"])
         for frame in dataset.episodes[0]
+    )
+    first_frame = dataset.episodes[0][0]
+    np.testing.assert_allclose(
+        first_frame["observation.state"][:6],
+        yam.DEFAULT_SIM_INITIAL_JOINTS,
+    )
+    np.testing.assert_allclose(first_frame["action"][:6], yam.DEFAULT_READY_JOINTS)
+    assert any(
+        not np.allclose(frame["action"][:6], yam.DEFAULT_READY_JOINTS)
+        for frame in dataset.episodes[0][4:]
     )
