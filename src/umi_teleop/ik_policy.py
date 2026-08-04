@@ -5,6 +5,8 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from threading import Condition, Thread
+from time import monotonic
 from typing import Literal
 
 import numpy as np
@@ -143,6 +145,27 @@ class IkFallbackResult:
     @property
     def orientation_alpha(self) -> float:
         return self.position_alpha * self.orientation_relaxation
+
+
+@dataclass(frozen=True)
+class AsyncIkCompletion:
+    """One completed IK request, including enough timing data to reject stale work."""
+
+    request_id: int
+    generation: int
+    submitted_at: float
+    completed_at: float
+    outcome: IkFallbackResult
+
+
+@dataclass(frozen=True)
+class _AsyncIkRequest:
+    request_id: int
+    generation: int
+    submitted_at: float
+    desired_pose: np.ndarray
+    last_good_pose: np.ndarray
+    last_good_joints: np.ndarray
 
 
 def _validated_fractions(
@@ -308,6 +331,130 @@ class FallbackIkSolver:
             full_target_failure=exact_failure,
             final_failure=final_failure,
         )
+
+
+class AsyncFallbackIkSolver:
+    """Run one arm's stateful fallback solver outside the real-time control loop.
+
+    There is at most one pending request. If control produces targets faster than IK can solve
+    them, the not-yet-started request is replaced by the newest target instead of building an
+    unbounded stale-work queue. The worker owns ``FallbackIkSolver`` and its kinematics model.
+    """
+
+    def __init__(self, solver: FallbackIkSolver, *, name: str):
+        self.solver = solver
+        self.name = name
+        self._condition = Condition()
+        self._pending: _AsyncIkRequest | None = None
+        self._latest: AsyncIkCompletion | None = None
+        self._worker_error: BaseException | None = None
+        self._next_request_id = 1
+        self._last_delivered_id = 0
+        self._closed = False
+        self._thread = Thread(
+            target=self._run,
+            name=f"umi-ik-{name}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(
+        self,
+        desired_pose: np.ndarray,
+        last_good_pose: np.ndarray,
+        last_good_joints: np.ndarray,
+        *,
+        generation: int,
+        submitted_at: float | None = None,
+    ) -> int:
+        """Replace pending work with the newest target and return its request ID."""
+        timestamp = monotonic() if submitted_at is None else float(submitted_at)
+        request = _AsyncIkRequest(
+            request_id=0,
+            generation=int(generation),
+            submitted_at=timestamp,
+            desired_pose=np.asarray(desired_pose, dtype=np.float64).copy(),
+            last_good_pose=np.asarray(last_good_pose, dtype=np.float64).copy(),
+            last_good_joints=np.asarray(last_good_joints, dtype=np.float64).copy(),
+        )
+        with self._condition:
+            self._raise_if_unavailable()
+            request = _AsyncIkRequest(
+                request_id=self._next_request_id,
+                generation=request.generation,
+                submitted_at=request.submitted_at,
+                desired_pose=request.desired_pose,
+                last_good_pose=request.last_good_pose,
+                last_good_joints=request.last_good_joints,
+            )
+            self._next_request_id += 1
+            self._pending = request
+            self._condition.notify()
+            return request.request_id
+
+    def poll(self, *, generation: int) -> AsyncIkCompletion | None:
+        """Return each completed result at most once, ignoring prior control generations."""
+        with self._condition:
+            self._raise_if_unavailable()
+            completion = self._latest
+            if completion is None or completion.request_id <= self._last_delivered_id:
+                return None
+            self._last_delivered_id = completion.request_id
+            if completion.generation != generation:
+                return None
+            return completion
+
+    def close(self, timeout_s: float = 0.0) -> bool:
+        """Request worker shutdown; return whether it stopped within the optional timeout."""
+        with self._condition:
+            if not self._closed:
+                self._closed = True
+                self._pending = None
+                self._condition.notify_all()
+        if timeout_s > 0.0:
+            self._thread.join(timeout=timeout_s)
+        return not self._thread.is_alive()
+
+    def _raise_if_unavailable(self) -> None:
+        if self._worker_error is not None:
+            raise RuntimeError(
+                f"{self.name} IK worker failed: {self._worker_error}"
+            ) from self._worker_error
+        if self._closed:
+            raise RuntimeError(f"{self.name} IK worker is closed")
+
+    def _run(self) -> None:
+        active_generation: int | None = None
+        try:
+            while True:
+                with self._condition:
+                    self._condition.wait_for(lambda: self._closed or self._pending is not None)
+                    if self._closed:
+                        return
+                    request = self._pending
+                    self._pending = None
+                assert request is not None
+                if request.generation != active_generation:
+                    self.solver.reset()
+                    active_generation = request.generation
+                outcome = self.solver.solve_target(
+                    request.desired_pose,
+                    request.last_good_pose,
+                    request.last_good_joints,
+                )
+                completion = AsyncIkCompletion(
+                    request_id=request.request_id,
+                    generation=request.generation,
+                    submitted_at=request.submitted_at,
+                    completed_at=monotonic(),
+                    outcome=outcome,
+                )
+                with self._condition:
+                    self._latest = completion
+        except BaseException as exc:
+            with self._condition:
+                self._worker_error = exc
+                self._condition.notify_all()
 
 
 def fallback_diagnostic(side: str, result: IkFallbackResult, desired_pose: np.ndarray) -> str:

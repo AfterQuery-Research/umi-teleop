@@ -90,6 +90,7 @@ class E2EIk:
         return np.eye(4)
 
     def solve(self, _target: np.ndarray, initial: np.ndarray) -> tuple[bool, np.ndarray]:
+        time.sleep(0.05)
         return True, np.asarray(initial, dtype=np.float64) + 0.005
 
 

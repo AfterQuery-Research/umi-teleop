@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import math
+import time
+from threading import Event
 
 import numpy as np
 import pytest
 
 from umi_teleop.controller import rotation_angle
 from umi_teleop.ik_policy import (
+    AsyncFallbackIkSolver,
     FallbackIkSolver,
     fallback_diagnostic,
     interpolate_pose,
@@ -215,3 +218,64 @@ def test_fallback_configuration_is_validated():
             lambda _q: None,
             orientation_relaxations=(1.0, 0.5, 0.5),
         )
+
+
+def test_async_solver_keeps_only_latest_pending_target():
+    started = Event()
+    release = Event()
+    attempted_x: list[float] = []
+
+    def solve(target, initial):
+        x = float(target[0, 3])
+        attempted_x.append(x)
+        if x == 1.0:
+            started.set()
+            assert release.wait(timeout=1.0)
+        return True, initial + x
+
+    worker = AsyncFallbackIkSolver(
+        FallbackIkSolver(solve, lambda _joints: None),
+        name="test",
+    )
+    try:
+        first_id = worker.submit(pose(1.0), pose(), np.zeros(6), generation=4)
+        assert started.wait(timeout=1.0)
+
+        submitted = time.monotonic()
+        worker.submit(pose(2.0), pose(), np.zeros(6), generation=4)
+        latest_id = worker.submit(pose(3.0), pose(), np.zeros(6), generation=4)
+        assert time.monotonic() - submitted < 0.1
+        release.set()
+
+        completions = []
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if completion := worker.poll(generation=4):
+                completions.append(completion)
+                if completion.request_id == latest_id:
+                    break
+            time.sleep(0.005)
+
+        assert first_id < latest_id
+        assert completions[-1].request_id == latest_id
+        np.testing.assert_allclose(completions[-1].outcome.joints, 3.0)
+        assert attempted_x == [1.0, 3.0]
+    finally:
+        release.set()
+        assert worker.close(timeout_s=1.0)
+
+
+def test_async_solver_does_not_deliver_an_old_generation():
+    worker = AsyncFallbackIkSolver(
+        FallbackIkSolver(lambda _target, initial: (True, initial), lambda _joints: None),
+        name="test",
+    )
+    try:
+        worker.submit(pose(), pose(), np.zeros(6), generation=1)
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and worker._latest is None:
+            time.sleep(0.005)
+        assert worker.poll(generation=2) is None
+        assert worker.poll(generation=1) is None
+    finally:
+        assert worker.close(timeout_s=1.0)

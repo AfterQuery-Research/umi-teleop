@@ -14,6 +14,7 @@ from umi_teleop.dataset import (
     CAMERA_SHAPE,
     TOP_CAMERA_CAPTURE_HEIGHT,
     YAM_SCALAR_NAMES,
+    ControlLagMonitor,
     DatasetConfig,
     DatasetFrameError,
     DatasetRecordingError,
@@ -38,6 +39,29 @@ class FakeCamera:
 
     def disconnect(self) -> None:
         self.disconnected += 1
+
+
+def test_control_lag_monitor_recovers_from_a_transient_backlog():
+    monitor = ControlLagMonitor(limit_s=0.1, grace_s=0.5)
+
+    entered = monitor.observe(0.15, cycle_overrun_s=0.08, now=10.0)
+    recovering = monitor.observe(0.12, cycle_overrun_s=0.0, now=10.2)
+    recovered = monitor.observe(0.08, cycle_overrun_s=0.0, now=10.3)
+
+    assert entered.over_limit and not entered.fault
+    assert recovering.over_limit and not recovering.fault
+    assert not recovered.over_limit and not recovered.fault
+
+
+def test_control_lag_monitor_rejects_sustained_or_severe_overload():
+    monitor = ControlLagMonitor(limit_s=0.1, grace_s=0.5)
+    monitor.observe(0.15, cycle_overrun_s=0.08, now=20.0)
+    sustained = monitor.observe(0.14, cycle_overrun_s=0.08, now=20.5)
+    assert sustained.fault
+
+    monitor.reset()
+    severe = monitor.observe(0.7, cycle_overrun_s=0.61, now=30.0)
+    assert severe.fault
 
 
 class FakeDataset:

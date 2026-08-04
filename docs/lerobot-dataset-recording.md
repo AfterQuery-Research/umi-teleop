@@ -52,8 +52,13 @@ finalized dataset to the Hugging Face Hub.
 - Queue overflow and background writer failures fail closed.
 - Require a configurable free-disk reserve before initialization and before each
   episode.
-- A control-loop delay over the configured timing limit discards the episode;
-  LeRobot timestamps are otherwise synthesized at the declared 30 Hz.
+- Per-arm IK and bounded fallback search run in latest-target background workers. The foreground
+  loop accepts only fresh, validated results, applies its existing joint slew limit at 30 Hz, and
+  holds the last validated goal while a worker is busy.
+- A transient scheduling backlog over the configured timing limit is allowed to recover. Only a
+  backlog that remains over the limit for the configured grace period, or a single cycle exceeding
+  the combined limit and grace, discards the episode. LeRobot timestamps are otherwise synthesized
+  at the declared 30 Hz.
 - A bimanual frame is queued only after both arm commands return successfully.
 - Previously committed episodes remain local if capture, finalization, login, or
   upload fails.

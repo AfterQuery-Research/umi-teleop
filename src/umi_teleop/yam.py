@@ -38,6 +38,7 @@ from umi_teleop.controller import (
     world_frame_delta,
 )
 from umi_teleop.dataset import (
+    ControlLagMonitor,
     DatasetConfig,
     DatasetFrameError,
     DatasetRecorder,
@@ -46,7 +47,12 @@ from umi_teleop.dataset import (
     create_dataset_recorder,
     prepare_dataset_step,
 )
-from umi_teleop.ik_policy import FallbackIkSolver, IkFallbackResult, fallback_diagnostic
+from umi_teleop.ik_policy import (
+    AsyncFallbackIkSolver,
+    FallbackIkSolver,
+    IkFallbackResult,
+    fallback_diagnostic,
+)
 
 KNOWN_CONTROL_PATTERNS = (
     "umi-yam",
@@ -111,6 +117,7 @@ class Config:
     ik_ori_threshold: float = 2e-3
     ik_fallback_attempts_per_cycle: int = 2
     ik_hold_disarm_s: float = 0.0
+    ik_result_max_age_s: float = 0.25
     stream_timeout: float = 20.0
     monitor_only: bool = False
     simulate: bool = False
@@ -457,6 +464,14 @@ def check_joint_target(robot: Any, target: np.ndarray, margin: float) -> bool:
 def joint_limit_reason(robot: Any, target: np.ndarray, margin: float) -> str | None:
     """Describe the first joint that is invalid or inside the configured limit margin."""
     limits = np.asarray(robot.get_robot_info()["joint_limits"], dtype=np.float64)
+    return joint_limit_reason_from_limits(limits, target, margin)
+
+
+def joint_limit_reason_from_limits(
+    limits: np.ndarray, target: np.ndarray, margin: float
+) -> str | None:
+    """Validate joints against a cached limit table without touching a hardware object."""
+    limits = np.asarray(limits, dtype=np.float64)
     if target.shape != (6,) or not np.isfinite(target).all() or limits.shape != (6, 2):
         return "has invalid joint data"
     for index, (value, bounds) in enumerate(zip(target, limits, strict=True), start=1):
@@ -723,6 +738,8 @@ def run(args: Config) -> None:
         raise SafetyStop("--ik-fallback-attempts-per-cycle must be at least one")
     if args.ik_hold_disarm_s < 0.0:
         raise SafetyStop("--ik-hold-disarm-s must be nonnegative")
+    if args.ik_result_max_age_s <= 0.0:
+        raise SafetyStop("--ik-result-max-age-s must be positive")
     if not args.monitor_only and not args.simulate and not args.confirm_clear:
         raise SafetyStop(
             "this command can move physical arms; clear the workspace and pass --confirm-clear"
@@ -777,7 +794,11 @@ def run(args: Config) -> None:
     )
 
     # Mink/MuJoCo allocation can hold the GIL; do it before any motor command thread exists.
-    ik = {
+    fk_models = {
+        name: IkModel(args.ik_max_iters, args.ik_pos_threshold, args.ik_ori_threshold)
+        for name in ARM_NAMES
+    }
+    solve_models = {
         name: IkModel(args.ik_max_iters, args.ik_pos_threshold, args.ik_ori_threshold)
         for name in ARM_NAMES
     }
@@ -796,6 +817,7 @@ def run(args: Config) -> None:
     channels: tuple[str, ...] = ()
     locks: list[Any] = []
     robots: dict[str, Any] = {}
+    async_ik: dict[str, AsyncFallbackIkSolver] = {}
     recorder = None
     try:
         try:
@@ -834,7 +856,7 @@ def run(args: Config) -> None:
         joints, grips = read_pair_state(robots)
         startup_recorder = recorder if args.move_to_ready else None
         if startup_recorder is not None:
-            initial_poses = {name: ik[name].fk(joints[name]) for name in ARM_NAMES}
+            initial_poses = {name: fk_models[name].fk(joints[name]) for name in ARM_NAMES}
             state.step(initial_packet, 0.0, initial_poses)
             startup_recorder.start_episode()
             print("DATASET recording includes teleop-ready startup motion", flush=True)
@@ -893,17 +915,41 @@ def run(args: Config) -> None:
         period = 1.0 / args.hz
         max_joint_step = args.max_joint_speed / args.hz
         max_gripper_step = args.max_gripper_speed / args.hz
-        fallback_solvers: dict[str, FallbackIkSolver] = {}
         for name in ARM_NAMES:
-            fallback_solvers[name] = FallbackIkSolver(
-                ik[name].solve,
-                lambda target, name=name: joint_limit_reason(
-                    robots[name], target, args.joint_limit_margin
+            limits = np.asarray(robots[name].get_robot_info()["joint_limits"], dtype=np.float64)
+
+            def validate_target(target: np.ndarray, limits: np.ndarray = limits) -> str | None:
+                return joint_limit_reason_from_limits(limits, target, args.joint_limit_margin)
+
+            async_ik[name] = AsyncFallbackIkSolver(
+                FallbackIkSolver(
+                    solve_models[name].solve,
+                    validate_target,
+                    fallback_attempts_per_cycle=args.ik_fallback_attempts_per_cycle,
                 ),
-                fallback_attempts_per_cycle=args.ik_fallback_attempts_per_cycle,
+                name=name,
             )
-        last_good_poses = {name: ik[name].fk(joints[name]) for name in ARM_NAMES}
+        joint_goals = {name: joints[name].copy() for name in ARM_NAMES}
+        ik_generation = 0
+        latest_ik_results: dict[str, IkFallbackResult] = {}
         ik_holding_since: dict[str, float | None] = {name: None for name in ARM_NAMES}
+        lag_monitor = (
+            ControlLagMonitor(
+                args.dataset.max_control_lag_s,
+                args.dataset.control_lag_grace_s,
+            )
+            if recorder is not None
+            else None
+        )
+        timing_warning_active = False
+
+        def invalidate_ik() -> None:
+            nonlocal ik_generation, joint_goals, latest_ik_results, ik_holding_since
+            ik_generation += 1
+            joint_goals = {name: joints[name].copy() for name in ARM_NAMES}
+            latest_ik_results.clear()
+            ik_holding_since = {name: None for name in ARM_NAMES}
+
         last_log = 0.0
         stop = False
 
@@ -920,6 +966,8 @@ def run(args: Config) -> None:
             if packet is None or packet_age is None:
                 was_armed = state.armed
                 state.disarm("waiting for telemetry")
+                if was_armed:
+                    invalidate_ik()
                 if recorder is not None and was_armed:
                     try:
                         recorder.finish_episode(commit=False, reason=state.reason)
@@ -929,7 +977,7 @@ def run(args: Config) -> None:
                 time.sleep(period)
                 continue
             current_joints, current_grips = read_pair_state(robots)
-            current_poses = {name: ik[name].fk(current_joints[name]) for name in ARM_NAMES}
+            current_poses = {name: fk_models[name].fk(current_joints[name]) for name in ARM_NAMES}
             observation_done = time.monotonic()
             was_armed = state.armed
             previous_session_id = state.session_id
@@ -984,10 +1032,7 @@ def run(args: Config) -> None:
             if result.zero_captured:
                 joints = {name: current_joints[name].copy() for name in ARM_NAMES}
                 grips = dict(current_grips)
-                last_good_poses = {name: current_poses[name].copy() for name in ARM_NAMES}
-                ik_holding_since = {name: None for name in ARM_NAMES}
-                for solver in fallback_solvers.values():
-                    solver.reset()
+                invalidate_ik()
                 for name in ARM_NAMES:
                     reason = joint_limit_reason(
                         robots[name], current_joints[name], args.joint_limit_margin
@@ -999,25 +1044,48 @@ def run(args: Config) -> None:
                         break
             held_joints = {name: joints[name].copy() for name in ARM_NAMES}
             held_grips = dict(grips)
-            ik_results: dict[str, IkFallbackResult] = {}
             if result.armed and result.targets is not None:
+                request_time = time.monotonic()
                 for name in ARM_NAMES:
-                    ik_results[name] = fallback_solvers[name].solve_target(
-                        result.targets[name], last_good_poses[name], joints[name]
+                    async_ik[name].submit(
+                        result.targets[name],
+                        current_poses[name],
+                        current_joints[name],
+                        generation=ik_generation,
+                        submitted_at=request_time,
                     )
                 cycle_now = time.monotonic()
                 for name in ARM_NAMES:
-                    outcome = ik_results[name]
+                    completion = async_ik[name].poll(generation=ik_generation)
+                    if completion is None:
+                        continue
+                    if cycle_now - completion.submitted_at > args.ik_result_max_age_s:
+                        joint_goals[name] = joints[name].copy()
+                        latest_ik_results.pop(name, None)
+                        ik_holding_since[name] = None
+                        continue
+                    outcome = completion.outcome
+                    latest_ik_results[name] = outcome
+                    joint_goals[name] = (
+                        joints[name].copy()
+                        if outcome.mode == "holding_ik"
+                        else outcome.joints.copy()
+                    )
+                for name in ARM_NAMES:
+                    outcome = latest_ik_results.get(name)
+                    if outcome is None:
+                        continue
                     if outcome.mode == "holding_ik":
                         if ik_holding_since[name] is None:
                             ik_holding_since[name] = cycle_now
                     else:
-                        delta = np.clip(
-                            outcome.joints - joints[name], -max_joint_step, max_joint_step
-                        )
-                        joints[name] += delta
-                        last_good_poses[name] = ik[name].fk(joints[name])
                         ik_holding_since[name] = None
+
+                for name in ARM_NAMES:
+                    delta = np.clip(
+                        joint_goals[name] - joints[name], -max_joint_step, max_joint_step
+                    )
+                    joints[name] += delta
 
                     desired_grip = result.grippers[name]
                     if desired_grip is not None:
@@ -1026,8 +1094,16 @@ def run(args: Config) -> None:
                         )
                         grips[name] = float(np.clip(grips[name] + grip_delta, 0.0, 1.0))
 
-                holding = [name for name in ARM_NAMES if ik_results[name].mode == "holding_ik"]
-                degraded = [name for name in ARM_NAMES if ik_results[name].mode == "degraded_ik"]
+                holding = [
+                    name
+                    for name, outcome in latest_ik_results.items()
+                    if outcome.mode == "holding_ik"
+                ]
+                degraded = [
+                    name
+                    for name, outcome in latest_ik_results.items()
+                    if outcome.mode == "degraded_ik"
+                ]
                 if args.ik_hold_disarm_s > 0.0:
                     expired = [
                         name
@@ -1053,9 +1129,11 @@ def run(args: Config) -> None:
                     if result.envelope_clamps and (holding or degraded):
                         state.reason += "; " + result.reason
             elif not result.armed:
+                joint_goals = {name: joints[name].copy() for name in ARM_NAMES}
+                latest_ik_results.clear()
                 ik_holding_since = {name: None for name in ARM_NAMES}
-                for solver in fallback_solvers.values():
-                    solver.reset()
+            if was_armed and not state.armed:
+                invalidate_ik()
             control_done = time.monotonic()
             prepared_dataset_frame = None
             if recorder is not None:
@@ -1074,6 +1152,7 @@ def run(args: Config) -> None:
                     state.disarm(f"dataset episode invalid: {exc}")
                     joints = held_joints
                     grips = held_grips
+                    invalidate_ik()
                     try:
                         recorder.finish_episode(commit=False, reason=state.reason)
                     except DatasetRecordingError as finish_exc:
@@ -1126,12 +1205,13 @@ def run(args: Config) -> None:
                         )
                     clamp_text = " command_clamped[" + " | ".join(pieces) + "]"
                 ik_text = ""
-                if ik_results and result.targets is not None:
+                if latest_ik_results and result.targets is not None:
                     ik_text = (
                         " ik["
                         + " | ".join(
-                            fallback_diagnostic(name, ik_results[name], result.targets[name])
+                            fallback_diagnostic(name, latest_ik_results[name], result.targets[name])
                             for name in ARM_NAMES
+                            if name in latest_ik_results
                         )
                         + "]"
                     )
@@ -1144,14 +1224,33 @@ def run(args: Config) -> None:
                 )
                 last_log = now
             next_step += period
-            control_lag = max(0.0, time.monotonic() - next_step)
-            if (
-                recorder is not None
-                and recorder.active
-                and control_lag > args.dataset.max_control_lag_s
-            ):
+            timing_now = time.monotonic()
+            control_lag = max(0.0, timing_now - next_step)
+            cycle_overrun = max(0.0, dispatch_done - cycle_started - period)
+            if recorder is not None and recorder.active:
+                assert lag_monitor is not None
+                decision = lag_monitor.observe(
+                    control_lag,
+                    cycle_overrun_s=cycle_overrun,
+                    now=timing_now,
+                )
+                if decision.over_limit and not timing_warning_active:
+                    print(
+                        f"DATASET timing recovery lag={control_lag:.3f}s; "
+                        f"allowing {args.dataset.control_lag_grace_s:.3f}s to catch up",
+                        flush=True,
+                    )
+                    timing_warning_active = True
+                elif not decision.over_limit:
+                    if timing_warning_active:
+                        print("DATASET timing recovered", flush=True)
+                    timing_warning_active = False
+                if not decision.fault:
+                    time.sleep(max(0.0, next_step - time.monotonic()))
+                    continue
                 reason = (
-                    f"control loop lagged by {control_lag:.3f}s; "
+                    f"control loop lagged by {control_lag:.3f}s for "
+                    f"{decision.over_limit_for_s:.3f}s; "
                     f"last cycle={(dispatch_done - cycle_started) * 1000:.1f}ms "
                     f"observe/FK={(observation_done - cycle_started) * 1000:.1f}ms "
                     f"control/IK={(control_done - observation_done) * 1000:.1f}ms "
@@ -1159,6 +1258,7 @@ def run(args: Config) -> None:
                     f"dispatch={(dispatch_done - dataset_done) * 1000:.1f}ms"
                 )
                 state.disarm(f"dataset episode invalid: {reason}")
+                invalidate_ik()
                 try:
                     recorder.finish_episode(
                         commit=False,
@@ -1166,16 +1266,28 @@ def run(args: Config) -> None:
                     )
                 except DatasetRecordingError as exc:
                     raise SafetyStop(str(exc)) from exc
+                timing_warning_active = False
+                lag_monitor.reset()
+            else:
+                if lag_monitor is not None:
+                    lag_monitor.reset()
+                timing_warning_active = False
             time.sleep(max(0.0, next_step - time.monotonic()))
     finally:
         pending_exception = sys.exc_info()[0] is not None
         cleanup_errors: list[str] = []
+        for name in reversed(ARM_NAMES):
+            if name in async_ik:
+                async_ik[name].close()
         for name in reversed(ARM_NAMES):
             if name in robots:
                 try:
                     close_robot(robots[name])
                 except Exception as exc:
                     cleanup_errors.append(f"failed to close {name} robot: {exc}")
+        for name in reversed(ARM_NAMES):
+            if name in async_ik and not async_ik[name].close(timeout_s=1.0):
+                cleanup_errors.append(f"{name} IK worker did not stop within 1.0s")
         try:
             receiver.close()
         except Exception as exc:

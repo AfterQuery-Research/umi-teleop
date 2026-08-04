@@ -48,6 +48,7 @@ class DatasetConfig:
     queue_size: int = 300
     camera_max_age_ms: int = 250
     max_control_lag_s: float = 0.10
+    control_lag_grace_s: float = 0.50
     min_free_disk_gb: float = 5.0
     image_writer_threads_per_camera: int = 2
     encoder_threads: int = 2
@@ -111,6 +112,8 @@ class DatasetConfig:
                 raise DatasetRecordingError(f"dataset {name} must be positive")
         if self.max_control_lag_s <= 0.0:
             raise DatasetRecordingError("dataset max control lag must be positive")
+        if self.control_lag_grace_s <= 0.0:
+            raise DatasetRecordingError("dataset control lag grace must be positive")
         if self.min_free_disk_gb <= 0.0:
             raise DatasetRecordingError("dataset minimum free disk space must be positive")
         if self.shutdown_timeout_s <= 0.0:
@@ -123,6 +126,48 @@ class DatasetRecordingError(RuntimeError):
 
 class DatasetFrameError(DatasetRecordingError):
     """A recoverable frame/camera error that invalidates only the active episode."""
+
+
+@dataclass(frozen=True)
+class ControlLagDecision:
+    """Result of one cumulative control-lag observation."""
+
+    over_limit: bool
+    fault: bool
+    over_limit_for_s: float
+
+
+class ControlLagMonitor:
+    """Allow a transient scheduling backlog to recover, but reject sustained overload."""
+
+    def __init__(self, limit_s: float, grace_s: float):
+        if limit_s <= 0.0 or grace_s <= 0.0:
+            raise ValueError("control lag limit and grace must be positive")
+        self.limit_s = float(limit_s)
+        self.grace_s = float(grace_s)
+        self._over_limit_since: float | None = None
+
+    def reset(self) -> None:
+        self._over_limit_since = None
+
+    def observe(
+        self,
+        lag_s: float,
+        *,
+        cycle_overrun_s: float,
+        now: float | None = None,
+    ) -> ControlLagDecision:
+        timestamp = time.monotonic() if now is None else float(now)
+        lag = max(0.0, float(lag_s))
+        cycle_overrun = max(0.0, float(cycle_overrun_s))
+        if lag <= self.limit_s:
+            self.reset()
+            return ControlLagDecision(False, False, 0.0)
+        if self._over_limit_since is None:
+            self._over_limit_since = timestamp
+        duration = max(0.0, timestamp - self._over_limit_since)
+        severe_single_cycle = cycle_overrun > self.limit_s + self.grace_s
+        return ControlLagDecision(True, severe_single_cycle or duration >= self.grace_s, duration)
 
 
 class Camera(Protocol):

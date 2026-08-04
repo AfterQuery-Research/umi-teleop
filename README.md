@@ -280,11 +280,13 @@ arms begin that upward motion. Those startup frames and commands become the begi
 the idle wait for ZERO/E is omitted, and the first successful E enable continues the same episode.
 Tapping E to stop saves it. Later E enable/disable cycles create additional episodes normally. If
 automatic move-to-ready is disabled, E enable starts the first episode as before. Z while armed,
-CANCEL, a safety disarm, camera/timing failure, source restart, or Ctrl+C during an episode discards
-that incomplete episode. Ordinary degraded or holding IK records the final bounded/held command
-without ending the episode. After the desired episode has printed `DATASET episode saved`, support
-the arms and press Ctrl+C. Both robots close first; the dataset then finalizes, validates locally,
-and uploads privately. The local dataset is retained if login or upload fails.
+CANCEL, a safety disarm, camera failure, sustained timing failure, source restart, or Ctrl+C during
+an episode discards that incomplete episode. A transient scheduling backlog gets 0.5 seconds to
+recover before it can invalidate the episode. Ordinary degraded or holding IK records the final
+bounded/held command without ending the episode. After the desired episode has printed
+`DATASET episode saved`, support the arms and press Ctrl+C. Both robots close first; the dataset then
+finalizes, validates locally, and uploads privately. The local dataset is retained if login or
+upload fails.
 
 To append during a later run, use the same repo ID and root and add `--dataset.resume`. Omit
 `--dataset.push-to-hub` to collect and validate locally without uploading. H.264/yuv420p is the
@@ -325,9 +327,12 @@ If upload fails after the robots have closed, retry it without opening cameras o
   controller, clear the workspace, and rerun it.
 - **An exact IK target is unreachable:** each arm independently searches toward the target while
   relaxing orientation. It reports `degraded_ik` when a nearby target solves and `holding_ik` when
-  it must hold that arm's last safe command. It stays armed and retries, so moving the UMI back into
-  a reachable region recovers automatically. Set `--ik-hold-disarm-s` to a positive timeout only if
-  a deployment should disarm after a sustained hold; the default `0` never disarms for IK alone.
+  it must hold that arm's last safe command. IK runs in one latest-target worker per arm, so a slow
+  fallback search cannot stall 30 Hz observation, command, or dataset capture. The foreground loop
+  rejects an IK result older than `--ik-result-max-age-s` (default `0.25`) and continues holding the
+  last validated goal. It stays armed and retries, so moving the UMI back into a reachable region
+  recovers automatically. Set `--ik-hold-disarm-s` to a positive timeout only if a deployment should
+  disarm after a sustained hold; the default `0` never disarms for IK alone.
 - **The UMI input envelope is exceeded:** the translation vector is projected to `0.50 m` and/or
   the relative rotation is projected to `90 deg`. The controller stays armed and reports
   `input_clamped`, including raw and commanded deltas in its periodic log.
