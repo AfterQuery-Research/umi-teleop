@@ -37,6 +37,7 @@ from umi_teleop.controller import (
     rotation_angle,
     world_frame_delta,
 )
+from umi_teleop.ik_policy import FallbackIkSolver, IkFallbackResult, fallback_diagnostic
 
 KNOWN_CONTROL_PATTERNS = (
     "umi-yam",
@@ -84,7 +85,7 @@ class Config:
     max_packet_age: float = 1.0
     max_pose_age: float = 0.25
     max_width_age: float = 0.75
-    max_translation: float = 0.40
+    max_translation: float = 0.50
     max_rotation_deg: float = 90.0
     position_scale: float = 1.50
     max_joint_speed: float = 0.45
@@ -99,7 +100,8 @@ class Config:
     ik_max_iters: int = 40
     ik_pos_threshold: float = 1e-3
     ik_ori_threshold: float = 2e-3
-    max_ik_failures: int = 5
+    ik_fallback_attempts_per_cycle: int = 2
+    ik_hold_disarm_s: float = 0.0
     stream_timeout: float = 20.0
     monitor_only: bool = False
     simulate: bool = False
@@ -660,6 +662,10 @@ def monitor_only(receiver: UdpTeleopReceiver) -> None:
 def run(args: Config) -> None:
     if args.move_to_ready and args.move_to_base:
         raise SafetyStop("move-to-ready and move-to-base are mutually exclusive")
+    if args.ik_fallback_attempts_per_cycle < 1:
+        raise SafetyStop("--ik-fallback-attempts-per-cycle must be at least one")
+    if args.ik_hold_disarm_s < 0.0:
+        raise SafetyStop("--ik-hold-disarm-s must be nonnegative")
     if not args.monitor_only and not args.simulate and not args.confirm_clear:
         raise SafetyStop(
             "this command can move physical arms; clear the workspace and pass --confirm-clear"
@@ -804,7 +810,17 @@ def run(args: Config) -> None:
         period = 1.0 / args.hz
         max_joint_step = args.max_joint_speed / args.hz
         max_gripper_step = args.max_gripper_speed / args.hz
-        ik_failures = 0
+        fallback_solvers: dict[str, FallbackIkSolver] = {}
+        for name in ARM_NAMES:
+            fallback_solvers[name] = FallbackIkSolver(
+                ik[name].solve,
+                lambda target, name=name: joint_limit_reason(
+                    robots[name], target, args.joint_limit_margin
+                ),
+                fallback_attempts_per_cycle=args.ik_fallback_attempts_per_cycle,
+            )
+        last_good_poses = {name: ik[name].fk(joints[name]) for name in ARM_NAMES}
+        ik_holding_since: dict[str, float | None] = {name: None for name in ARM_NAMES}
         last_log = 0.0
         stop = False
 
@@ -855,7 +871,10 @@ def run(args: Config) -> None:
             if result.zero_captured:
                 joints = {name: current_joints[name].copy() for name in ARM_NAMES}
                 grips = {name: gripper_position(robots[name]) for name in ARM_NAMES}
-                ik_failures = 0
+                last_good_poses = {name: current_poses[name].copy() for name in ARM_NAMES}
+                ik_holding_since = {name: None for name in ARM_NAMES}
+                for solver in fallback_solvers.values():
+                    solver.reset()
                 for name in ARM_NAMES:
                     reason = joint_limit_reason(
                         robots[name], current_joints[name], args.joint_limit_margin
@@ -865,46 +884,63 @@ def run(args: Config) -> None:
                         state.reject_zero(message)
                         print(message, flush=True)
                         break
+            ik_results: dict[str, IkFallbackResult] = {}
             if result.armed and result.targets is not None:
-                solved: dict[str, np.ndarray] = {}
-                solve_ok = True
-                failed_arm: str | None = None
-                failure_detail: str | None = None
                 for name in ARM_NAMES:
-                    success, target_joints = ik[name].solve(result.targets[name], joints[name])
-                    if not success:
-                        solve_ok = False
-                        failed_arm = name
-                        failure_detail = "IK solver did not converge"
-                        break
-                    limit_reason = joint_limit_reason(
-                        robots[name], target_joints, args.joint_limit_margin
+                    ik_results[name] = fallback_solvers[name].solve_target(
+                        result.targets[name], last_good_poses[name], joints[name]
                     )
-                    if limit_reason is not None:
-                        solve_ok = False
-                        failed_arm = name
-                        failure_detail = f"IK target {limit_reason}"
-                        break
-                    solved[name] = target_joints
-                if solve_ok:
-                    ik_failures = 0
-                    for name in ARM_NAMES:
+                cycle_now = time.monotonic()
+                for name in ARM_NAMES:
+                    outcome = ik_results[name]
+                    if outcome.mode == "holding_ik":
+                        if ik_holding_since[name] is None:
+                            ik_holding_since[name] = cycle_now
+                    else:
                         delta = np.clip(
-                            solved[name] - joints[name], -max_joint_step, max_joint_step
+                            outcome.joints - joints[name], -max_joint_step, max_joint_step
                         )
                         joints[name] += delta
-                        desired_grip = result.grippers[name]
-                        if desired_grip is not None:
-                            grip_delta = np.clip(
-                                desired_grip - grips[name], -max_gripper_step, max_gripper_step
-                            )
-                            grips[name] = float(np.clip(grips[name] + grip_delta, 0.0, 1.0))
-                else:
-                    ik_failures += 1
-                    if ik_failures >= args.max_ik_failures:
-                        state.disarm(
-                            f"{failed_arm} {failure_detail} for {ik_failures} consecutive cycles"
+                        last_good_poses[name] = ik[name].fk(joints[name])
+                        ik_holding_since[name] = None
+
+                    desired_grip = result.grippers[name]
+                    if desired_grip is not None:
+                        grip_delta = np.clip(
+                            desired_grip - grips[name], -max_gripper_step, max_gripper_step
                         )
+                        grips[name] = float(np.clip(grips[name] + grip_delta, 0.0, 1.0))
+
+                holding = [name for name in ARM_NAMES if ik_results[name].mode == "holding_ik"]
+                degraded = [name for name in ARM_NAMES if ik_results[name].mode == "degraded_ik"]
+                if args.ik_hold_disarm_s > 0.0:
+                    expired = [
+                        name
+                        for name in holding
+                        if ik_holding_since[name] is not None
+                        and cycle_now - ik_holding_since[name] >= args.ik_hold_disarm_s
+                    ]
+                    if expired:
+                        state.disarm(
+                            "safety_disarmed: persistent IK fallback failure for "
+                            + ",".join(expired)
+                            + f" ({args.ik_hold_disarm_s:.1f}s)"
+                        )
+                if state.armed:
+                    if holding:
+                        state.reason = (
+                            "holding_ik: " + ",".join(holding) + " holding last safe target"
+                        )
+                    elif degraded:
+                        state.reason = "degraded_ik: " + ",".join(degraded) + " using fallback"
+                    else:
+                        state.reason = result.reason
+                    if result.envelope_clamps and (holding or degraded):
+                        state.reason += "; " + result.reason
+            elif not result.armed:
+                ik_holding_since = {name: None for name in ARM_NAMES}
+                for solver in fallback_solvers.values():
+                    solver.reset()
             command_pair(robots, joints, grips)
 
             now = time.monotonic()
@@ -921,10 +957,34 @@ def run(args: Config) -> None:
                             f"{math.degrees(rotation_angle(delta[:3, :3])):.1f}deg"
                         )
                     input_text = " input[" + " ".join(pieces) + "]"
+                clamp_text = ""
+                if result.envelope_clamps is not None and result.command_deltas is not None:
+                    pieces = []
+                    for name, reasons in result.envelope_clamps.items():
+                        delta = result.command_deltas[name]
+                        dxyz_mm = 1000.0 * delta[:3, 3]
+                        pieces.append(
+                            f"{name[0].upper()}=[{dxyz_mm[0]:+.1f},"
+                            f"{dxyz_mm[1]:+.1f},{dxyz_mm[2]:+.1f}]mm/"
+                            f"{math.degrees(rotation_angle(delta[:3, :3])):.1f}deg "
+                            f"({' '.join(reasons)})"
+                        )
+                    clamp_text = " command_clamped[" + " | ".join(pieces) + "]"
+                ik_text = ""
+                if ik_results and result.targets is not None:
+                    ik_text = (
+                        " ik["
+                        + " | ".join(
+                            fallback_diagnostic(name, ik_results[name], result.targets[name])
+                            for name in ARM_NAMES
+                        )
+                        + "]"
+                    )
                 print(
                     f"armed={state.armed} zeroed={state.zeroed} reason={state.reason} "
                     f"grip[L={grips['left']:.3f} R={grips['right']:.3f}] "
-                    f"packet_age={packet_age:.3f}s bad={receiver.bad_packets}{input_text}",
+                    f"packet_age={packet_age:.3f}s bad={receiver.bad_packets}"
+                    f"{input_text}{clamp_text}{ik_text}",
                     flush=True,
                 )
                 last_log = now

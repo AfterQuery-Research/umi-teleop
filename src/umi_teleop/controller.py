@@ -115,6 +115,42 @@ def rotation_angle(rotation: np.ndarray) -> float:
     return float(np.arccos(cos_angle))
 
 
+def limit_rotation_angle(rotation: np.ndarray, max_angle_rad: float) -> np.ndarray:
+    """Project a proper rotation onto a maximum angle from identity."""
+    checked = checked_rotation_matrix(rotation)
+    if not math.isfinite(max_angle_rad) or not 0.0 <= max_angle_rad <= math.pi:
+        raise ValueError("max rotation angle must be between zero and pi")
+    angle = rotation_angle(checked)
+    if angle <= max_angle_rad:
+        return checked
+    if max_angle_rad == 0.0:
+        return np.eye(3, dtype=np.float64)
+
+    if math.isclose(angle, math.pi, abs_tol=1e-6):
+        eigenvalues, eigenvectors = np.linalg.eig(checked)
+        axis_index = int(np.argmin(np.abs(eigenvalues - 1.0)))
+        axis = np.real(eigenvectors[:, axis_index])
+    else:
+        axis = np.array(
+            [
+                checked[2, 1] - checked[1, 2],
+                checked[0, 2] - checked[2, 0],
+                checked[1, 0] - checked[0, 1],
+            ],
+            dtype=np.float64,
+        ) / (2.0 * math.sin(angle))
+    axis_norm = float(np.linalg.norm(axis))
+    if axis_norm < 1e-9:
+        raise ValueError("rotation axis is numerically unstable")
+    x, y, z = axis / axis_norm
+    skew = np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]], dtype=np.float64)
+    return (
+        np.eye(3, dtype=np.float64)
+        + math.sin(max_angle_rad) * skew
+        + (1.0 - math.cos(max_angle_rad)) * (skew @ skew)
+    )
+
+
 def checked_rotation_matrix(rotation: np.ndarray, name: str = "rotation") -> np.ndarray:
     """Return a finite, proper 3-D rotation matrix or raise ``ValueError``."""
     out = np.asarray(rotation, dtype=np.float64)
@@ -180,7 +216,7 @@ class TeleopLimits:
     max_packet_age_s: float = 0.25
     max_pose_age_s: float = 0.25
     max_width_age_s: float = 0.75
-    max_translation_m: float = 0.25
+    max_translation_m: float = 0.50
     max_rotation_rad: float = math.radians(100.0)
     position_scale: float = 1.0
     require_width_to_arm: bool = True
@@ -196,6 +232,8 @@ class StepResult:
     targets: dict[str, np.ndarray] | None = None
     grippers: dict[str, float | None] | None = None
     input_deltas: dict[str, np.ndarray] | None = None
+    command_deltas: dict[str, np.ndarray] | None = None
+    envelope_clamps: dict[str, tuple[str, ...]] | None = None
 
 
 class TeleopStateMachine:
@@ -220,6 +258,13 @@ class TeleopStateMachine:
             )
         self.gripper_maps = gripper_maps
         self.limits = limits or TeleopLimits()
+        if not math.isfinite(self.limits.max_translation_m) or self.limits.max_translation_m < 0.0:
+            raise ValueError("max translation must be finite and nonnegative")
+        if (
+            not math.isfinite(self.limits.max_rotation_rad)
+            or not 0.0 <= self.limits.max_rotation_rad <= math.pi
+        ):
+            raise ValueError("max rotation must be between zero and pi")
         self.tip_offsets_m = {
             name: np.asarray((tip_offsets_m or {}).get(name, np.zeros(3)), dtype=np.float64)
             for name in ARM_NAMES
@@ -387,35 +432,49 @@ class TeleopStateMachine:
         targets: dict[str, np.ndarray] = {}
         grippers: dict[str, float | None] = {}
         input_deltas: dict[str, np.ndarray] = {}
+        command_deltas: dict[str, np.ndarray] = {}
+        envelope_clamps: dict[str, tuple[str, ...]] = {}
         for name in ARM_NAMES:
             current = pose_matrix(packet["arms"][name]["pose"], self.tip_offsets_m[name])
             delta = world_frame_delta(
                 self.input_zero[name], current, self.zero_input_to_robot_rotation[name]
             )
+            command_delta = delta.copy()
+            clamp_reasons = []
             translation_norm = float(np.linalg.norm(delta[:3, 3]))
             angle = rotation_angle(delta[:3, :3])
             if translation_norm > self.limits.max_translation_m:
-                self.disarm(
-                    f"{name} translation {translation_norm:.3f}m exceeds "
-                    f"{self.limits.max_translation_m:.3f}m"
+                command_delta[:3, 3] *= self.limits.max_translation_m / translation_norm
+                clamp_reasons.append(
+                    f"translation {translation_norm:.3f}m->{self.limits.max_translation_m:.3f}m"
                 )
-                return StepResult(False, self.zeroed, reason=self.reason)
             if angle > self.limits.max_rotation_rad:
-                self.disarm(
-                    f"{name} rotation {math.degrees(angle):.1f}deg exceeds "
-                    f"{math.degrees(self.limits.max_rotation_rad):.1f}deg"
+                command_delta[:3, :3] = limit_rotation_angle(
+                    delta[:3, :3], self.limits.max_rotation_rad
                 )
-                return StepResult(False, self.zeroed, reason=self.reason)
+                clamp_reasons.append(
+                    f"rotation {math.degrees(angle):.1f}deg"
+                    f"->{math.degrees(self.limits.max_rotation_rad):.1f}deg"
+                )
+            if clamp_reasons:
+                envelope_clamps[name] = tuple(clamp_reasons)
             target = self.robot_zero[name].copy()
-            target[:3, 3] += delta[:3, 3] * self.limits.position_scale
-            target[:3, :3] = delta[:3, :3] @ target[:3, :3]
+            target[:3, 3] += command_delta[:3, 3] * self.limits.position_scale
+            target[:3, :3] = command_delta[:3, :3] @ target[:3, :3]
             targets[name] = target
             input_deltas[name] = delta
+            command_deltas[name] = command_delta
             arm = packet["arms"][name]
             if arm["width_mm"] is None or arm["width_age_s"] > self.limits.max_width_age_s:
                 grippers[name] = None
             else:
                 grippers[name] = self.gripper_maps[name].normalized(arm["width_mm"])
+        if envelope_clamps:
+            self.reason = "input_clamped: " + "; ".join(
+                f"{name} " + ", ".join(reasons) for name, reasons in envelope_clamps.items()
+            )
+        else:
+            self.reason = "enabled"
         return StepResult(
             True,
             self.zeroed,
@@ -424,4 +483,6 @@ class TeleopStateMachine:
             targets=targets,
             grippers=grippers,
             input_deltas=input_deltas,
+            command_deltas=command_deltas,
+            envelope_clamps=envelope_clamps or None,
         )
