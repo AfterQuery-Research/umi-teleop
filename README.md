@@ -207,7 +207,9 @@ was replugged.
 
 The right UMI orientation at Z defines the shared command axes. Each arm otherwise follows its own
 leader's position/orientation change from Z. Translation is scaled `1.5x`; the input envelope is
-`0.40 m` and `90 deg`; joint speed is limited to `0.45 rad/s`.
+`0.50 m` and `90 deg`; joint speed is limited to `0.45 rad/s`. At the envelope, the controller
+projects the raw UMI delta onto the boundary and stays armed. This permits up to `0.75 m` of scaled
+robot translation while preventing a larger raw motion from producing an unbounded target.
 
 ## Controls
 
@@ -316,9 +318,16 @@ If upload fails after the robots have closed, retry it without opening cameras o
   source back to disabled. To continue from the current robot pose, hold the UMIs neutral, tap Z,
   wait 5 seconds, then tap E. To return to the canonical posture, disable, support the arms, stop the
   controller, clear the workspace, and rerun it.
-- **IK fails five consecutive cycles, a workspace limit is exceeded, packets go stale, or a joint
-  target approaches its limit:** the controller disarms and holds its last command. It never
-  automatically rearms.
+- **An exact IK target is unreachable:** each arm independently searches toward the target while
+  relaxing orientation. It reports `degraded_ik` when a nearby target solves and `holding_ik` when
+  it must hold that arm's last safe command. It stays armed and retries, so moving the UMI back into
+  a reachable region recovers automatically. Set `--ik-hold-disarm-s` to a positive timeout only if
+  a deployment should disarm after a sustained hold; the default `0` never disarms for IK alone.
+- **The UMI input envelope is exceeded:** the translation vector is projected to `0.50 m` and/or
+  the relative rotation is projected to `90 deg`. The controller stays armed and reports
+  `input_clamped`, including raw and commanded deltas in its periodic log.
+- **Packets go stale or the operator disables/cancels:** the controller disarms and holds its last
+  command. It never automatically rearms after these safety events.
 - **CAN is missing, down, in CAN FD mode, or at the wrong bitrate:** stop robot controllers and rerun
   `umi-setup-can` with the two adapter serials. Never use `can0`/`can1` order to infer arm side.
 - **Inspect packets without motors:** run `.venv/bin/umi-yam --monitor-only` on the YAM Pi.

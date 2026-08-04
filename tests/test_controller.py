@@ -12,7 +12,9 @@ from umi_teleop.controller import (
     TeleopLimits,
     TeleopStateMachine,
     decode_packet,
+    limit_rotation_angle,
     pose_matrix,
+    rotation_angle,
     world_frame_delta,
 )
 from umi_teleop.yam import (
@@ -72,6 +74,21 @@ def machine(**limit_overrides):
         {"left": GripperMap(20, 80), "right": GripperMap(20, 80)},
         TeleopLimits(**limit_overrides),
     )
+
+
+@pytest.mark.parametrize(
+    ("limits", "message"),
+    [
+        (TeleopLimits(max_translation_m=-0.1), "max translation"),
+        (TeleopLimits(max_rotation_rad=math.pi + 0.01), "max rotation"),
+    ],
+)
+def test_invalid_motion_envelopes_are_rejected(limits, message):
+    with pytest.raises(ValueError, match=message):
+        TeleopStateMachine(
+            {"left": GripperMap(20, 80), "right": GripperMap(20, 80)},
+            limits,
+        )
 
 
 ROBOT_POSES = {"left": np.eye(4), "right": np.eye(4)}
@@ -308,7 +325,7 @@ def test_session_change_and_cancel_disarm():
     assert not result.armed and not result.zeroed
 
 
-def test_motion_envelope_disarms_before_emitting_target():
+def test_translation_envelope_projects_without_disarming():
     m = machine(max_translation_m=0.05, max_rotation_rad=math.radians(10))
     step(m, packet())
     step(m, packet(seq=1, zero=1))
@@ -322,7 +339,42 @@ def test_motion_envelope_disarms_before_emitting_target():
             left_pose=[0.1, 0, 0, 0, 0, 0, 1],
         ),
     )
-    assert not result.armed and result.targets is None and "translation" in result.reason
+    assert result.armed and result.targets is not None
+    np.testing.assert_allclose(result.input_deltas["left"][:3, 3], [0.1, 0, 0])
+    np.testing.assert_allclose(result.command_deltas["left"][:3, 3], [0.05, 0, 0])
+    np.testing.assert_allclose(result.targets["left"][:3, 3], [0.05, 0, 0])
+    assert result.envelope_clamps is not None
+    assert "translation 0.100m->0.050m" in result.envelope_clamps["left"]
+    assert result.reason.startswith("input_clamped:")
+
+
+def test_rotation_envelope_projects_without_disarming():
+    m = machine(max_translation_m=1.0, max_rotation_rad=math.radians(10))
+    step(m, packet())
+    step(m, packet(seq=1, zero=1))
+    half_angle = math.radians(20) / 2.0
+    result = step(
+        m,
+        packet(
+            seq=2,
+            enabled=True,
+            zero=1,
+            toggle=1,
+            left_pose=[0, 0, 0, 0, 0, math.sin(half_angle), math.cos(half_angle)],
+        ),
+    )
+    assert result.armed and result.targets is not None
+    assert math.degrees(rotation_angle(result.input_deltas["left"][:3, :3])) == pytest.approx(20)
+    assert math.degrees(rotation_angle(result.command_deltas["left"][:3, :3])) == pytest.approx(10)
+    assert math.degrees(rotation_angle(result.targets["left"][:3, :3])) == pytest.approx(10)
+    assert "rotation 20.0deg->10.0deg" in result.envelope_clamps["left"]
+
+
+def test_limit_rotation_angle_handles_half_turn():
+    half_turn_x = np.diag([1.0, -1.0, -1.0])
+    limited = limit_rotation_angle(half_turn_x, math.pi / 2.0)
+    assert rotation_angle(limited) == pytest.approx(math.pi / 2.0)
+    np.testing.assert_allclose(limited @ limited.T, np.eye(3), atol=1e-9)
 
 
 def test_pose_matrix_rotates_tip_offset():
