@@ -329,8 +329,7 @@ def arm_joints(robot: Any) -> np.ndarray:
     return np.asarray(obs["joint_pos"], dtype=np.float64).copy()
 
 
-def gripper_position(robot: Any) -> float:
-    obs = robot.get_observations()
+def _gripper_position_from_observation(obs: dict[str, Any]) -> float:
     value = float(np.asarray(obs["gripper_pos"]).ravel()[0])
     if not math.isfinite(value) or value < -0.1 or value > 1.1:
         raise SafetyStop(
@@ -338,6 +337,23 @@ def gripper_position(robot: Any) -> float:
             "verify I2RT gripper limits before commanding"
         )
     return float(np.clip(value, 0.0, 1.0))
+
+
+def gripper_position(robot: Any) -> float:
+    return _gripper_position_from_observation(robot.get_observations())
+
+
+def read_pair_state(
+    robots: dict[str, Any],
+) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+    """Read joints and gripper together, acquiring each I2RT state lock once."""
+    joints: dict[str, np.ndarray] = {}
+    grippers: dict[str, float] = {}
+    for name in ARM_NAMES:
+        observation = robots[name].get_observations()
+        joints[name] = np.asarray(observation["joint_pos"], dtype=np.float64).copy()
+        grippers[name] = _gripper_position_from_observation(observation)
+    return joints, grippers
 
 
 def gripper_limits_for_mode(limits: list[float], simulate: bool) -> np.ndarray:
@@ -587,7 +603,7 @@ def move_pair_to_joint_targets(
     observed: dict[str, np.ndarray] = {}
     while True:
         command_startup_pair(robots, targets, grips, recorder)
-        observed = {name: arm_joints(robots[name]) for name in ARM_NAMES}
+        observed, _ = read_pair_state(robots)
         max_error = max(float(np.max(np.abs(observed[name] - targets[name]))) for name in ARM_NAMES)
         if max_error <= readback_tolerance:
             break
@@ -639,9 +655,10 @@ def command_startup_pair(
     """Capture a startup observation, dispatch both arms, then commit its action."""
     prepared_frame = None
     if recorder is not None:
+        measured_joints, measured_grippers = read_pair_state(robots)
         prepared_frame = recorder.prepare_frame(
-            measured_joints={name: arm_joints(robots[name]) for name in ARM_NAMES},
-            measured_grippers={name: gripper_position(robots[name]) for name in ARM_NAMES},
+            measured_joints=measured_joints,
+            measured_grippers=measured_grippers,
             commanded_joints=joints,
             commanded_grippers=grips,
         )
@@ -814,8 +831,7 @@ def run(args: Config) -> None:
                 f"{np.asarray(args.sim_initial_joints)}",
                 flush=True,
             )
-        joints = {name: arm_joints(robots[name]) for name in ARM_NAMES}
-        grips = {name: gripper_position(robots[name]) for name in ARM_NAMES}
+        joints, grips = read_pair_state(robots)
         startup_recorder = recorder if args.move_to_ready else None
         if startup_recorder is not None:
             initial_poses = {name: ik[name].fk(joints[name]) for name in ARM_NAMES}
@@ -856,7 +872,7 @@ def run(args: Config) -> None:
                 if startup_recorder is not None:
                     startup_recorder.finish_episode(commit=False, reason=startup_blocked)
             except DatasetFrameError as exc:
-                joints = {name: arm_joints(robots[name]) for name in ARM_NAMES}
+                joints, _ = read_pair_state(robots)
                 startup_blocked = f"dataset episode invalid during startup: {exc}"
                 assert startup_recorder is not None
                 startup_recorder.finish_episode(commit=False, reason=startup_blocked)
@@ -899,6 +915,7 @@ def run(args: Config) -> None:
         signal.signal(signal.SIGTERM, _signal)
         next_step = time.monotonic()
         while not stop:
+            cycle_started = time.monotonic()
             packet, packet_age = receiver.poll()
             if packet is None or packet_age is None:
                 was_armed = state.armed
@@ -911,13 +928,9 @@ def run(args: Config) -> None:
                 command_pair(robots, joints, grips)
                 time.sleep(period)
                 continue
-            current_joints = {name: arm_joints(robots[name]) for name in ARM_NAMES}
-            current_grips = (
-                {name: gripper_position(robots[name]) for name in ARM_NAMES}
-                if recorder is not None
-                else None
-            )
+            current_joints, current_grips = read_pair_state(robots)
             current_poses = {name: ik[name].fk(current_joints[name]) for name in ARM_NAMES}
+            observation_done = time.monotonic()
             was_armed = state.armed
             previous_session_id = state.session_id
             previous_cancel_id = state.cancel_id
@@ -951,7 +964,6 @@ def run(args: Config) -> None:
                     reject = f"ZERO rejected: {message}"
                     state.reject_zero(reject)
                     print(reject, flush=True)
-                current_joints = {name: arm_joints(robots[name]) for name in ARM_NAMES}
                 command_pair(robots, joints, grips)
                 now = time.monotonic()
                 if now - last_log >= 0.5:
@@ -971,7 +983,7 @@ def run(args: Config) -> None:
                 continue
             if result.zero_captured:
                 joints = {name: current_joints[name].copy() for name in ARM_NAMES}
-                grips = {name: gripper_position(robots[name]) for name in ARM_NAMES}
+                grips = dict(current_grips)
                 last_good_poses = {name: current_poses[name].copy() for name in ARM_NAMES}
                 ik_holding_since = {name: None for name in ARM_NAMES}
                 for solver in fallback_solvers.values():
@@ -1044,10 +1056,10 @@ def run(args: Config) -> None:
                 ik_holding_since = {name: None for name in ARM_NAMES}
                 for solver in fallback_solvers.values():
                     solver.reset()
+            control_done = time.monotonic()
             prepared_dataset_frame = None
             if recorder is not None:
                 try:
-                    assert current_grips is not None
                     prepared_dataset_frame = prepare_dataset_step(
                         recorder,
                         was_armed=was_armed,
@@ -1069,6 +1081,7 @@ def run(args: Config) -> None:
                 except DatasetRecordingError as exc:
                     state.disarm(f"dataset failure: {exc}")
                     raise SafetyStop(state.reason) from exc
+            dataset_done = time.monotonic()
             command_pair(robots, joints, grips)
 
             if recorder is not None:
@@ -1083,6 +1096,7 @@ def run(args: Config) -> None:
                 except DatasetRecordingError as exc:
                     state.disarm(f"dataset failure: {exc}")
                     raise SafetyStop(state.reason) from exc
+            dispatch_done = time.monotonic()
 
             now = time.monotonic()
             if now - last_log >= 0.5:
@@ -1136,7 +1150,14 @@ def run(args: Config) -> None:
                 and recorder.active
                 and control_lag > args.dataset.max_control_lag_s
             ):
-                reason = f"control loop lagged by {control_lag:.3f}s"
+                reason = (
+                    f"control loop lagged by {control_lag:.3f}s; "
+                    f"last cycle={(dispatch_done - cycle_started) * 1000:.1f}ms "
+                    f"observe/FK={(observation_done - cycle_started) * 1000:.1f}ms "
+                    f"control/IK={(control_done - observation_done) * 1000:.1f}ms "
+                    f"dataset={(dataset_done - control_done) * 1000:.1f}ms "
+                    f"dispatch={(dispatch_done - dataset_done) * 1000:.1f}ms"
+                )
                 state.disarm(f"dataset episode invalid: {reason}")
                 try:
                     recorder.finish_episode(

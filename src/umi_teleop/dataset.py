@@ -214,12 +214,12 @@ def build_frame(
             )
         if image.dtype != np.uint8:
             raise DatasetFrameError(f"{name} camera frame must be RGB uint8")
-        frame[f"observation.images.{name}"] = np.ascontiguousarray(image).copy()
+        frame[f"observation.images.{name}"] = np.array(image, copy=True, order="C")
     return frame
 
 
-def normalize_camera_image(name: str, image: np.ndarray) -> np.ndarray:
-    """Return one RGB camera image in the fixed LeRobot dataset shape."""
+def _camera_image_view(name: str, image: np.ndarray) -> np.ndarray:
+    """Validate and crop a camera image without copying its pixels."""
     image = np.asarray(image)
     if name == "top" and image.shape == (TOP_CAMERA_CAPTURE_HEIGHT, CAMERA_WIDTH, 3):
         crop_start = (TOP_CAMERA_CAPTURE_HEIGHT - CAMERA_HEIGHT) // 2
@@ -230,7 +230,12 @@ def normalize_camera_image(name: str, image: np.ndarray) -> np.ndarray:
         )
     if image.dtype != np.uint8:
         raise DatasetFrameError(f"{name} camera frame must be RGB uint8")
-    return np.ascontiguousarray(image).copy()
+    return image
+
+
+def normalize_camera_image(name: str, image: np.ndarray) -> np.ndarray:
+    """Return one RGB camera image in the fixed LeRobot dataset shape."""
+    return np.array(_camera_image_view(name, image), copy=True, order="C")
 
 
 def _normalized_features(features: Mapping[str, Mapping[str, Any]]) -> dict[str, tuple[Any, ...]]:
@@ -497,7 +502,7 @@ class DatasetRecorder:
             raise DatasetRecordingError("cannot record a frame without an active episode")
         try:
             images = {
-                name: normalize_camera_image(
+                name: _camera_image_view(
                     name,
                     camera.read_latest(max_age_ms=self.config.camera_max_age_ms),
                 )
