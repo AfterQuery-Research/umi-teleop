@@ -106,8 +106,8 @@ class Config:
     max_joint_speed: float = 0.45
     max_gripper_speed: float = 1.50
     joint_limit_margin: float = 0.03
-    move_to_ready: bool = True
-    move_to_base: bool = False
+    move_to_ready: bool = False
+    move_to_base: bool = True
     ready_bend_joints: tuple[float, float] = DEFAULT_READY_BEND_JOINTS
     ready_joint_speed: float = 0.10
     base_joint_speed: float = 0.10
@@ -872,12 +872,7 @@ def run(args: Config) -> None:
                 flush=True,
             )
         joints, grips = read_pair_state(robots)
-        startup_recorder = recorder if args.move_to_ready else None
-        if startup_recorder is not None:
-            initial_poses = {name: fk_models[name].fk(joints[name]) for name in ARM_NAMES}
-            state.step(initial_packet, 0.0, initial_poses)
-            startup_recorder.start_episode()
-            print("DATASET recording includes teleop-ready startup motion", flush=True)
+        base_pose_verified = False
         if args.move_to_base:
             try:
                 joints = move_pair_to_base(
@@ -888,6 +883,7 @@ def run(args: Config) -> None:
                     args.hz,
                     args.startup_readback_tolerance,
                 )
+                base_pose_verified = True
                 startup_blocked = None
             except StartupReadbackError as exc:
                 joints = exc.observed
@@ -903,19 +899,11 @@ def run(args: Config) -> None:
                     args.hz,
                     args.joint_limit_margin,
                     args.startup_readback_tolerance,
-                    recorder=startup_recorder,
                 )
                 startup_blocked = None
             except StartupReadbackError as exc:
                 joints = exc.observed
                 startup_blocked = str(exc)
-                if startup_recorder is not None:
-                    startup_recorder.finish_episode(commit=False, reason=startup_blocked)
-            except DatasetFrameError as exc:
-                joints, _ = read_pair_state(robots)
-                startup_blocked = f"dataset episode invalid during startup: {exc}"
-                assert startup_recorder is not None
-                startup_recorder.finish_episode(commit=False, reason=startup_blocked)
         else:
             startup_blocked = None
         command_pair(robots, joints, grips)
@@ -1019,6 +1007,8 @@ def run(args: Config) -> None:
             previous_session_id = state.session_id
             previous_cancel_id = state.cancel_id
             result = state.step(packet, packet_age, robot_poses)
+            if result.armed:
+                base_pose_verified = False
             prearm_episode_fault = None
             if recorder is not None and recorder.active and not was_armed and not result.armed:
                 if previous_session_id is not None and packet["session_id"] != previous_session_id:
@@ -1073,12 +1063,28 @@ def run(args: Config) -> None:
                     for name in ARM_NAMES
                 }
                 invalidate_ik()
+                at_verified_base = base_pose_verified and all(
+                    float(
+                        np.max(
+                            np.abs(
+                                current_joints[name]
+                                - np.asarray(DEFAULT_BASE_JOINTS, dtype=np.float64)
+                            )
+                        )
+                    )
+                    <= args.startup_readback_tolerance
+                    for name in ARM_NAMES
+                )
                 for name in ARM_NAMES:
-                    reason = joint_limit_reason(
-                        robots[name], current_joints[name], args.joint_limit_margin
+                    reason = (
+                        None
+                        if at_verified_base
+                        else joint_limit_reason(
+                            robots[name], current_joints[name], args.joint_limit_margin
+                        )
                     )
                     if reason is not None:
-                        message = f"ZERO rejected: {name} {reason}; use teleop-ready bend"
+                        message = f"ZERO rejected: {name} {reason}; return to the base pose"
                         state.reject_zero(message)
                         print(message, flush=True)
                         break
@@ -1218,6 +1224,62 @@ def run(args: Config) -> None:
                     state.disarm(f"dataset failure: {exc}")
                     raise SafetyStop(state.reason) from exc
             dispatch_done = time.monotonic()
+
+            episode_stopped = (
+                recorder is not None
+                and was_armed
+                and not state.armed
+                and state.reason == "enable toggled off"
+            )
+            if episode_stopped:
+                print(
+                    "recording ended; returning both YAMs to unrecorded base pose",
+                    flush=True,
+                )
+                invalidate_ik()
+                reset_joints, reset_grips = read_pair_state(robots)
+                grips = dict(reset_grips)
+                try:
+                    joints = move_pair_to_base(
+                        robots,
+                        reset_joints,
+                        grips,
+                        args.base_joint_speed,
+                        args.hz,
+                        args.startup_readback_tolerance,
+                    )
+                    base_pose_verified = True
+                    startup_blocked = None
+                    state.invalidate_zero("returned to base pose; tap ZERO")
+                    ik_reference_poses = {
+                        name: fk_models[name].fk(joints[name]) for name in ARM_NAMES
+                    }
+                    joint_goals = {name: joints[name].copy() for name in ARM_NAMES}
+                    command_pair(robots, joints, grips)
+                    print(
+                        "robots at unrecorded base pose; tap ZERO, then enable for a new episode",
+                        flush=True,
+                    )
+                except StartupReadbackError as exc:
+                    joints = {name: exc.observed[name].copy() for name in ARM_NAMES}
+                    base_pose_verified = False
+                    startup_blocked = f"post-episode base reset failed: {exc}"
+                    state.invalidate_zero(startup_blocked)
+                    command_pair(robots, joints, grips)
+                    print(
+                        "RESET HOLD: automatic base return did not verify; arms are holding "
+                        f"their observed pose and enable is locked out: {exc}",
+                        flush=True,
+                    )
+                if lag_monitor is not None:
+                    lag_monitor.reset()
+                timing_warning_active = False
+                timing_window_started = None
+                for samples in timing_samples.values():
+                    samples.clear()
+                next_step = time.monotonic()
+                last_log = 0.0
+                continue
 
             if state.armed or was_armed:
                 if timing_window_started is None:

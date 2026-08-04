@@ -192,8 +192,8 @@ was replugged.
    ```
 
    It resolves each USB serial to its current `canN` name, refuses competing controllers, validates
-   both CAN buses, waits for fresh disabled telemetry, and slowly moves both arms through a bent
-   posture to `[0, 23, 46, 0, 0, 0]` degrees. Wait for:
+   both CAN buses, waits for fresh disabled telemetry, and slowly moves both arms down to the
+   all-zero base posture `[0, 0, 0, 0, 0, 0]` degrees. Wait for:
 
    ```text
    robots holding current pose; tap the Pi ZERO button before enable
@@ -216,7 +216,7 @@ robot translation while preventing a larger raw motion from producing an unbound
 | Control | Action |
 |---|---|
 | E tap while disabled | Request enable; commits after 3 quiet seconds with fresh poses and widths |
-| E tap while enabled | Disable immediately and hold the last commanded robot pose |
+| E tap while enabled | Disable immediately; a recording run saves, then returns both arms to base |
 | E hold for 1 second | Cancel/disarm immediately |
 | Z tap | Disable, wait 0.4 seconds for fresh poses, then capture a new zero |
 | Z hold for 1 second | Ask the source and YAM controller to quit |
@@ -278,18 +278,20 @@ then run:
   --confirm-clear
 ```
 
-With the default automatic move to the teleop-ready pose, recording starts immediately before the
-arms begin that upward motion. Those startup frames and commands become the beginning of episode 1;
-the idle wait for ZERO/E is omitted, and the first successful E enable continues the same episode.
-Tapping E to stop saves it. Later E enable/disable cycles create additional episodes normally. If
-automatic move-to-ready is disabled, E enable starts the first episode as before. Z while armed,
-CANCEL, a safety disarm, camera failure, sustained timing failure, source restart, or Ctrl+C during
-an episode discards that incomplete episode. A transient scheduling backlog gets 0.5 seconds to
+The default startup slowly places both arms at the all-zero base posture. That automatic motion and
+the idle wait for ZERO/E are not recorded. An episode starts only when E successfully enables
+teleoperation. Tapping E to stop saves the episode, then automatically returns both arms to the
+all-zero base posture without recording the return. The previous Cartesian zero is invalidated;
+after the terminal prints `robots at unrecorded base pose`, place the UMIs at their next neutral
+poses, tap Z, wait for the cooldown, and tap E to record another episode without restarting any
+process. Z while armed, CANCEL, a safety disarm, camera failure, sustained timing failure, source
+restart, or Ctrl+C during an episode discards that incomplete episode and holds the last safe pose
+rather than initiating an automatic return. A transient scheduling backlog gets 0.5 seconds to
 recover before it can invalidate the episode. Ordinary degraded or holding IK records the final
 bounded/held command without ending the episode. After the desired episode has printed
-`DATASET episode saved`, support the arms and press Ctrl+C. Both robots close first; the dataset then
-finalizes, validates locally, and uploads privately. The local dataset is retained if login or
-upload fails.
+`DATASET episode saved` and the arms have returned to base, support the arms and press Ctrl+C. Both
+robots close first; the dataset then finalizes, validates locally, and uploads privately. The local
+dataset is retained if login or upload fails.
 
 To append during a later run, use the same repo ID and root and add `--dataset.resume`. Omit
 `--dataset.push-to-hub` to collect and validate locally without uploading. H.264/yuv420p is the
@@ -331,9 +333,9 @@ If upload fails after the robots have closed, retry it without opening cameras o
 - **Vive or width telemetry is stale:** make both trackers visible and both ArUco tag pairs visible;
   do not enable until both ages recover.
 - **YAM controller disarms while the source still says enabled:** tap E once to synchronize the
-  source back to disabled. To continue from the current robot pose, hold the UMIs neutral, tap Z,
-  wait 5 seconds, then tap E. To return to the canonical posture, disable, support the arms, stop the
-  controller, clear the workspace, and rerun it.
+  source back to disabled. To continue from the current robot pose after a safety disarm, hold the
+  UMIs neutral, tap Z, wait 5 seconds, then tap E. An intentional recording stop returns to the
+  all-zero base posture automatically and then requires a new Z.
 - **An exact IK target is unreachable:** each arm independently searches toward the target while
   relaxing orientation. It reports `degraded_ik` when a nearby target solves and `holding_ik` when
   it must hold that arm's last safe command. IK runs in one latest-target worker per arm, so a slow

@@ -296,13 +296,17 @@ class TeleopStateMachine:
         self.armed = False
         self.reason = reason
 
-    def reject_zero(self, reason: str) -> None:
-        """Invalidate a captured zero that the hardware launcher found unsafe."""
+    def invalidate_zero(self, reason: str) -> None:
+        """Require a fresh operator ZERO after an external robot-frame change."""
         self.input_zero.clear()
         self.robot_zero.clear()
         self.zero_input_to_robot_rotation.clear()
         self.zeroed = False
         self.disarm(reason)
+
+    def reject_zero(self, reason: str) -> None:
+        """Invalidate a captured zero that the hardware launcher found unsafe."""
+        self.invalidate_zero(reason)
 
     def _new_session(self, packet: dict[str, Any]) -> StepResult:
         self.session_id = packet["session_id"]

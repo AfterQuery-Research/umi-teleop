@@ -158,7 +158,13 @@ def stream_source(port: int, done: threading.Event) -> None:
         state.handle(Event.START)
         send(8)
         state.handle(Event.STOP)
+        send(6)
+        state.handle(Event.ZERO)
         send(4)
+        state.handle(Event.START)
+        send(8)
+        state.handle(Event.STOP)
+        send(6)
         state.handle(Event.QUIT)
         send(3)
     finally:
@@ -216,8 +222,8 @@ def test_production_yam_loop_records_final_dispatched_simulated_actions(
         yam.Config(
             bind="127.0.0.1",
             port=port,
-            move_to_ready=True,
-            ready_joint_speed=100.0,
+            move_to_base=True,
+            base_joint_speed=100.0,
             simulate=True,
             stream_timeout=2.0,
             dataset=dataset_config,
@@ -227,29 +233,42 @@ def test_production_yam_loop_records_final_dispatched_simulated_actions(
 
     assert sender_done.is_set()
     assert dataset is not None and dataset.finalized
-    assert len(dataset.episodes) == 1
-    assert len(dataset.episodes[0]) >= 6
+    assert len(dataset.episodes) == 2
+    assert all(len(episode) >= 6 for episode in dataset.episodes)
     assert len(robots) == 2 and all(robot.closed for robot in robots)
     assert all(camera.disconnected for camera in cameras.values())
 
-    for frame in dataset.episodes[0]:
-        action = frame["action"]
-        assert any(np.allclose(action[:7], command) for command in robots[0].commands)
-        assert any(np.allclose(action[7:], command) for command in robots[1].commands)
+    for episode in dataset.episodes:
+        for frame in episode:
+            action = frame["action"]
+            assert any(np.allclose(action[:7], command) for command in robots[0].commands)
+            assert any(np.allclose(action[7:], command) for command in robots[1].commands)
     assert any(
         not np.array_equal(frame["observation.state"], frame["action"])
-        for frame in dataset.episodes[0]
+        for episode in dataset.episodes
+        for frame in episode
     )
-    first_frame = dataset.episodes[0][0]
+    for episode in dataset.episodes:
+        first_frame = episode[0]
+        np.testing.assert_allclose(
+            first_frame["observation.state"][:6],
+            yam.DEFAULT_BASE_JOINTS,
+            atol=1e-9,
+        )
+        np.testing.assert_allclose(
+            first_frame["action"][:6],
+            yam.DEFAULT_BASE_JOINTS,
+            atol=1e-9,
+        )
+    assert all(np.allclose(robot.joints, yam.DEFAULT_BASE_JOINTS, atol=1e-9) for robot in robots)
     np.testing.assert_allclose(
-        first_frame["observation.state"][:6],
-        yam.DEFAULT_SIM_INITIAL_JOINTS,
+        [robot.gripper for robot in robots],
+        [
+            dataset.episodes[-1][-1]["action"][6],
+            dataset.episodes[-1][-1]["action"][13],
+        ],
+        atol=1e-9,
     )
-    np.testing.assert_allclose(first_frame["action"][:6], yam.DEFAULT_READY_JOINTS)
-    assert any(
-        not np.allclose(frame["action"][:6], yam.DEFAULT_READY_JOINTS)
-        for frame in dataset.episodes[0][4:]
-    )
-    # Two initial/startup FK snapshots and one ZERO snapshot per arm are sufficient; live
-    # teleoperation must not put FK back into every 30 Hz foreground cycle.
-    assert sum(model.fk_calls for model in E2EIk.instances) == 6
+    # One initial snapshot, one snapshot per ZERO, and one snapshot after each automatic base
+    # return per arm are sufficient; live teleoperation must not run FK in every foreground cycle.
+    assert sum(model.fk_calls for model in E2EIk.instances) == 10
