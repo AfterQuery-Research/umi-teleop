@@ -843,7 +843,8 @@ def run(args: Config) -> None:
         if recorder is not None:
             print(
                 f"DATASET ready repo={args.dataset.repo_id} root={args.dataset.root} "
-                f"resume={args.dataset.resume} upload={args.dataset.push_to_hub}",
+                f"resume={args.dataset.resume} upload={args.dataset.push_to_hub} "
+                f"pipeline={'streaming' if args.dataset.streaming_encoding else 'png-staging'}",
                 flush=True,
             )
 
@@ -963,6 +964,10 @@ def run(args: Config) -> None:
             else None
         )
         timing_warning_active = False
+        timing_window_started: float | None = None
+        timing_samples: dict[str, list[float]] = {
+            name: [] for name in ("cycle", "robot_read", "control", "dataset", "dispatch")
+        }
 
         def invalidate_ik() -> None:
             nonlocal ik_generation, joint_goals, latest_ik_results, ik_holding_since
@@ -1213,6 +1218,49 @@ def run(args: Config) -> None:
                     raise SafetyStop(state.reason) from exc
             dispatch_done = time.monotonic()
 
+            if state.armed or was_armed:
+                if timing_window_started is None:
+                    timing_window_started = cycle_started
+                for name, duration in (
+                    ("cycle", dispatch_done - cycle_started),
+                    ("robot_read", observation_done - cycle_started),
+                    ("control", control_done - observation_done),
+                    ("dataset", dataset_done - control_done),
+                    ("dispatch", dispatch_done - dataset_done),
+                ):
+                    timing_samples[name].append(duration * 1000.0)
+                timing_duration = dispatch_done - timing_window_started
+                if timing_duration >= 0.5:
+                    pieces = []
+                    for name, samples in timing_samples.items():
+                        percentiles = np.percentile(samples, (50, 95, 99))
+                        pieces.append(
+                            f"{name}[p50={percentiles[0]:.1f} p95={percentiles[1]:.1f} "
+                            f"p99={percentiles[2]:.1f}]ms"
+                        )
+                    queue_text = ""
+                    if recorder is not None:
+                        queue_text = (
+                            " queues["
+                            + " ".join(
+                                f"{name}={depth}" for name, depth in recorder.queue_depths().items()
+                            )
+                            + "]"
+                        )
+                    print(
+                        f"TIMING effective_hz={len(timing_samples['cycle']) / timing_duration:.1f} "
+                        + " ".join(pieces)
+                        + queue_text,
+                        flush=True,
+                    )
+                    timing_window_started = None
+                    for samples in timing_samples.values():
+                        samples.clear()
+            else:
+                timing_window_started = None
+                for samples in timing_samples.values():
+                    samples.clear()
+
             now = time.monotonic()
             if now - last_log >= 0.5:
                 input_text = ""
@@ -1288,7 +1336,7 @@ def run(args: Config) -> None:
                     f"control loop lagged by {control_lag:.3f}s for "
                     f"{decision.over_limit_for_s:.3f}s; "
                     f"last cycle={(dispatch_done - cycle_started) * 1000:.1f}ms "
-                    f"observe/FK={(observation_done - cycle_started) * 1000:.1f}ms "
+                    f"robot_read={(observation_done - cycle_started) * 1000:.1f}ms "
                     f"control/IK={(control_done - observation_done) * 1000:.1f}ms "
                     f"dataset={(dataset_done - control_done) * 1000:.1f}ms "
                     f"dispatch={(dispatch_done - dataset_done) * 1000:.1f}ms"

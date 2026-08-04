@@ -52,6 +52,8 @@ class DatasetConfig:
     min_free_disk_gb: float = 5.0
     image_writer_threads_per_camera: int = 2
     encoder_threads: int = 2
+    streaming_encoding: bool = False
+    encoder_queue_size: int = 120
     video_codec: Literal["h264", "libsvtav1"] = "h264"
     shutdown_timeout_s: float = 60.0
 
@@ -107,6 +109,7 @@ class DatasetConfig:
             ("camera max age", self.camera_max_age_ms),
             ("image writer threads per camera", self.image_writer_threads_per_camera),
             ("encoder threads", self.encoder_threads),
+            ("encoder queue size", self.encoder_queue_size),
         ):
             if value <= 0:
                 raise DatasetRecordingError(f"dataset {name} must be positive")
@@ -317,9 +320,15 @@ def _default_dataset_factory(config: DatasetConfig, features: dict[str, dict[str
     common = {
         "root": config.root,
         "image_writer_processes": 0,
-        "image_writer_threads": config.image_writer_threads_per_camera * len(CAMERA_NAMES),
+        "image_writer_threads": (
+            0
+            if config.streaming_encoding
+            else config.image_writer_threads_per_camera * len(CAMERA_NAMES)
+        ),
         "batch_encoding_size": 1,
         "encoder_threads": config.encoder_threads,
+        "streaming_encoding": config.streaming_encoding,
+        "encoder_queue_maxsize": config.encoder_queue_size,
         "rgb_encoder": RGBEncoderConfig(vcodec=config.video_codec, pix_fmt="yuv420p"),
     }
     if config.resume:
@@ -480,6 +489,24 @@ class DatasetRecorder:
     @property
     def active(self) -> bool:
         return self._active
+
+    def queue_depths(self) -> dict[str, int]:
+        """Return approximate queue depths for live throughput diagnostics."""
+        depths = {"recorder": self._queue.qsize()}
+        writer = getattr(self.dataset, "writer", None)
+        image_writer = getattr(writer, "image_writer", None)
+        image_queue = getattr(image_writer, "queue", None)
+        if image_queue is not None:
+            try:
+                depths["png"] = image_queue.qsize()
+            except (AttributeError, NotImplementedError):
+                pass
+        streaming_encoder = getattr(writer, "_streaming_encoder", None)
+        frame_queues = getattr(streaming_encoder, "_frame_queues", {})
+        for key, frame_queue in frame_queues.items():
+            short_key = key.rsplit(".", maxsplit=1)[-1]
+            depths[f"encoder_{short_key}"] = frame_queue.qsize()
+        return depths
 
     def _set_worker_error(self, exc: BaseException) -> None:
         with self._error_lock:

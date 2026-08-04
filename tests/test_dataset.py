@@ -277,6 +277,7 @@ def test_disabled_recording_does_not_call_factories() -> None:
         ({"task": ""}, "task must be nonempty"),
         ({"right_camera_serial": "left-1"}, "must be distinct"),
         ({"queue_size": 0}, "queue size must be positive"),
+        ({"encoder_queue_size": 0}, "encoder queue size must be positive"),
         ({"min_free_disk_gb": 0}, "minimum free disk space must be positive"),
         ({"shutdown_timeout_s": 0}, "shutdown timeout must be positive"),
         ({"resume": True}, "resume requires an explicit local root"),
@@ -317,6 +318,8 @@ def test_recording_checks_disk_before_starting_writer(tmp_path: Path) -> None:
 
 def test_async_recorder_saves_only_intentional_long_enough_episode(tmp_path) -> None:
     recorder, dataset, cameras = recorder_fixture(tmp_path)
+
+    assert recorder.queue_depths() == {"recorder": 0}
 
     recorder.start_episode()
     add_frame(recorder, 0.0)
