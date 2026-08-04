@@ -37,7 +37,7 @@ from umi_teleop.controller import (
     rotation_angle,
     world_frame_delta,
 )
-from umi_teleop.ik import FallbackIkSolver, IkFallbackResult, fallback_diagnostic
+from umi_teleop.ik_policy import FallbackIkSolver, IkFallbackResult, fallback_diagnostic
 
 KNOWN_CONTROL_PATTERNS = (
     "umi-yam",

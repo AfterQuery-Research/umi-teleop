@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from umi_teleop.controller import rotation_angle
-from umi_teleop.ik import (
+from umi_teleop.ik_policy import (
     FallbackIkSolver,
     fallback_diagnostic,
     interpolate_pose,
