@@ -18,10 +18,12 @@ import numpy as np
 from umi_teleop.controller import ARM_NAMES
 
 CAMERA_NAMES = ("top", "left", "right")
-CAMERA_HEIGHT = 360
-CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 270
+CAMERA_WIDTH = 480
 CAMERA_SHAPE = (CAMERA_HEIGHT, CAMERA_WIDTH, 3)
+TOP_CAMERA_CAPTURE_WIDTH = 640
 TOP_CAMERA_CAPTURE_HEIGHT = 480
+TOP_CAMERA_CROP_HEIGHT = 360
 DATASET_FPS = 30
 YAM_SCALAR_NAMES = (
     *(f"left_joint_{index}.pos" for index in range(6)),
@@ -270,11 +272,26 @@ def build_frame(
 
 
 def _camera_image_view(name: str, image: np.ndarray) -> np.ndarray:
-    """Validate and crop a camera image without copying its pixels."""
+    """Validate and normalize a camera image to the stored 16:9 resolution."""
     image = np.asarray(image)
-    if name == "top" and image.shape == (TOP_CAMERA_CAPTURE_HEIGHT, CAMERA_WIDTH, 3):
-        crop_start = (TOP_CAMERA_CAPTURE_HEIGHT - CAMERA_HEIGHT) // 2
-        image = image[crop_start : crop_start + CAMERA_HEIGHT]
+    if name == "top" and image.shape == (
+        TOP_CAMERA_CAPTURE_HEIGHT,
+        TOP_CAMERA_CAPTURE_WIDTH,
+        3,
+    ):
+        crop_start = (TOP_CAMERA_CAPTURE_HEIGHT - TOP_CAMERA_CROP_HEIGHT) // 2
+        image = image[crop_start : crop_start + TOP_CAMERA_CROP_HEIGHT]
+        try:
+            import cv2
+        except ImportError as exc:
+            raise DatasetFrameError(
+                "top camera downsampling requires OpenCV from the dataset dependencies"
+            ) from exc
+        image = cv2.resize(
+            image,
+            (CAMERA_WIDTH, CAMERA_HEIGHT),
+            interpolation=cv2.INTER_AREA,
+        )
     if image.shape != CAMERA_SHAPE:
         raise DatasetFrameError(
             f"{name} camera frame shape {image.shape} cannot be converted to {CAMERA_SHAPE}"
@@ -393,7 +410,7 @@ def _default_upload_validator(config: DatasetConfig, dataset: Dataset) -> None:
 
 
 def validate_finalized_dataset(dataset: Dataset) -> None:
-    """Validate the local schema and nonempty counters before Hub upload."""
+    """Validate the local schema, counters, and encoded media before Hub upload."""
     if not _features_match(dataset.meta.features, dataset_features()):
         raise DatasetRecordingError(
             "finalized dataset schema does not match the MolmoAct2 Bimanual YAM contract"
@@ -404,6 +421,83 @@ def validate_finalized_dataset(dataset: Dataset) -> None:
         )
     if dataset.meta.total_episodes <= 0 or dataset.meta.total_frames <= 0:
         raise DatasetRecordingError("finalized dataset has no saved frames to upload")
+    _validate_video_integrity(dataset)
+
+
+def _video_frame_count(video_path: Path) -> int:
+    """Read a video container's frame count without decoding the full stream."""
+    try:
+        import av
+    except ImportError as exc:
+        raise DatasetRecordingError(
+            "video integrity validation requires PyAV from the dataset dependencies"
+        ) from exc
+    try:
+        with av.open(str(video_path)) as container:
+            if not container.streams.video:
+                raise DatasetRecordingError(f"encoded video has no video stream: {video_path}")
+            stream = container.streams.video[0]
+            if stream.frames > 0:
+                return int(stream.frames)
+            return sum(1 for packet in container.demux(stream) if packet.dts is not None)
+    except DatasetRecordingError:
+        raise
+    except Exception as exc:
+        raise DatasetRecordingError(f"cannot inspect encoded video {video_path}: {exc}") from exc
+
+
+def _validate_video_integrity(dataset: Dataset) -> None:
+    """Require every finalized camera video to agree with episode metadata."""
+    root_value = getattr(dataset, "root", None)
+    if root_value is None:
+        # Lightweight fake datasets used by unit tests do not contain encoded media.
+        return
+    root = Path(root_value)
+    meta = dataset.meta
+    episodes = getattr(meta, "episodes", None)
+    if episodes is None:
+        raise DatasetRecordingError("finalized dataset is missing episode metadata")
+    video_keys = [key for key, feature in meta.features.items() if feature.get("dtype") == "video"]
+    expected_from = 0
+    for episode_index, episode in enumerate(episodes):
+        try:
+            length = int(episode["length"])
+            dataset_from = int(episode["dataset_from_index"])
+            dataset_to = int(episode["dataset_to_index"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DatasetRecordingError(
+                f"episode {episode_index} has invalid tabular metadata"
+            ) from exc
+        if dataset_from != expected_from or dataset_to != dataset_from + length:
+            raise DatasetRecordingError(
+                f"episode {episode_index} row range [{dataset_from}, {dataset_to}) "
+                f"does not match length {length} after row {expected_from}"
+            )
+        for video_key in video_keys:
+            try:
+                relative_path = meta.get_video_file_path(episode_index, video_key)
+            except Exception as exc:
+                raise DatasetRecordingError(
+                    f"episode {episode_index} is missing video metadata for {video_key}"
+                ) from exc
+            video_path = root / relative_path
+            if not video_path.is_file():
+                raise DatasetRecordingError(
+                    f"episode {episode_index} video is missing for {video_key}: {video_path}"
+                )
+            frame_count = _video_frame_count(video_path)
+            if frame_count != length:
+                raise DatasetRecordingError(
+                    f"episode {episode_index} {video_key} has {frame_count} encoded frames; "
+                    f"expected {length}"
+                )
+        expected_from = dataset_to
+    if len(episodes) != int(meta.total_episodes) or expected_from != int(meta.total_frames):
+        raise DatasetRecordingError(
+            "episode metadata totals do not match finalized dataset counters: "
+            f"episodes={len(episodes)}/{meta.total_episodes} "
+            f"frames={expected_from}/{meta.total_frames}"
+        )
 
 
 def _check_free_disk(config: DatasetConfig, dataset: Dataset) -> None:
@@ -437,12 +531,13 @@ def _default_camera_factory(config: DatasetConfig) -> dict[str, Camera]:
     cameras: dict[str, Camera] = {}
     try:
         for name in CAMERA_NAMES:
+            capture_width = TOP_CAMERA_CAPTURE_WIDTH if name == "top" else CAMERA_WIDTH
             capture_height = TOP_CAMERA_CAPTURE_HEIGHT if name == "top" else CAMERA_HEIGHT
             camera = RealSenseCamera(
                 RealSenseCameraConfig(
                     serial_number_or_name=config.camera_serials[name],
                     fps=DATASET_FPS,
-                    width=CAMERA_WIDTH,
+                    width=capture_width,
                     height=capture_height,
                     use_rgb=True,
                     use_depth=False,
@@ -525,6 +620,32 @@ class DatasetRecorder:
             depths[f"encoder_{short_key}"] = frame_queue.qsize()
         return depths
 
+    def _streaming_encoder_drops(self) -> dict[str, int]:
+        """Return positive per-camera drop counts reported by LeRobot's encoder."""
+        writer = getattr(self.dataset, "writer", None)
+        encoder = getattr(writer, "_streaming_encoder", None)
+        raw_counts = getattr(encoder, "_dropped_frames", {})
+        for _attempt in range(2):
+            try:
+                items = tuple(raw_counts.items())
+                break
+            except RuntimeError:
+                continue
+        else:
+            raise DatasetRecordingError("streaming encoder drop counters changed while reading")
+        return {str(key): int(value) for key, value in items if int(value) > 0}
+
+    def _clear_streaming_encoder_drops(self) -> None:
+        writer = getattr(self.dataset, "writer", None)
+        encoder = getattr(writer, "_streaming_encoder", None)
+        raw_counts = getattr(encoder, "_dropped_frames", None)
+        if raw_counts is not None:
+            raw_counts.clear()
+
+    @staticmethod
+    def _format_streaming_encoder_drops(drops: Mapping[str, int]) -> str:
+        return ", ".join(f"{key}={value}" for key, value in sorted(drops.items()))
+
     def _set_worker_error(self, exc: BaseException) -> None:
         with self._error_lock:
             if self._worker_error is None:
@@ -589,6 +710,11 @@ class DatasetRecorder:
         self._check_healthy()
         if not self._active:
             raise DatasetRecordingError("cannot record a frame without an active episode")
+        drops = self._streaming_encoder_drops()
+        if drops:
+            raise DatasetFrameError(
+                "streaming encoder dropped frames: " + self._format_streaming_encoder_drops(drops)
+            )
         try:
             images = {
                 name: _camera_image_view(
@@ -644,17 +770,23 @@ class DatasetRecorder:
                 if isinstance(operation, _FrameOperation):
                     self.dataset.add_frame(operation.frame)
                 elif isinstance(operation, _FinishOperation):
-                    if operation.commit:
+                    drops = self._streaming_encoder_drops()
+                    if operation.commit and not drops:
                         self.dataset.save_episode()
                         self._saved_episodes += 1
                         print(f"DATASET episode saved frames={operation.frame_count}", flush=True)
                     else:
                         self.dataset.clear_episode_buffer()
+                        reason = operation.reason
+                        if drops:
+                            reason += "; streaming encoder dropped frames: "
+                            reason += self._format_streaming_encoder_drops(drops)
                         print(
                             f"DATASET episode discarded frames={operation.frame_count} "
-                            f"reason={operation.reason}",
+                            f"reason={reason}",
                             flush=True,
                         )
+                    self._clear_streaming_encoder_drops()
                 else:
                     raise RuntimeError(f"unknown dataset operation {operation!r}")
         except BaseException as exc:

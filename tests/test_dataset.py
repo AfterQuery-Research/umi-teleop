@@ -13,6 +13,8 @@ from umi_teleop.dataset import (
     CAMERA_NAMES,
     CAMERA_SHAPE,
     TOP_CAMERA_CAPTURE_HEIGHT,
+    TOP_CAMERA_CAPTURE_WIDTH,
+    TOP_CAMERA_CROP_HEIGHT,
     YAM_SCALAR_NAMES,
     ControlLagMonitor,
     DatasetConfig,
@@ -25,6 +27,7 @@ from umi_teleop.dataset import (
     dataset_features,
     normalize_camera_image,
     prepare_dataset_step,
+    validate_finalized_dataset,
     yam_vector,
 )
 
@@ -172,7 +175,7 @@ def test_dataset_features_match_molmoact2_bimanual_yam_contract() -> None:
     for name in CAMERA_NAMES:
         feature = features[f"observation.images.{name}"]
         assert feature["dtype"] == "video"
-        assert feature["shape"] == (360, 640, 3)
+        assert feature["shape"] == (270, 480, 3)
 
 
 def test_yam_vector_orders_left_gripper_then_right_gripper() -> None:
@@ -208,18 +211,21 @@ def test_frame_keeps_measured_state_separate_from_applied_command() -> None:
     assert not np.shares_memory(frame["observation.images.top"], images["top"])
 
 
-def test_top_camera_native_frame_is_center_cropped_to_dataset_shape() -> None:
-    image = np.repeat(
+def test_top_camera_native_frame_is_center_cropped_and_downsampled() -> None:
+    cv2 = pytest.importorskip("cv2")
+    image = np.broadcast_to(
         np.arange(TOP_CAMERA_CAPTURE_HEIGHT, dtype=np.uint16)[:, None, None],
-        640 * 3,
-        axis=1,
-    ).reshape(TOP_CAMERA_CAPTURE_HEIGHT, 640, 3)
+        (TOP_CAMERA_CAPTURE_HEIGHT, TOP_CAMERA_CAPTURE_WIDTH, 3),
+    )
     image = (image % 256).astype(np.uint8)
 
     normalized = normalize_camera_image("top", image)
 
+    crop_start = (TOP_CAMERA_CAPTURE_HEIGHT - TOP_CAMERA_CROP_HEIGHT) // 2
+    cropped = image[crop_start : crop_start + TOP_CAMERA_CROP_HEIGHT]
+    expected = cv2.resize(cropped, (480, 270), interpolation=cv2.INTER_AREA)
     assert normalized.shape == CAMERA_SHAPE
-    np.testing.assert_array_equal(normalized, image[60:420])
+    np.testing.assert_array_equal(normalized, expected)
     assert normalized.flags.c_contiguous
     assert not np.shares_memory(normalized, image)
 
@@ -358,6 +364,92 @@ def test_async_recorder_saves_only_intentional_long_enough_episode(tmp_path) -> 
     assert dataset.clear_count == 2
     assert dataset.finalize_count == 1
     assert all(camera.disconnected == 1 for camera in cameras.values())
+
+
+def test_streaming_encoder_drop_discards_episode_instead_of_saving(tmp_path) -> None:
+    class DroppingDataset(FakeDataset):
+        def __init__(self) -> None:
+            super().__init__()
+            encoder = type("Encoder", (), {"_dropped_frames": {}})()
+            self.writer = type("Writer", (), {"_streaming_encoder": encoder})()
+
+    dataset = DroppingDataset()
+    recorder, dataset, _cameras = recorder_fixture(tmp_path, dataset=dataset)
+    recorder.start_episode()
+    add_frame(recorder)
+    add_frame(recorder, measured_offset=0.1)
+    deadline = time.monotonic() + 1.0
+    while len(dataset.buffer) < 2 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert len(dataset.buffer) == 2
+    dataset.writer._streaming_encoder._dropped_frames = {"observation.images.left": 1}
+    recorder.finish_episode(commit=True, reason="enable toggled off")
+    recorder.close()
+
+    assert dataset.episodes == []
+    assert dataset.clear_count == 1
+    assert dataset.writer._streaming_encoder._dropped_frames == {}
+
+
+def test_streaming_encoder_drop_invalidates_active_frame(tmp_path) -> None:
+    dataset = FakeDataset()
+    encoder = type(
+        "Encoder",
+        (),
+        {"_dropped_frames": {"observation.images.right": 2}},
+    )()
+    dataset.writer = type("Writer", (), {"_streaming_encoder": encoder})()
+    recorder, _dataset, _cameras = recorder_fixture(tmp_path, dataset=dataset)
+    recorder.start_episode()
+
+    with pytest.raises(DatasetFrameError, match="observation.images.right=2"):
+        add_frame(recorder)
+    recorder.finish_episode(commit=False, reason="encoder drop")
+    recorder.close()
+
+
+def test_finalized_dataset_rejects_mismatched_encoded_video_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "dataset"
+    root.mkdir()
+    video_keys = [f"observation.images.{name}" for name in CAMERA_NAMES]
+    relative_paths = {
+        key: Path("videos") / key / "chunk-000" / "file-000.mp4" for key in video_keys
+    }
+    for path in relative_paths.values():
+        target = root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.touch()
+
+    class MediaMeta:
+        features = dataset_features()
+        fps = 30
+        total_episodes = 1
+        total_frames = 10
+        episodes = [
+            {
+                "length": 10,
+                "dataset_from_index": 0,
+                "dataset_to_index": 10,
+            }
+        ]
+
+        @staticmethod
+        def get_video_file_path(_episode_index: int, video_key: str) -> Path:
+            return relative_paths[video_key]
+
+    dataset = type("FinalizedDataset", (), {"root": root, "meta": MediaMeta()})()
+    monkeypatch.setattr(
+        "umi_teleop.dataset._video_frame_count",
+        lambda path: 9 if "left" in str(path) else 10,
+    )
+
+    with pytest.raises(
+        DatasetRecordingError,
+        match=r"observation.images.left has 9 encoded frames; expected 10",
+    ):
+        validate_finalized_dataset(dataset)
 
 
 def test_enable_continues_episode_that_started_during_ready_motion(tmp_path) -> None:
