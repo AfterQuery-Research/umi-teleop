@@ -846,7 +846,8 @@ def run(args: Config) -> None:
                 f"resume={args.dataset.resume} upload={args.dataset.push_to_hub} "
                 f"side_cameras={args.dataset.side_camera_kind} "
                 f"pipeline={'streaming' if args.dataset.streaming_encoding else 'png-staging'} "
-                f"codec={args.dataset.video_codec} gop={args.dataset.encoder_gop_size}",
+                f"codec={args.dataset.video_codec} gop={args.dataset.encoder_gop_size} "
+                f"encoder_threads={args.dataset.encoder_threads}",
                 flush=True,
             )
 

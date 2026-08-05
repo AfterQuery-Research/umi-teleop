@@ -292,6 +292,7 @@ def test_real_lerobot_v3_video_dataset_can_finalize_and_reopen(tmp_path: Path) -
 @pytest.mark.integration
 def test_real_lerobot_v3_video_dataset_supports_ultrawide_side_shapes(tmp_path: Path) -> None:
     lerobot_dataset = pytest.importorskip("lerobot.datasets.lerobot_dataset")
+    video_utils = pytest.importorskip("lerobot.datasets.video_utils")
     config = DatasetConfig(
         repo_id="afterquery/umi-teleop-ultrawide-integration",
         root=tmp_path / "lerobot-ultrawide",
@@ -314,6 +315,7 @@ def test_real_lerobot_v3_video_dataset_supports_ultrawide_side_shapes(tmp_path: 
         camera_factory=lambda _config: cameras,
     )
     assert recorder is not None
+    assert getattr(video_utils._CameraEncoderThread, "_umi_deferred_rgb_stats", False)
     recorder.start_episode()
     for offset in (0.0, 0.1, 0.2):
         measured = {

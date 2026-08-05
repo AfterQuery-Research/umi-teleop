@@ -24,8 +24,10 @@ CAMERA_SHAPE = (CAMERA_HEIGHT, CAMERA_WIDTH, 3)
 TOP_CAMERA_CAPTURE_WIDTH = 640
 TOP_CAMERA_CAPTURE_HEIGHT = 480
 TOP_CAMERA_CROP_HEIGHT = 360
-ULTRAWIDE_CAMERA_HEIGHT = 600
-ULTRAWIDE_CAMERA_WIDTH = 800
+ULTRAWIDE_CAPTURE_HEIGHT = 480
+ULTRAWIDE_CAPTURE_WIDTH = 640
+ULTRAWIDE_CAMERA_HEIGHT = 312
+ULTRAWIDE_CAMERA_WIDTH = 416
 ULTRAWIDE_CAMERA_SHAPE = (ULTRAWIDE_CAMERA_HEIGHT, ULTRAWIDE_CAMERA_WIDTH, 3)
 ULTRAWIDE_REQUESTED_FPS = 60
 DATASET_FPS = 30
@@ -326,6 +328,27 @@ def build_frame(
     return frame
 
 
+def _validated_camera_image(
+    name: str,
+    image: np.ndarray,
+    expected_shape: tuple[int, int, int],
+) -> np.ndarray:
+    """Validate that a camera frame can be converted to its stored shape without copying it."""
+    image = np.asarray(image)
+    accepted_shapes = {expected_shape}
+    if name == "top" and expected_shape == CAMERA_SHAPE:
+        accepted_shapes.add((TOP_CAMERA_CAPTURE_HEIGHT, TOP_CAMERA_CAPTURE_WIDTH, 3))
+    elif name in ("left", "right") and expected_shape == ULTRAWIDE_CAMERA_SHAPE:
+        accepted_shapes.add((ULTRAWIDE_CAPTURE_HEIGHT, ULTRAWIDE_CAPTURE_WIDTH, 3))
+    if image.shape not in accepted_shapes:
+        raise DatasetFrameError(
+            f"{name} camera frame shape {image.shape} cannot be converted to {expected_shape}"
+        )
+    if image.dtype != np.uint8:
+        raise DatasetFrameError(f"{name} camera frame must be RGB uint8")
+    return image
+
+
 def _camera_image_view(
     name: str,
     image: np.ndarray,
@@ -333,7 +356,7 @@ def _camera_image_view(
 ) -> np.ndarray:
     """Validate and normalize a camera image to its stored dataset resolution."""
     expected_shape = (camera_shapes or dataset_camera_shapes())[name]
-    image = np.asarray(image)
+    image = _validated_camera_image(name, image, expected_shape)
     if name == "top" and image.shape == (
         TOP_CAMERA_CAPTURE_HEIGHT,
         TOP_CAMERA_CAPTURE_WIDTH,
@@ -352,12 +375,28 @@ def _camera_image_view(
             (CAMERA_WIDTH, CAMERA_HEIGHT),
             interpolation=cv2.INTER_AREA,
         )
-    if image.shape != expected_shape:
-        raise DatasetFrameError(
-            f"{name} camera frame shape {image.shape} cannot be converted to {expected_shape}"
+    elif (
+        name in ("left", "right")
+        and image.shape
+        == (
+            ULTRAWIDE_CAPTURE_HEIGHT,
+            ULTRAWIDE_CAPTURE_WIDTH,
+            3,
         )
-    if image.dtype != np.uint8:
-        raise DatasetFrameError(f"{name} camera frame must be RGB uint8")
+        and expected_shape == ULTRAWIDE_CAMERA_SHAPE
+    ):
+        try:
+            import cv2
+        except ImportError as exc:
+            raise DatasetFrameError(
+                "ultrawide camera downsampling requires OpenCV from the dataset dependencies"
+            ) from exc
+        image = cv2.resize(
+            image,
+            (ULTRAWIDE_CAMERA_WIDTH, ULTRAWIDE_CAMERA_HEIGHT),
+            interpolation=cv2.INTER_AREA,
+        )
+    assert image.shape == expected_shape
     return image
 
 
@@ -409,10 +448,15 @@ def _default_dataset_factory(config: DatasetConfig, features: dict[str, dict[str
     try:
         from lerobot.configs import RGBEncoderConfig
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+        from umi_teleop.streaming_encoder import install_streaming_encoder_optimization
     except ImportError as exc:
         raise DatasetRecordingError(
             "LeRobot recording dependencies are unavailable; install the dataset extra"
         ) from exc
+
+    if config.streaming_encoding:
+        install_streaming_encoder_optimization()
 
     common = {
         "root": config.root,
@@ -468,16 +512,19 @@ def _default_upload_validator(config: DatasetConfig, dataset: Dataset) -> None:
     )
     expected_features = dataset_features(config.side_camera_kind)
     validate_finalized_dataset(reopened, expected_features=expected_features)
-    for frame_index in sorted({0, reopened.meta.total_frames - 1}):
-        sample = reopened[frame_index]
-        for name in CAMERA_NAMES:
-            image = sample[f"observation.images.{name}"]
-            expected_shape = config.camera_shapes[name]
-            channel_first_shape = (expected_shape[2], expected_shape[0], expected_shape[1])
-            if tuple(image.shape) not in (expected_shape, channel_first_shape):
-                raise DatasetRecordingError(
-                    f"decoded {name} frame has unexpected shape {tuple(image.shape)}"
-                )
+    from umi_teleop.streaming_encoder import _suppress_av_conversion_warnings
+
+    with _suppress_av_conversion_warnings():
+        for frame_index in sorted({0, reopened.meta.total_frames - 1}):
+            sample = reopened[frame_index]
+            for name in CAMERA_NAMES:
+                image = sample[f"observation.images.{name}"]
+                expected_shape = config.camera_shapes[name]
+                channel_first_shape = (expected_shape[2], expected_shape[0], expected_shape[1])
+                if tuple(image.shape) not in (expected_shape, channel_first_shape):
+                    raise DatasetRecordingError(
+                        f"decoded {name} frame has unexpected shape {tuple(image.shape)}"
+                    )
 
 
 def validate_finalized_dataset(
@@ -654,8 +701,8 @@ def _camera_specs(config: DatasetConfig) -> tuple[_CameraSpec, ...]:
                 name,
                 "opencv",
                 config.camera_paths[name],
-                ULTRAWIDE_CAMERA_WIDTH,
-                ULTRAWIDE_CAMERA_HEIGHT,
+                ULTRAWIDE_CAPTURE_WIDTH,
+                ULTRAWIDE_CAPTURE_HEIGHT,
                 ULTRAWIDE_REQUESTED_FPS,
                 "MJPG",
             )
@@ -824,6 +871,24 @@ class DatasetRecorder:
         if error := self._current_error():
             raise DatasetRecordingError(f"dataset writer failed: {error}") from error
 
+    def _check_recoverable_backlog(self) -> None:
+        """Invalidate an episode before writer saturation can kill motor hold.
+
+        Keep enough queue capacity for the caller to enqueue the current episode's
+        discard operation. Very small queues are retained for deterministic overflow
+        tests and are not useful as production recording configurations.
+        """
+        if self.config.queue_size < 4:
+            return
+        reserve = max(2, min(DATASET_FPS, self.config.queue_size // 10))
+        limit = self.config.queue_size - reserve
+        depth = self._queue.qsize()
+        if depth >= limit:
+            raise DatasetFrameError(
+                f"dataset writer backlog reached {depth}/{self.config.queue_size} frames; "
+                "recording cannot keep up, discarding episode before controller saturation"
+            )
+
     def _put_nowait(self, operation: object) -> None:
         self._check_healthy()
         try:
@@ -873,31 +938,33 @@ class DatasetRecorder:
         self._check_healthy()
         if not self._active:
             raise DatasetRecordingError("cannot record a frame without an active episode")
+        self._check_recoverable_backlog()
         drops = self._streaming_encoder_drops()
         if drops:
             raise DatasetFrameError(
                 "streaming encoder dropped frames: " + self._format_streaming_encoder_drops(drops)
             )
         try:
-            images = {
-                name: _camera_image_view(
-                    name,
-                    camera.read_latest(max_age_ms=self.config.camera_max_age_ms),
-                    self.config.camera_shapes,
-                )
-                for name, camera in self.cameras.items()
-            }
+            images = {}
+            for name, camera in self.cameras.items():
+                image = camera.read_latest(max_age_ms=self.config.camera_max_age_ms)
+                # Validate convertibility now so a bad camera frame disarms immediately, but defer
+                # the expensive resize to the dataset writer thread.  The private copy preserves
+                # the exact pre-command observation even if the camera reuses its capture buffer.
+                _validated_camera_image(name, image, self.config.camera_shapes[name])
+                images[name] = np.array(image, copy=True, order="C")
         except Exception as exc:
             raise DatasetFrameError(f"camera capture failed: {exc}") from exc
-        return build_frame(
-            images=images,
-            measured_joints=measured_joints,
-            measured_grippers=measured_grippers,
-            commanded_joints=commanded_joints,
-            commanded_grippers=commanded_grippers,
-            task=(self.config.task or "").strip(),
-            camera_shapes=self.config.camera_shapes,
-        )
+        frame: dict[str, Any] = {
+            "observation.state": yam_vector(
+                measured_joints, measured_grippers, label="measured state"
+            ),
+            "action": yam_vector(commanded_joints, commanded_grippers, label="commanded action"),
+            "task": (self.config.task or "").strip(),
+        }
+        for name, image in images.items():
+            frame[f"observation.images.{name}"] = image
+        return frame
 
     def commit_frame(self, frame: dict[str, Any]) -> None:
         """Queue a prepared frame after both arm command calls have succeeded."""
@@ -933,7 +1000,19 @@ class DatasetRecorder:
                 if operation is _STOP:
                     return
                 if isinstance(operation, _FrameOperation):
-                    self.dataset.add_frame(operation.frame)
+                    frame = operation.frame
+                    for name in CAMERA_NAMES:
+                        key = f"observation.images.{name}"
+                        frame[key] = np.array(
+                            _camera_image_view(
+                                name,
+                                frame[key],
+                                self.config.camera_shapes,
+                            ),
+                            copy=True,
+                            order="C",
+                        )
+                    self.dataset.add_frame(frame)
                 elif isinstance(operation, _FinishOperation):
                     drops = self._streaming_encoder_drops()
                     if operation.commit and not drops:

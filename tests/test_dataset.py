@@ -16,6 +16,8 @@ from umi_teleop.dataset import (
     TOP_CAMERA_CAPTURE_WIDTH,
     TOP_CAMERA_CROP_HEIGHT,
     ULTRAWIDE_CAMERA_SHAPE,
+    ULTRAWIDE_CAPTURE_HEIGHT,
+    ULTRAWIDE_CAPTURE_WIDTH,
     ULTRAWIDE_REQUESTED_FPS,
     YAM_SCALAR_NAMES,
     ControlLagMonitor,
@@ -259,15 +261,21 @@ def test_top_camera_native_frame_is_center_cropped_and_downsampled() -> None:
     assert not np.shares_memory(normalized, image)
 
 
-def test_ultrawide_camera_frame_is_preserved_without_aspect_ratio_conversion() -> None:
-    image = np.arange(np.prod(ULTRAWIDE_CAMERA_SHAPE), dtype=np.uint8).reshape(
-        ULTRAWIDE_CAMERA_SHAPE
-    )
+def test_ultrawide_camera_frame_is_downsampled_without_aspect_ratio_conversion() -> None:
+    import cv2
+
+    capture_shape = (ULTRAWIDE_CAPTURE_HEIGHT, ULTRAWIDE_CAPTURE_WIDTH, 3)
+    image = np.arange(np.prod(capture_shape), dtype=np.uint8).reshape(capture_shape)
 
     normalized = normalize_camera_image("left", image, "ultrawide")
+    expected = cv2.resize(
+        image,
+        (ULTRAWIDE_CAMERA_SHAPE[1], ULTRAWIDE_CAMERA_SHAPE[0]),
+        interpolation=cv2.INTER_AREA,
+    )
 
     assert normalized.shape == ULTRAWIDE_CAMERA_SHAPE
-    np.testing.assert_array_equal(normalized, image)
+    np.testing.assert_array_equal(normalized, expected)
     assert normalized.flags.c_contiguous
     assert not np.shares_memory(normalized, image)
 
@@ -384,7 +392,7 @@ def test_camera_specs_preserve_realsense_defaults_and_add_ultrawide_option(tmp_p
         assert spec.name == name
         assert spec.backend == "opencv"
         assert spec.source == path
-        assert (spec.width, spec.height) == (800, 600)
+        assert (spec.width, spec.height) == (640, 480)
         assert spec.requested_fps == ULTRAWIDE_REQUESTED_FPS
         assert spec.fourcc == "MJPG"
 
@@ -475,6 +483,41 @@ def test_ultrawide_recorder_writes_mixed_camera_shapes(tmp_path: Path) -> None:
 
     frame = dataset.episodes[0][0]
     assert frame["observation.images.top"].shape == CAMERA_SHAPE
+    assert frame["observation.images.left"].shape == ULTRAWIDE_CAMERA_SHAPE
+    assert frame["observation.images.right"].shape == ULTRAWIDE_CAMERA_SHAPE
+
+
+def test_ultrawide_recorder_defers_side_downsampling_to_writer(tmp_path: Path) -> None:
+    capture_shape = (ULTRAWIDE_CAPTURE_HEIGHT, ULTRAWIDE_CAPTURE_WIDTH, 3)
+
+    def use_native_ultrawide_frames(cameras: dict[str, FakeCamera]) -> None:
+        cameras["left"].image = np.full(capture_shape, 1, dtype=np.uint8)
+        cameras["right"].image = np.full(capture_shape, 2, dtype=np.uint8)
+
+    recorder, dataset, _cameras = recorder_fixture(
+        tmp_path,
+        config=ultrawide_recording_config(tmp_path),
+        camera_mutator=use_native_ultrawide_frames,
+    )
+    measured_joints, measured_grippers = robot_values()
+    commanded_joints, commanded_grippers = robot_values(0.5)
+    recorder.start_episode()
+    prepared = recorder.prepare_frame(
+        measured_joints=measured_joints,
+        measured_grippers=measured_grippers,
+        commanded_joints=commanded_joints,
+        commanded_grippers=commanded_grippers,
+    )
+
+    assert prepared["observation.images.left"].shape == capture_shape
+    assert prepared["observation.images.right"].shape == capture_shape
+
+    recorder.commit_frame(prepared)
+    add_frame(recorder, measured_offset=0.1)
+    recorder.finish_episode(commit=True, reason="enable toggled off")
+    recorder.close()
+
+    frame = dataset.episodes[0][0]
     assert frame["observation.images.left"].shape == ULTRAWIDE_CAMERA_SHAPE
     assert frame["observation.images.right"].shape == ULTRAWIDE_CAMERA_SHAPE
 
@@ -810,6 +853,40 @@ def test_queue_overflow_fails_and_close_does_not_deadlock(tmp_path) -> None:
     with pytest.raises(DatasetRecordingError, match="queue is full"):
         recorder.close()
 
+    assert dataset.finalize_count == 1
+
+
+def test_writer_backlog_invalidates_episode_before_fatal_queue_overflow(tmp_path) -> None:
+    entered = Event()
+    release = Event()
+
+    class BlockingDataset(FakeDataset):
+        def add_frame(self, frame: dict[str, Any]) -> None:
+            entered.set()
+            assert release.wait(timeout=2.0)
+            super().add_frame(frame)
+
+    config = recording_config(tmp_path, queue_size=10, min_episode_frames=1)
+    recorder, dataset, _cameras = recorder_fixture(
+        tmp_path,
+        config=config,
+        dataset=BlockingDataset(),
+    )
+    recorder.start_episode()
+    add_frame(recorder)
+    assert entered.wait(timeout=1.0)
+    for offset in np.linspace(0.1, 0.8, 8):
+        add_frame(recorder, measured_offset=float(offset))
+
+    with pytest.raises(DatasetFrameError, match="writer backlog reached 8/10"):
+        add_frame(recorder, measured_offset=0.9)
+
+    recorder.finish_episode(commit=False, reason="writer backlog")
+    release.set()
+    recorder.close()
+
+    assert dataset.episodes == []
+    assert dataset.clear_count == 1
     assert dataset.finalize_count == 1
 
 

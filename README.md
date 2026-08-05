@@ -281,9 +281,9 @@ then run:
 
 To retain the top D435 while replacing the two D405 wrist views with the ultrawide cameras, select
 the additive ultrawide side-camera mode. The existing RealSense mode remains the default. The
-ultrawides are captured and stored at RGB `800x600`; the cameras require MJPEG with a requested
-60 fps setting to deliver the measured 30 fps stream. They have identical USB serials, so use their
-stable physical USB paths:
+ultrawides are captured as MJPEG at RGB `640x480`, then downsampled and stored at RGB `416x312`;
+the cameras require a requested 60 fps setting to deliver the measured 30 fps stream. They have
+identical USB serials, so use their stable physical USB paths:
 
 ```bash
 export LEFT_WIDE=/dev/v4l/by-path/platform-xhci-hcd.1-usb-0:1.4.4.4:1.0-video-index0
@@ -306,7 +306,7 @@ export RIGHT_WIDE=/dev/v4l/by-path/platform-xhci-hcd.1-usb-0:1.4.4.3:1.0-video-i
 
 Use a new dataset root and Hub repository when switching side-camera kinds. The RealSense schema
 stores all views at `480x270`; the ultrawide schema stores `top` at `480x270` and `left`/`right` at
-`800x600`, so the two modes cannot be resumed into the same LeRobot dataset.
+`416x312`, so the two modes cannot be resumed into the same LeRobot dataset.
 
 The default startup slowly places both arms at the all-zero base posture. That automatic motion and
 the idle wait for ZERO/E are not recorded. An episode starts only when E successfully enables
@@ -326,7 +326,11 @@ dataset is retained if login or upload fails.
 To append during a later run, use the same repo ID and root and add `--dataset.resume`. Omit
 `--dataset.push-to-hub` to collect and validate locally without uploading. H.264/yuv420p is the
 Raspberry Pi default. Streaming H.264 uses a 30-frame GOP and the `ultrafast` x264 preset so the
-three camera encoders can keep up with capture without starving arm control. Add
+three camera encoders can keep up with capture without starving arm control. RGB statistics are
+computed from the completed videos after an episode ends instead of competing with live encoding,
+so saving an episode can take a little longer. If the
+background writer reaches 90% of its queue, the current episode is discarded and teleoperation is
+disarmed while the controller keeps the motors holding position. Add
 `--dataset.video-codec libsvtav1` only when AV1 file-level parity is required and the slower encoder
 has been tested on this hardware. Final validation decodes the
 first and last saved frames with PyAV, avoiding TorchCodec's optional GPU-linked runtime on ARM64.
