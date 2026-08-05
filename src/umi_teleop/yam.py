@@ -844,6 +844,7 @@ def run(args: Config) -> None:
             print(
                 f"DATASET ready repo={args.dataset.repo_id} root={args.dataset.root} "
                 f"resume={args.dataset.resume} upload={args.dataset.push_to_hub} "
+                f"side_cameras={args.dataset.side_camera_kind} "
                 f"pipeline={'streaming' if args.dataset.streaming_encoding else 'png-staging'} "
                 f"codec={args.dataset.video_codec} gop={args.dataset.encoder_gop_size}",
                 flush=True,

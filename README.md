@@ -13,7 +13,7 @@ flowchart LR
     W["Windows 10.103.3.44<br/>SteamVR + umi-vive-sender"]
     S["UMI Pi 10.103.3.43<br/>trackers + cameras + buttons"]
     Y["YAM Pi 10.103.3.85<br/>safety + IK + motor control"]
-    C["3 RealSense policy cameras<br/>optional dataset recording"]
+    C["Top RealSense + selectable side cameras<br/>optional dataset recording"]
     H["Hugging Face dataset<br/>optional private upload"]
     L["Left YAM<br/>USB serial to current canN"]
     R["Right YAM<br/>USB serial to current canN"]
@@ -29,8 +29,9 @@ The Windows sender publishes raw SteamVR poses. The UMI Pi converts them to `+X`
 left, `+Z` up; measures both grippers from calibrated ArUco tags; reads the E/Z buttons; and sends
 one validated packet at 30 Hz. The YAM Pi owns zeroing, workspace limits, inverse kinematics, joint
 limits, slew limits, CAN access, and motor commands. The two UMI ArUco-camera images never leave
-the UMI Pi. Optional policy-dataset images come from three separate RealSense cameras connected to
-the YAM Pi and leave it only when explicit Hub upload is enabled.
+the UMI Pi. Optional policy-dataset images come from a top RealSense plus either two RealSense or
+two ultrawide side cameras connected to the YAM Pi, and leave it only when explicit Hub upload is
+enabled.
 
 One root `pyproject.toml` and lockfile keep the protocol and safety code on one version. Install only
 the relevant hardware extra on each device: `windows`, `source`, or `yam`. Every CLI uses Tyro;
@@ -278,6 +279,35 @@ then run:
   --confirm-clear
 ```
 
+To retain the top D435 while replacing the two D405 wrist views with the ultrawide cameras, select
+the additive ultrawide side-camera mode. The existing RealSense mode remains the default. The
+ultrawides are captured and stored at RGB `800x600`; the cameras require MJPEG with a requested
+60 fps setting to deliver the measured 30 fps stream. They have identical USB serials, so use their
+stable physical USB paths:
+
+```bash
+export LEFT_WIDE=/dev/v4l/by-path/platform-xhci-hcd.1-usb-0:1.4.4.4:1.0-video-index0
+export RIGHT_WIDE=/dev/v4l/by-path/platform-xhci-hcd.1-usb-0:1.4.4.3:1.0-video-index0
+
+.venv/bin/umi-yam \
+  --left-adapter-serial "$LEFT_CAN" \
+  --right-adapter-serial "$RIGHT_CAN" \
+  --dataset.repo-id AfterQuery-Research/YOUR_ULTRAWIDE_DATASET_NAME \
+  --dataset.root /home/yam/Datasets/YOUR_ULTRAWIDE_DATASET_NAME \
+  --dataset.task "Pick up the oranges and put them in the bowl" \
+  --dataset.top-camera-serial "$TOP_CAMERA" \
+  --dataset.side-camera-kind ultrawide \
+  --dataset.left-camera-path "$LEFT_WIDE" \
+  --dataset.right-camera-path "$RIGHT_WIDE" \
+  --dataset.streaming-encoding \
+  --dataset.push-to-hub \
+  --confirm-clear
+```
+
+Use a new dataset root and Hub repository when switching side-camera kinds. The RealSense schema
+stores all views at `480x270`; the ultrawide schema stores `top` at `480x270` and `left`/`right` at
+`800x600`, so the two modes cannot be resumed into the same LeRobot dataset.
+
 The default startup slowly places both arms at the all-zero base posture. That automatic motion and
 the idle wait for ZERO/E are not recorded. An episode starts only when E successfully enables
 teleoperation. Tapping E to stop saves the episode, then automatically returns both arms to the
@@ -303,8 +333,8 @@ first and last saved frames with PyAV, avoiding TorchCodec's optional GPU-linked
 It also requires every camera video file to contain exactly the combined number of frames declared
 by the episodes that reference it; LeRobot may pack multiple episodes into one shared file. A
 streaming encoder drop discards the active episode instead of saving misaligned views.
-Use a new dataset root/repository for these `480x270` recordings; they cannot be appended to an
-existing `640x360` LeRobot schema.
+Resume only a dataset created with the same selected camera profile. Recording rejects an existing
+root whose per-camera shapes or frame rate do not match.
 
 The resulting LeRobot v3 schema keeps the `MolmoAct2-BimanualYAM-Dataset` camera, state, and action
 semantics: `top`, `left`, and `right` RGB images plus 14-value `observation.state` and `action`

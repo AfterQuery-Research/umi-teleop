@@ -14,6 +14,7 @@ from umi_teleop.controller import GripperMap, TeleopLimits, TeleopStateMachine, 
 from umi_teleop.dataset import (
     CAMERA_NAMES,
     CAMERA_SHAPE,
+    ULTRAWIDE_CAMERA_SHAPE,
     DatasetConfig,
     DatasetRecordingError,
     create_dataset_recorder,
@@ -25,14 +26,15 @@ from umi_teleop.types import Event
 
 
 class IntegrationCamera:
-    def __init__(self, value: int) -> None:
+    def __init__(self, value: int, shape: tuple[int, int, int] = CAMERA_SHAPE) -> None:
         self.value = value
+        self.shape = shape
         self.disconnected = False
 
     def read_latest(self, max_age_ms: int = 500) -> np.ndarray:
         assert max_age_ms == 250
         self.value += 1
-        return np.full(CAMERA_SHAPE, self.value, dtype=np.uint8)
+        return np.full(self.shape, self.value, dtype=np.uint8)
 
     def disconnect(self) -> None:
         self.disconnected = True
@@ -285,3 +287,59 @@ def test_real_lerobot_v3_video_dataset_can_finalize_and_reopen(tmp_path: Path) -
                 name: IntegrationCamera(index + 20) for index, name in enumerate(CAMERA_NAMES)
             },
         )
+
+
+@pytest.mark.integration
+def test_real_lerobot_v3_video_dataset_supports_ultrawide_side_shapes(tmp_path: Path) -> None:
+    lerobot_dataset = pytest.importorskip("lerobot.datasets.lerobot_dataset")
+    config = DatasetConfig(
+        repo_id="afterquery/umi-teleop-ultrawide-integration",
+        root=tmp_path / "lerobot-ultrawide",
+        task="Move the object",
+        top_camera_serial="top",
+        side_camera_kind="ultrawide",
+        left_camera_path=Path("/dev/v4l/by-path/left-wide"),
+        right_camera_path=Path("/dev/v4l/by-path/right-wide"),
+        min_episode_frames=2,
+        video_codec="h264",
+        streaming_encoding=True,
+    )
+    cameras = {
+        name: IntegrationCamera(index, config.camera_shapes[name])
+        for index, name in enumerate(CAMERA_NAMES)
+    }
+    recorder = create_dataset_recorder(
+        config,
+        30.0,
+        camera_factory=lambda _config: cameras,
+    )
+    assert recorder is not None
+    recorder.start_episode()
+    for offset in (0.0, 0.1, 0.2):
+        measured = {
+            "left": np.full(6, offset),
+            "right": np.full(6, offset + 1.0),
+        }
+        recorder.record_frame(
+            measured_joints=measured,
+            measured_grippers={"left": 0.25, "right": 0.75},
+            commanded_joints={name: values + 0.1 for name, values in measured.items()},
+            commanded_grippers={"left": 0.3, "right": 0.7},
+        )
+    recorder.finish_episode(commit=True, reason="enable toggled off")
+    recorder.close()
+
+    reopened = lerobot_dataset.LeRobotDataset(
+        config.repo_id,
+        root=config.root,
+        video_backend="pyav",
+        return_uint8=True,
+    )
+    assert reopened.meta.total_frames == 3
+    assert reopened.meta.features["observation.images.top"]["shape"] == CAMERA_SHAPE
+    assert reopened.meta.features["observation.images.left"]["shape"] == ULTRAWIDE_CAMERA_SHAPE
+    sample = reopened[0]
+    for name, expected_shape in config.camera_shapes.items():
+        actual_shape = tuple(sample[f"observation.images.{name}"].shape)
+        channel_first_shape = (expected_shape[2], expected_shape[0], expected_shape[1])
+        assert actual_shape in (expected_shape, channel_first_shape)

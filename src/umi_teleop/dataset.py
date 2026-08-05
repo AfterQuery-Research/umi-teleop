@@ -24,7 +24,12 @@ CAMERA_SHAPE = (CAMERA_HEIGHT, CAMERA_WIDTH, 3)
 TOP_CAMERA_CAPTURE_WIDTH = 640
 TOP_CAMERA_CAPTURE_HEIGHT = 480
 TOP_CAMERA_CROP_HEIGHT = 360
+ULTRAWIDE_CAMERA_HEIGHT = 600
+ULTRAWIDE_CAMERA_WIDTH = 800
+ULTRAWIDE_CAMERA_SHAPE = (ULTRAWIDE_CAMERA_HEIGHT, ULTRAWIDE_CAMERA_WIDTH, 3)
+ULTRAWIDE_REQUESTED_FPS = 60
 DATASET_FPS = 30
+SideCameraKind = Literal["realsense", "ultrawide"]
 YAM_SCALAR_NAMES = (
     *(f"left_joint_{index}.pos" for index in range(6)),
     "left_gripper.pos",
@@ -43,6 +48,9 @@ class DatasetConfig:
     top_camera_serial: str | None = None
     left_camera_serial: str | None = None
     right_camera_serial: str | None = None
+    side_camera_kind: SideCameraKind = "realsense"
+    left_camera_path: Path | None = None
+    right_camera_path: Path | None = None
     resume: bool = False
     push_to_hub: bool = False
     private: bool = True
@@ -74,6 +82,17 @@ class DatasetConfig:
         }
         return {name: value.strip() for name, value in values.items() if value is not None}
 
+    @property
+    def camera_paths(self) -> dict[str, Path]:
+        values = {"left": self.left_camera_path, "right": self.right_camera_path}
+        return {
+            name: Path(value).expanduser() for name, value in values.items() if value is not None
+        }
+
+    @property
+    def camera_shapes(self) -> dict[str, tuple[int, int, int]]:
+        return dataset_camera_shapes(self.side_camera_kind)
+
     def validate(self, control_hz: float) -> None:
         if not self.enabled:
             return
@@ -88,14 +107,33 @@ class DatasetConfig:
             raise DatasetRecordingError(
                 f"dataset recording requires a {DATASET_FPS} Hz YAM control loop"
             )
-        serials = self.camera_serials
-        missing = [name for name in CAMERA_NAMES if name not in serials or not serials[name]]
-        if missing:
+        if self.side_camera_kind not in ("realsense", "ultrawide"):
             raise DatasetRecordingError(
-                "dataset recording requires camera serials for " + ", ".join(missing)
+                "dataset side camera kind must be realsense or ultrawide, "
+                f"got {self.side_camera_kind!r}"
             )
-        if len(set(serials.values())) != len(CAMERA_NAMES):
-            raise DatasetRecordingError("top, left, and right camera serials must be distinct")
+        serials = self.camera_serials
+        if not serials.get("top"):
+            raise DatasetRecordingError("dataset recording requires a camera serial for top")
+        if self.side_camera_kind == "realsense":
+            missing = [name for name in ("left", "right") if not serials.get(name)]
+            if missing:
+                raise DatasetRecordingError(
+                    "dataset recording requires camera serials for " + ", ".join(missing)
+                )
+            if len({serials[name] for name in CAMERA_NAMES}) != len(CAMERA_NAMES):
+                raise DatasetRecordingError("top, left, and right camera serials must be distinct")
+        else:
+            paths = self.camera_paths
+            missing = [name for name in ("left", "right") if name not in paths]
+            if missing:
+                raise DatasetRecordingError(
+                    "ultrawide recording requires camera paths for " + ", ".join(missing)
+                )
+            if paths["left"] == paths["right"]:
+                raise DatasetRecordingError(
+                    "left and right ultrawide camera paths must be distinct"
+                )
         if self.resume:
             if self.root is None:
                 raise DatasetRecordingError("dataset resume requires an explicit local root")
@@ -202,7 +240,21 @@ DatasetFactory = Callable[[DatasetConfig, dict[str, dict[str, Any]]], Dataset]
 CameraFactory = Callable[[DatasetConfig], dict[str, Camera]]
 
 
-def dataset_features() -> dict[str, dict[str, Any]]:
+def dataset_camera_shapes(
+    side_camera_kind: SideCameraKind = "realsense",
+) -> dict[str, tuple[int, int, int]]:
+    if side_camera_kind == "realsense":
+        side_shape = CAMERA_SHAPE
+    elif side_camera_kind == "ultrawide":
+        side_shape = ULTRAWIDE_CAMERA_SHAPE
+    else:
+        raise ValueError(f"unsupported side camera kind {side_camera_kind!r}")
+    return {"top": CAMERA_SHAPE, "left": side_shape, "right": side_shape}
+
+
+def dataset_features(
+    side_camera_kind: SideCameraKind = "realsense",
+) -> dict[str, dict[str, Any]]:
     features: dict[str, dict[str, Any]] = {
         "observation.state": {
             "dtype": "float32",
@@ -215,10 +267,10 @@ def dataset_features() -> dict[str, dict[str, Any]]:
             "names": list(YAM_SCALAR_NAMES),
         },
     }
-    for name in CAMERA_NAMES:
+    for name, shape in dataset_camera_shapes(side_camera_kind).items():
         features[f"observation.images.{name}"] = {
             "dtype": "video",
-            "shape": CAMERA_SHAPE,
+            "shape": shape,
             "names": ["height", "width", "channels"],
             "info": {"is_depth_map": False},
         }
@@ -251,6 +303,7 @@ def build_frame(
     commanded_joints: Mapping[str, np.ndarray],
     commanded_grippers: Mapping[str, float],
     task: str,
+    camera_shapes: Mapping[str, tuple[int, int, int]] | None = None,
 ) -> dict[str, Any]:
     if set(images) != set(CAMERA_NAMES):
         raise DatasetFrameError("camera frames must contain top, left, and right")
@@ -259,11 +312,13 @@ def build_frame(
         "action": yam_vector(commanded_joints, commanded_grippers, label="commanded action"),
         "task": task,
     }
+    expected_shapes = camera_shapes or dataset_camera_shapes()
     for name in CAMERA_NAMES:
         image = np.asarray(images[name])
-        if image.shape != CAMERA_SHAPE:
+        expected_shape = expected_shapes[name]
+        if image.shape != expected_shape:
             raise DatasetFrameError(
-                f"{name} camera frame shape {image.shape} does not match {CAMERA_SHAPE}"
+                f"{name} camera frame shape {image.shape} does not match {expected_shape}"
             )
         if image.dtype != np.uint8:
             raise DatasetFrameError(f"{name} camera frame must be RGB uint8")
@@ -271,8 +326,13 @@ def build_frame(
     return frame
 
 
-def _camera_image_view(name: str, image: np.ndarray) -> np.ndarray:
-    """Validate and normalize a camera image to the stored 16:9 resolution."""
+def _camera_image_view(
+    name: str,
+    image: np.ndarray,
+    camera_shapes: Mapping[str, tuple[int, int, int]] | None = None,
+) -> np.ndarray:
+    """Validate and normalize a camera image to its stored dataset resolution."""
+    expected_shape = (camera_shapes or dataset_camera_shapes())[name]
     image = np.asarray(image)
     if name == "top" and image.shape == (
         TOP_CAMERA_CAPTURE_HEIGHT,
@@ -292,18 +352,26 @@ def _camera_image_view(name: str, image: np.ndarray) -> np.ndarray:
             (CAMERA_WIDTH, CAMERA_HEIGHT),
             interpolation=cv2.INTER_AREA,
         )
-    if image.shape != CAMERA_SHAPE:
+    if image.shape != expected_shape:
         raise DatasetFrameError(
-            f"{name} camera frame shape {image.shape} cannot be converted to {CAMERA_SHAPE}"
+            f"{name} camera frame shape {image.shape} cannot be converted to {expected_shape}"
         )
     if image.dtype != np.uint8:
         raise DatasetFrameError(f"{name} camera frame must be RGB uint8")
     return image
 
 
-def normalize_camera_image(name: str, image: np.ndarray) -> np.ndarray:
-    """Return one RGB camera image in the fixed LeRobot dataset shape."""
-    return np.array(_camera_image_view(name, image), copy=True, order="C")
+def normalize_camera_image(
+    name: str,
+    image: np.ndarray,
+    side_camera_kind: SideCameraKind = "realsense",
+) -> np.ndarray:
+    """Return one RGB camera image in the selected LeRobot dataset shape."""
+    return np.array(
+        _camera_image_view(name, image, dataset_camera_shapes(side_camera_kind)),
+        copy=True,
+        order="C",
+    )
 
 
 def _normalized_features(features: Mapping[str, Mapping[str, Any]]) -> dict[str, tuple[Any, ...]]:
@@ -398,20 +466,32 @@ def _default_upload_validator(config: DatasetConfig, dataset: Dataset) -> None:
         video_backend="pyav",
         return_uint8=True,
     )
-    validate_finalized_dataset(reopened)
+    expected_features = dataset_features(config.side_camera_kind)
+    validate_finalized_dataset(reopened, expected_features=expected_features)
     for frame_index in sorted({0, reopened.meta.total_frames - 1}):
         sample = reopened[frame_index]
         for name in CAMERA_NAMES:
             image = sample[f"observation.images.{name}"]
-            if tuple(image.shape) not in (CAMERA_SHAPE, (3, CAMERA_HEIGHT, CAMERA_WIDTH)):
+            expected_shape = config.camera_shapes[name]
+            channel_first_shape = (expected_shape[2], expected_shape[0], expected_shape[1])
+            if tuple(image.shape) not in (expected_shape, channel_first_shape):
                 raise DatasetRecordingError(
                     f"decoded {name} frame has unexpected shape {tuple(image.shape)}"
                 )
 
 
-def validate_finalized_dataset(dataset: Dataset) -> None:
+def validate_finalized_dataset(
+    dataset: Dataset,
+    *,
+    expected_features: Mapping[str, Mapping[str, Any]] | None = None,
+) -> None:
     """Validate the local schema, counters, and encoded media before Hub upload."""
-    if not _features_match(dataset.meta.features, dataset_features()):
+    allowed_features = (
+        (expected_features,)
+        if expected_features is not None
+        else (dataset_features("realsense"), dataset_features("ultrawide"))
+    )
+    if not any(_features_match(dataset.meta.features, expected) for expected in allowed_features):
         raise DatasetRecordingError(
             "finalized dataset schema does not match the MolmoAct2 Bimanual YAM contract"
         )
@@ -534,6 +614,56 @@ def _check_free_disk(config: DatasetConfig, dataset: Dataset) -> None:
         )
 
 
+@dataclass(frozen=True)
+class _CameraSpec:
+    name: str
+    backend: Literal["realsense", "opencv"]
+    source: str | Path
+    width: int
+    height: int
+    requested_fps: int
+    fourcc: str | None = None
+
+
+def _camera_specs(config: DatasetConfig) -> tuple[_CameraSpec, ...]:
+    specs = [
+        _CameraSpec(
+            "top",
+            "realsense",
+            config.camera_serials["top"],
+            TOP_CAMERA_CAPTURE_WIDTH,
+            TOP_CAMERA_CAPTURE_HEIGHT,
+            DATASET_FPS,
+        )
+    ]
+    if config.side_camera_kind == "realsense":
+        specs.extend(
+            _CameraSpec(
+                name,
+                "realsense",
+                config.camera_serials[name],
+                CAMERA_WIDTH,
+                CAMERA_HEIGHT,
+                DATASET_FPS,
+            )
+            for name in ("left", "right")
+        )
+    else:
+        specs.extend(
+            _CameraSpec(
+                name,
+                "opencv",
+                config.camera_paths[name],
+                ULTRAWIDE_CAMERA_WIDTH,
+                ULTRAWIDE_CAMERA_HEIGHT,
+                ULTRAWIDE_REQUESTED_FPS,
+                "MJPG",
+            )
+            for name in ("left", "right")
+        )
+    return tuple(specs)
+
+
 def _default_camera_factory(config: DatasetConfig) -> dict[str, Camera]:
     try:
         from lerobot.cameras.realsense import RealSenseCamera, RealSenseCameraConfig
@@ -541,25 +671,42 @@ def _default_camera_factory(config: DatasetConfig) -> dict[str, Camera]:
         raise DatasetRecordingError(
             "RealSense recording dependencies are unavailable; install the dataset extra"
         ) from exc
+    if config.side_camera_kind == "ultrawide":
+        try:
+            from lerobot.cameras.opencv import OpenCVCamera, OpenCVCameraConfig
+        except ImportError as exc:
+            raise DatasetRecordingError(
+                "OpenCV recording dependencies are unavailable; install the dataset extra"
+            ) from exc
 
     cameras: dict[str, Camera] = {}
     try:
-        for name in CAMERA_NAMES:
-            capture_width = TOP_CAMERA_CAPTURE_WIDTH if name == "top" else CAMERA_WIDTH
-            capture_height = TOP_CAMERA_CAPTURE_HEIGHT if name == "top" else CAMERA_HEIGHT
-            camera = RealSenseCamera(
-                RealSenseCameraConfig(
-                    serial_number_or_name=config.camera_serials[name],
-                    fps=DATASET_FPS,
-                    width=capture_width,
-                    height=capture_height,
-                    use_rgb=True,
-                    use_depth=False,
-                    warmup_s=2,
+        for spec in _camera_specs(config):
+            if spec.backend == "realsense":
+                camera = RealSenseCamera(
+                    RealSenseCameraConfig(
+                        serial_number_or_name=str(spec.source),
+                        fps=spec.requested_fps,
+                        width=spec.width,
+                        height=spec.height,
+                        use_rgb=True,
+                        use_depth=False,
+                        warmup_s=2,
+                    )
                 )
-            )
+            else:
+                camera = OpenCVCamera(
+                    OpenCVCameraConfig(
+                        index_or_path=Path(spec.source),
+                        fps=spec.requested_fps,
+                        width=spec.width,
+                        height=spec.height,
+                        warmup_s=2,
+                        fourcc=spec.fourcc,
+                    )
+                )
             camera.connect()
-            cameras[name] = camera
+            cameras[spec.name] = camera
     except Exception as exc:
         for camera in reversed(tuple(cameras.values())):
             try:
@@ -568,7 +715,9 @@ def _default_camera_factory(config: DatasetConfig) -> dict[str, Camera]:
                 pass
         if isinstance(exc, DatasetRecordingError):
             raise
-        raise DatasetRecordingError(f"failed to initialize RealSense cameras: {exc}") from exc
+        raise DatasetRecordingError(
+            f"failed to initialize {config.side_camera_kind} dataset cameras: {exc}"
+        ) from exc
     return cameras
 
 
@@ -734,6 +883,7 @@ class DatasetRecorder:
                 name: _camera_image_view(
                     name,
                     camera.read_latest(max_age_ms=self.config.camera_max_age_ms),
+                    self.config.camera_shapes,
                 )
                 for name, camera in self.cameras.items()
             }
@@ -746,6 +896,7 @@ class DatasetRecorder:
             commanded_joints=commanded_joints,
             commanded_grippers=commanded_grippers,
             task=(self.config.task or "").strip(),
+            camera_shapes=self.config.camera_shapes,
         )
 
     def commit_frame(self, frame: dict[str, Any]) -> None:
@@ -917,7 +1068,7 @@ def create_dataset_recorder(
                 pass
         raise DatasetRecordingError("camera factory must return top, left, and right")
     try:
-        dataset = dataset_factory(config, dataset_features())
+        dataset = dataset_factory(config, dataset_features(config.side_camera_kind))
     except Exception as exc:
         for camera in reversed(tuple(cameras.values())):
             try:

@@ -15,15 +15,19 @@ from umi_teleop.dataset import (
     TOP_CAMERA_CAPTURE_HEIGHT,
     TOP_CAMERA_CAPTURE_WIDTH,
     TOP_CAMERA_CROP_HEIGHT,
+    ULTRAWIDE_CAMERA_SHAPE,
+    ULTRAWIDE_REQUESTED_FPS,
     YAM_SCALAR_NAMES,
     ControlLagMonitor,
     DatasetConfig,
     DatasetFrameError,
     DatasetRecordingError,
+    _camera_specs,
     _effective_encoder_preset,
     build_frame,
     commit_dataset_step,
     create_dataset_recorder,
+    dataset_camera_shapes,
     dataset_features,
     normalize_camera_image,
     prepare_dataset_step,
@@ -113,6 +117,18 @@ def recording_config(tmp_path: Path, **overrides: Any) -> DatasetConfig:
     return DatasetConfig(**values)
 
 
+def ultrawide_recording_config(tmp_path: Path, **overrides: Any) -> DatasetConfig:
+    values = {
+        "side_camera_kind": "ultrawide",
+        "left_camera_serial": None,
+        "right_camera_serial": None,
+        "left_camera_path": Path("/dev/v4l/by-path/left-wide"),
+        "right_camera_path": Path("/dev/v4l/by-path/right-wide"),
+    }
+    values.update(overrides)
+    return recording_config(tmp_path, **values)
+
+
 def robot_values(offset: float = 0.0) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     return (
         {
@@ -178,6 +194,19 @@ def test_dataset_features_match_molmoact2_bimanual_yam_contract() -> None:
         assert feature["shape"] == (270, 480, 3)
 
 
+def test_ultrawide_dataset_features_keep_top_shape_and_expand_side_views() -> None:
+    features = dataset_features("ultrawide")
+
+    assert features["observation.images.top"]["shape"] == CAMERA_SHAPE
+    assert features["observation.images.left"]["shape"] == ULTRAWIDE_CAMERA_SHAPE
+    assert features["observation.images.right"]["shape"] == ULTRAWIDE_CAMERA_SHAPE
+    assert dataset_camera_shapes("ultrawide") == {
+        "top": CAMERA_SHAPE,
+        "left": ULTRAWIDE_CAMERA_SHAPE,
+        "right": ULTRAWIDE_CAMERA_SHAPE,
+    }
+
+
 def test_yam_vector_orders_left_gripper_then_right_gripper() -> None:
     joints, grippers = robot_values()
 
@@ -226,6 +255,19 @@ def test_top_camera_native_frame_is_center_cropped_and_downsampled() -> None:
     expected = cv2.resize(cropped, (480, 270), interpolation=cv2.INTER_AREA)
     assert normalized.shape == CAMERA_SHAPE
     np.testing.assert_array_equal(normalized, expected)
+    assert normalized.flags.c_contiguous
+    assert not np.shares_memory(normalized, image)
+
+
+def test_ultrawide_camera_frame_is_preserved_without_aspect_ratio_conversion() -> None:
+    image = np.arange(np.prod(ULTRAWIDE_CAMERA_SHAPE), dtype=np.uint8).reshape(
+        ULTRAWIDE_CAMERA_SHAPE
+    )
+
+    normalized = normalize_camera_image("left", image, "ultrawide")
+
+    assert normalized.shape == ULTRAWIDE_CAMERA_SHAPE
+    np.testing.assert_array_equal(normalized, image)
     assert normalized.flags.c_contiguous
     assert not np.shares_memory(normalized, image)
 
@@ -298,6 +340,55 @@ def test_recording_config_rejects_invalid_contract(tmp_path, overrides, message)
         recording_config(tmp_path, **overrides).validate(30.0)
 
 
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"top_camera_serial": None}, "camera serial for top"),
+        ({"left_camera_path": None}, "camera paths for left"),
+        ({"right_camera_path": None}, "camera paths for right"),
+        (
+            {
+                "left_camera_path": Path("/dev/video-wide"),
+                "right_camera_path": Path("/dev/video-wide"),
+            },
+            "paths must be distinct",
+        ),
+    ],
+)
+def test_ultrawide_recording_config_requires_top_serial_and_distinct_side_paths(
+    tmp_path: Path, overrides: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(DatasetRecordingError, match=message):
+        ultrawide_recording_config(tmp_path, **overrides).validate(30.0)
+
+
+def test_camera_specs_preserve_realsense_defaults_and_add_ultrawide_option(tmp_path: Path) -> None:
+    realsense_specs = _camera_specs(recording_config(tmp_path))
+    assert [
+        (spec.name, spec.backend, spec.width, spec.height, spec.requested_fps)
+        for spec in realsense_specs
+    ] == [
+        ("top", "realsense", 640, 480, 30),
+        ("left", "realsense", 480, 270, 30),
+        ("right", "realsense", 480, 270, 30),
+    ]
+
+    ultrawide_specs = _camera_specs(ultrawide_recording_config(tmp_path))
+    assert ultrawide_specs[0] == realsense_specs[0]
+    for spec, name, path in zip(
+        ultrawide_specs[1:],
+        ("left", "right"),
+        (Path("/dev/v4l/by-path/left-wide"), Path("/dev/v4l/by-path/right-wide")),
+        strict=True,
+    ):
+        assert spec.name == name
+        assert spec.backend == "opencv"
+        assert spec.source == path
+        assert (spec.width, spec.height) == (800, 600)
+        assert spec.requested_fps == ULTRAWIDE_REQUESTED_FPS
+        assert spec.fourcc == "MJPG"
+
+
 def test_new_recording_rejects_nonempty_root(tmp_path: Path) -> None:
     root = tmp_path / "dataset"
     root.mkdir()
@@ -364,6 +455,28 @@ def test_async_recorder_saves_only_intentional_long_enough_episode(tmp_path) -> 
     assert dataset.clear_count == 2
     assert dataset.finalize_count == 1
     assert all(camera.disconnected == 1 for camera in cameras.values())
+
+
+def test_ultrawide_recorder_writes_mixed_camera_shapes(tmp_path: Path) -> None:
+    def use_ultrawide_side_frames(cameras: dict[str, FakeCamera]) -> None:
+        cameras["left"].image = np.full(ULTRAWIDE_CAMERA_SHAPE, 1, dtype=np.uint8)
+        cameras["right"].image = np.full(ULTRAWIDE_CAMERA_SHAPE, 2, dtype=np.uint8)
+
+    recorder, dataset, _cameras = recorder_fixture(
+        tmp_path,
+        config=ultrawide_recording_config(tmp_path),
+        camera_mutator=use_ultrawide_side_frames,
+    )
+    recorder.start_episode()
+    add_frame(recorder)
+    add_frame(recorder, measured_offset=0.1)
+    recorder.finish_episode(commit=True, reason="enable toggled off")
+    recorder.close()
+
+    frame = dataset.episodes[0][0]
+    assert frame["observation.images.top"].shape == CAMERA_SHAPE
+    assert frame["observation.images.left"].shape == ULTRAWIDE_CAMERA_SHAPE
+    assert frame["observation.images.right"].shape == ULTRAWIDE_CAMERA_SHAPE
 
 
 def test_streaming_encoder_drop_discards_episode_instead_of_saving(tmp_path) -> None:
@@ -450,6 +563,22 @@ def test_finalized_dataset_rejects_mismatched_encoded_video_count(
         match=r"observation.images.left has 9 encoded frames; expected 10",
     ):
         validate_finalized_dataset(dataset)
+
+
+def test_finalized_dataset_accepts_ultrawide_schema() -> None:
+    meta = type(
+        "Meta",
+        (),
+        {
+            "features": dataset_features("ultrawide"),
+            "fps": 30,
+            "total_episodes": 1,
+            "total_frames": 1,
+        },
+    )()
+    dataset = type("FinalizedDataset", (), {"meta": meta})()
+
+    validate_finalized_dataset(dataset)
 
 
 def test_finalized_dataset_accepts_shared_video_files_across_episodes(
