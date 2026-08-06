@@ -256,11 +256,13 @@ export LEFT_CAMERA=LEFT_REALSENSE_SERIAL
 export RIGHT_CAMERA=RIGHT_REALSENSE_SERIAL
 ```
 
-The top D435 is captured at RGB `640x480` at 30 Hz and center-cropped to `640x360`. The left and
-right D405 cameras are captured natively at RGB `640x360` at 30 Hz. Recording validates and opens
-all three before it opens CAN or constructs either robot, and requires at least 5 GiB of free
-dataset storage before each episode. Authenticate once before requesting upload; the token stays
-in Hugging Face's normal credential store and is never passed to `umi-yam`:
+The top D435 is captured at RGB `640x480` at 30 Hz, center-cropped to `640x360`, and downsampled to
+`480x270`. The left and right D405 cameras are captured natively at RGB `480x270` at 30 Hz. This
+keeps the same 16:9 views while reducing encoder load; the MolmoAct2 checkpoint resizes each view to
+its `378x378` image input. Recording validates and opens all three before it opens CAN or constructs
+either robot, and requires at least 5 GiB of free dataset storage before each episode. Authenticate
+once before requesting upload; the token stays in Hugging Face's normal credential store and is
+never passed to `umi-yam`:
 
 ```bash
 cd /home/yam/Documents/Repos/umi-teleop
@@ -304,11 +306,15 @@ three camera encoders can keep up with capture without starving arm control. Add
 `--dataset.video-codec libsvtav1` only when AV1 file-level parity is required and the slower encoder
 has been tested on this hardware. Final validation decodes the
 first and last saved frames with PyAV, avoiding TorchCodec's optional GPU-linked runtime on ARM64.
+It also requires every camera video to contain exactly the number of frames declared in its episode
+metadata. A streaming encoder drop discards the active episode instead of saving misaligned views.
+Use a new dataset root/repository for these `480x270` recordings; they cannot be appended to an
+existing `640x360` LeRobot schema.
 
-The resulting LeRobot v3 schema matches `MolmoAct2-BimanualYAM-Dataset`: `top`, `left`, and `right`
-RGB images plus 14-value `observation.state` and `action` vectors ordered as left joints 0-5, left
-gripper, right joints 0-5, right gripper. State is measured immediately before control. Action is
-the final bounded target successfully sent to both arms.
+The resulting LeRobot v3 schema keeps the `MolmoAct2-BimanualYAM-Dataset` camera, state, and action
+semantics: `top`, `left`, and `right` RGB images plus 14-value `observation.state` and `action`
+vectors ordered as left joints 0-5, left gripper, right joints 0-5, right gripper. State is measured
+immediately before control. Action is the final bounded target successfully sent to both arms.
 
 If upload fails after the robots have closed, retry it without opening cameras or CAN:
 

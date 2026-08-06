@@ -10,9 +10,9 @@ finalized dataset to the Hugging Face Hub.
 
 - Record at exactly 30 Hz on the YAM controller computer.
 - Store three ordered RGB views named `top`, `left`, and `right`.
-- Store every image as RGB `uint8` with shape `(360, 640, 3)`.
-- Capture the top D435 at `640x480` and center-crop it to `640x360`; capture the
-  two side D405 cameras natively at `640x360`.
+- Store every image as RGB `uint8` with shape `(270, 480, 3)`.
+- Capture the top D435 at `640x480`, center-crop it to `640x360`, and downsample it
+  to `480x270`; capture the two side D405 cameras natively at `480x270`.
 - Store `observation.state` as 14 `float32` values in this order:
   left joints 0-5, left gripper, right joints 0-5, right gripper.
 - Store `action` in the same order. The action is the final joint/gripper target
@@ -50,6 +50,8 @@ finalized dataset to the Hugging Face Hub.
   either robot is constructed.
 - Camera capture and dataset writes use a bounded asynchronous queue so video or
   Parquet work does not run in the 30 Hz motor-control thread.
+- Any frame drop reported by a streaming encoder invalidates and discards the
+  episode rather than committing camera streams of different lengths.
 - Queue overflow and background writer failures fail closed.
 - Require a configurable free-disk reserve before initialization and before each
   episode.
@@ -63,6 +65,8 @@ finalized dataset to the Hugging Face Hub.
 - A bimanual frame is queued only after both arm commands return successfully.
 - Previously committed episodes remain local if capture, finalization, login, or
   upload fails.
+- Final validation checks contiguous episode row ranges and requires every encoded
+  camera video to have exactly the declared episode length before Hub upload.
 - Finalization is mandatory and idempotent. Upload begins only after both robots
   have been closed and the local dataset has finalized. Writer shutdown is
   bounded; a hung encoder reports an error and leaves the local files untouched
