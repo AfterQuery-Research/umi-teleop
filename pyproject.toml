@@ -30,6 +30,11 @@ dataset = [
 [project.scripts]
 umi-vive-sender = "umi_teleop.windows:main"
 umi-source = "umi_teleop.source:main"
+umi-lidar-lambda = "umi_teleop.lambda_lidar:main"
+umi-lidar-ssh-relay = "umi_teleop.lidar_ssh_relay:main"
+umi-lidar-arm-source = "umi_teleop.lidar_arm_source:main"
+umi-lidar-merge-source = "umi_teleop.lidar_merge_source:main"
+umi-lidar-teleop-mode = "umi_teleop.lidar_teleop_mode:main"
 umi-setup-can = "umi_teleop.setup_can:main"
 umi-yam = "umi_teleop.yam:main"
 umi-dataset-upload = "umi_teleop.dataset_cli:main"

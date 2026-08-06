@@ -221,6 +221,151 @@ leader's position/orientation change from Z. Translation is scaled `1.5x`; the i
 projects the raw UMI delta onto the boundary and stays armed. This permits up to `0.75 m` of scaled
 robot translation while preventing a larger raw motion from producing an unbounded target.
 
+## Experimental LiDAR/SLAM Teleop
+
+This path reuses the same YAM-side safety, zeroing, limits, gripper mapping, and UDP packet schema
+as Vive teleop, but replaces SteamVR poses with live GLIM odometry from the RoboSense LiDAR UMIs.
+It is intentionally split into small processes so the existing `umi-recorder` autostart behavior on
+the UMI Pis does not change.
+
+```mermaid
+flowchart LR
+    LP["LiDAR UMI Pis<br/>10.103.0.80 / 10.103.0.84"]
+    LB["Lambda box<br/>ubuntu@192.222.52.98<br/>live GLIM containers"]
+    MS["umi-lidar-merge-source<br/>pose :9142 + arm :9143"]
+    YA["umi-yam<br/>existing YAM safety/IK"]
+    LP -->|"raw LiDAR UDP via pi_tap"| LB
+    LB -->|"LiDAR body poses JSON/UDP :9142"| MS
+    LP -->|"gripper widths + buttons JSON/UDP :9143"| MS
+    MS -->|"existing teleop JSON/UDP :9140"| YA
+```
+
+Known current LiDAR hardware from `umi-flow`:
+
+| Role | Address / notes |
+|---|---|
+| Lambda processing box | `ubuntu@192.222.52.98` |
+| Right LiDAR UMI (`umi1`) | `umi1@10.103.0.80`, `umi-recorder`, `umi-ptp@eth0`, and upload tunnel autostart |
+| Left LiDAR UMI (`umi2`) | `umi2@10.103.0.84`, `umi-recorder`, `umi-ptp@eth0`, and upload tunnel autostart |
+| LiDAR network | each Pi's `eth0` uses host `192.168.1.102`, LiDAR `192.168.1.200` |
+
+Current side assignment: `umi1` is the right-hand leader and `umi2` is the left-hand leader. The
+scripts in `scripts/` bake this in, while the lower-level CLIs still allow explicit overrides.
+
+Observed live Pi configs at the time this was written:
+
+| Pi | Side | Config name | Camera calibration | ArUco tags |
+|---|---|---|---|---|
+| `10.103.0.80` | right | `umi1` | `config/calib/umi1_calib.npz` | `2 3` |
+| `10.103.0.84` | left | `umi2` | `config/calib/umi2_calib.npz` | `0 1` |
+
+### What must be running first
+
+1. The Lambda box must have one live GLIM container per UMI, each named distinctly.
+   `scripts/run-lambda-live-glim-containers.sh` builds the live image and starts containers named
+   `glim-10-103-0-80` and `glim-10-103-0-84`.
+2. The LiDARs must be powered on before starting the GLIM feed. If the LiDARs are off, the merge
+   source will stay disabled because pose ages never become fresh.
+3. The YAM side should be run with the LiDAR TCP lever instead of the Vive tracker lever:
+
+   ```bash
+   scripts/run-lidar-yam.sh
+   ```
+
+   The script binds `umi-yam` to `127.0.0.1:9140` by default so only the local LiDAR merger can feed
+   the robot controller. This prevents stale LAN senders, for example an old Vive UMI Pi process,
+   from interleaving disabled packets with the merged LiDAR stream. Override with
+   `YAM_TELEOP_BIND=0.0.0.0` only if you intentionally run the merger on another machine. The script
+   defaults to the observed CAN mapping: left `209D378045465008`, right `206237A845465006`. Override
+   with `LEFT_CAN=... RIGHT_CAN=...` if the hardware mapping changes.
+
+### Bring-up shape
+
+Pick a machine for the merger. The YAM Pi is preferred because the merger can send to
+`127.0.0.1:9140`, keeping the robot-control port closed to stale LAN senders. An operator laptop
+also works if `umi-yam` is intentionally started with `YAM_TELEOP_BIND=0.0.0.0` and the merger sends
+to the YAM Pi's LAN IP.
+
+1. Start the merger:
+
+   ```bash
+   scripts/run-lidar-merge-yam.sh
+   ```
+
+2. On Lambda, build and start the live GLIM containers and Pi UDP feeds:
+
+   ```bash
+   cd /home/ubuntu/umi-teleop
+   scripts/run-lambda-live-glim-containers.sh
+   ```
+
+   To prepare the Docker image without touching live feeds:
+
+   ```bash
+   BUILD_ONLY=1 scripts/run-lambda-live-glim-containers.sh
+   ```
+
+3. Stream live GLIM poses to the merger.
+
+   In the observed AfterQuery lab network, Lambda can be reached by SSH from the operator laptop,
+   but cannot send UDP directly to the private `10.103.*` YAM LAN. In that topology, run this relay
+   on the operator laptop/Mac:
+
+   ```bash
+   cd /path/to/umi-teleop
+   scripts/run-lidar-lambda-pose-ssh-relay.sh ubuntu@192.222.52.98 10.103.3.85 9142
+   ```
+
+   The relay SSHes into Lambda, starts the live GLIM pose sender in stdout-packet mode, and forwards
+   those datagrams from the laptop to the YAM Pi's merger UDP port. If Lambda and the merger are on a
+   network where UDP routing works directly, you can instead run this on Lambda:
+
+   ```bash
+   cd /home/ubuntu/umi-teleop
+   scripts/run-lidar-lambda-pose-sender.sh MERGER_HOST
+   ```
+
+   `umi-lidar-lambda` sends the LiDAR body pose in the UMI-handle frame. It does **not** pre-apply
+   the TCP lever unless `--include-tcp-offset` is set for debugging.
+
+4. On each UMI Pi, enter teleop mode for this session and send gripper/button telemetry. The wrapper
+   refuses to stop `umi-recorder.service` unless explicitly confirmed, and it does not change whether
+   the recorder autostarts on the next boot.
+
+   On the right/`umi1` Pi:
+
+   ```bash
+   cd /home/aq/umi-teleop
+   scripts/run-lidar-teleop-umi1-right.sh MERGER_HOST
+   ```
+
+   On the left/`umi2` Pi:
+
+   ```bash
+   cd /home/aq/umi-teleop
+   scripts/run-lidar-teleop-umi2-left.sh MERGER_HOST
+   ```
+
+5. Once the merger logs show fresh left/right `pose_age`, fresh left/right `width_age`, and
+   nonempty widths, start `umi-yam`:
+
+   ```bash
+   cd /home/yam/Documents/Repos/umi-teleop
+   scripts/run-lidar-yam.sh
+   ```
+
+   Then use the same controls as Vive teleop: Z tap to zero, wait for cooldown, E tap to enable.
+
+### Returning the UMI Pis to recorder mode
+
+Stopping `umi-lidar-teleop-mode` leaves boot/autostart policy unchanged. If you want the recorder
+back immediately without rebooting, either pass `--restart-recorder-on-exit` when launching teleop
+mode, or run:
+
+```bash
+sudo systemctl start umi-recorder.service
+```
+
 ## Controls
 
 | Control | Action |
@@ -234,6 +379,23 @@ robot translation while preventing a larger raw motion from producing an unbound
 A new source process always creates a new session ID, so the YAM controller requires a new Z before
 it can enable. Z can be used again during a session; it disarms first and captures the current UMI
 and robot poses as the next references.
+
+## Current LiDAR teleop envelope
+
+The default `scripts/run-lidar-yam.sh` LiDAR/YAM controller parameters are:
+
+| Parameter | Value |
+|---|---:|
+| Position scale | `1.5x` |
+| Input translation safety limit | `0.50 m` before scaling |
+| Effective commanded translation cap | up to `0.75 m`, if IK and joint limits allow |
+| Rotation safety limit | `90 deg` |
+| Joint speed cap | `0.45 rad/s` |
+| Gripper speed cap | `1.50` normalized open/close units per second |
+
+The controller clamps larger input to this envelope and stays armed. Unreachable Cartesian targets
+use the same degraded/holding IK policy as Vive teleop. For initial bring-up, keep each UMI motion
+small (about `2-3 cm` translation and under `10-15 deg` wrist rotation), then expand gradually.
 
 ## Record A LeRobot Dataset
 
