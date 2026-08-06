@@ -30,21 +30,26 @@ finalized dataset to the Hugging Face Hub.
 
 ## Episode Contract
 
-- The default automatic move to the all-zero base posture is not recorded.
+- Automatic startup motion is disabled by default. The arms hold their physical starting pose, and
+  a successful `E` enable starts the first episode.
 - The idle wait for ZERO and E is not recorded or padded with duplicate frames.
-- A successful disabled-to-enabled `E` transition starts every episode.
 - An intentional `E` disable transition commits the active episode.
 - After that commit is queued, both arms automatically return to the all-zero base posture without
   recording the return. The old Cartesian reference is invalidated, so a new Z is required before
   the next E enable.
 - Repeated Z/E/disable cycles start and commit additional episodes without restarting the source,
   controller, cameras, CAN connections, or dataset writer.
+- Passing `--move-to-ready` explicitly starts the first episode immediately before the first
+  startup-motion command. Every startup observation and bounded joint command is recorded, and the
+  first successful `E` enable continues that same episode.
+- Passing `--move-to-base` explicitly performs an unrecorded startup parking operation.
 - ZERO while armed, CANCEL, source restart, stale telemetry, tracking loss, a configured persistent
   IK-hold timeout, camera failure, or process shutdown discards the active episode. Ordinary
   degraded/holding IK remains armed and records the final bounded or held action actually sent.
 - Episodes shorter than the configured minimum are discarded.
 - A discarded episode must not change the count of saved episodes.
-- A new episode can start only after a new disabled-to-enabled transition.
+- Apart from an explicitly requested automatic startup episode, a new episode can start only after
+  a new disabled-to-enabled transition.
 
 ## Safety And Failure Contract
 

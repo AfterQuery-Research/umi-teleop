@@ -666,7 +666,7 @@ def test_finalized_dataset_accepts_shared_video_files_across_episodes(
     assert sorted(inspected) == sorted(root / path for path in relative_paths.values())
 
 
-def test_enable_starts_episode_after_unrecorded_startup_motion(tmp_path) -> None:
+def test_enable_starts_episode_when_no_startup_episode_is_active(tmp_path) -> None:
     recorder, dataset, _cameras = recorder_fixture(tmp_path)
     measured_joints, measured_grippers = robot_values(0.25)
     commanded_joints, commanded_grippers = robot_values(0.5)
@@ -702,6 +702,43 @@ def test_enable_starts_episode_after_unrecorded_startup_motion(tmp_path) -> None
         recorder,
         prepared,
         was_armed=True,
+        is_armed=True,
+        disarm_reason="enabled",
+    )
+    commit_dataset_step(
+        recorder,
+        None,
+        was_armed=True,
+        is_armed=False,
+        disarm_reason="enable toggled off",
+    )
+    recorder.close()
+
+    assert len(dataset.episodes) == 1
+    assert len(dataset.episodes[0]) == 2
+
+
+def test_enable_continues_episode_that_started_during_ready_motion(tmp_path) -> None:
+    recorder, dataset, _cameras = recorder_fixture(tmp_path)
+    recorder.start_episode()
+    add_frame(recorder, measured_offset=0.0, command_offset=0.25)
+    measured_joints, measured_grippers = robot_values(0.25)
+    commanded_joints, commanded_grippers = robot_values(0.5)
+
+    prepared = prepare_dataset_step(
+        recorder,
+        was_armed=False,
+        is_armed=True,
+        invalid_frame_reason=None,
+        measured_joints=measured_joints,
+        measured_grippers=measured_grippers,
+        commanded_joints=commanded_joints,
+        commanded_grippers=commanded_grippers,
+    )
+    commit_dataset_step(
+        recorder,
+        prepared,
+        was_armed=False,
         is_armed=True,
         disarm_reason="enabled",
     )

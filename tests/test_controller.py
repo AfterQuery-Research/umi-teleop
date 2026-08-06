@@ -33,11 +33,7 @@ from umi_teleop.yam import (
 )
 
 
-def test_default_startup_targets_unrecorded_all_zero_base_pose():
-    config = Config()
-
-    assert config.move_to_base
-    assert not config.move_to_ready
+def test_base_pose_is_all_zero():
     np.testing.assert_allclose(DEFAULT_BASE_JOINTS, np.zeros(6))
 
 
@@ -85,6 +81,13 @@ def machine(**limit_overrides):
         {"left": GripperMap(20, 80), "right": GripperMap(20, 80)},
         TeleopLimits(**limit_overrides),
     )
+
+
+def test_automatic_startup_motion_is_opt_in() -> None:
+    config = Config()
+
+    assert not config.move_to_ready
+    assert not config.move_to_base
 
 
 @pytest.mark.parametrize(

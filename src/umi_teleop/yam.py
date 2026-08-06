@@ -107,7 +107,7 @@ class Config:
     max_gripper_speed: float = 1.50
     joint_limit_margin: float = 0.03
     move_to_ready: bool = False
-    move_to_base: bool = True
+    move_to_base: bool = False
     ready_bend_joints: tuple[float, float] = DEFAULT_READY_BEND_JOINTS
     ready_joint_speed: float = 0.10
     base_joint_speed: float = 0.10
@@ -875,6 +875,12 @@ def run(args: Config) -> None:
             )
         joints, grips = read_pair_state(robots)
         base_pose_verified = False
+        startup_recorder = recorder if args.move_to_ready else None
+        if startup_recorder is not None:
+            initial_poses = {name: fk_models[name].fk(joints[name]) for name in ARM_NAMES}
+            state.step(initial_packet, 0.0, initial_poses)
+            startup_recorder.start_episode()
+            print("DATASET recording includes teleop-ready startup motion", flush=True)
         if args.move_to_base:
             try:
                 joints = move_pair_to_base(
@@ -901,11 +907,19 @@ def run(args: Config) -> None:
                     args.hz,
                     args.joint_limit_margin,
                     args.startup_readback_tolerance,
+                    recorder=startup_recorder,
                 )
                 startup_blocked = None
             except StartupReadbackError as exc:
                 joints = exc.observed
                 startup_blocked = str(exc)
+                if startup_recorder is not None:
+                    startup_recorder.finish_episode(commit=False, reason=startup_blocked)
+            except DatasetFrameError as exc:
+                joints, _ = read_pair_state(robots)
+                startup_blocked = f"dataset episode invalid during startup: {exc}"
+                assert startup_recorder is not None
+                startup_recorder.finish_episode(commit=False, reason=startup_blocked)
         else:
             startup_blocked = None
         command_pair(robots, joints, grips)
