@@ -15,16 +15,18 @@ flowchart LR
     Y["YAM Pi 10.103.3.85<br/>safety + IK + motor control"]
     L["Left YAM<br/>USB serial to current canN"]
     R["Right YAM<br/>USB serial to current canN"]
-    W -->|"raw tracker JSON/UDP :9001"| S
+    W -->|"broadcast tracker JSON/UDP :9001"| S
     S -->|"poses + widths + controls JSON/UDP :9140"| Y
     Y --> L
     Y --> R
 ```
 
-The Windows sender publishes raw SteamVR poses. The UMI Pi converts them to `+X` forward, `+Y`
-left, `+Z` up; measures both grippers from calibrated ArUco tags; reads the E/Z buttons; and sends
-one validated packet at 30 Hz. The YAM Pi owns zeroing, workspace limits, inverse kinematics, joint
-limits, slew limits, CAN access, and motor commands. Images never leave the UMI Pi.
+The Windows sender broadcasts raw SteamVR poses to UDP port `9001`, so the UMI Pi and monitoring
+computers on the same local network can receive the stream simultaneously. The UMI Pi converts
+poses to `+X` forward, `+Y` left, `+Z` up; measures both grippers from calibrated ArUco tags; reads
+the E/Z buttons; and sends one validated packet at 30 Hz. The YAM Pi owns zeroing, workspace limits,
+inverse kinematics, joint limits, slew limits, CAN access, and motor commands. Images never leave
+the UMI Pi.
 
 One root `pyproject.toml` and lockfile keep the protocol and safety code on one version. Install only
 the relevant hardware extra on each device: `windows`, `source`, or `yam`. Every CLI uses Tyro;
@@ -34,7 +36,7 @@ run any command with `--help` to override its typed defaults.
 
 | Role | Address / mapping |
 |---|---|
-| Windows SteamVR host | `aq@10.103.3.44` |
+| Windows SteamVR host | `aq@10.103.3.44`, broadcasts raw poses on UDP `9001` |
 | UMI source Pi | `aq@10.103.3.43`, receives UDP `9001`, sends to `10.103.3.85:9140` |
 | YAM controller Pi | `yam@10.103.3.85`, receives UDP `9140` |
 | Left leader | UMI2, tracker `LHR-BBAF093A`, camera tags `2/3` |
@@ -150,6 +152,11 @@ was replugged.
    cd C:\umi-teleop
    .\.venv\Scripts\umi-vive-sender.exe
    ```
+
+   The default destination is the local broadcast address `255.255.255.255`, allowing any receiver
+   bound to UDP `9001` on the same broadcast network to consume the packets. Use `--target-host`
+   only when a specific unicast destination is required. The UDP stream is unauthenticated and
+   unencrypted, so broadcast it only on a trusted local network.
 
 3. In a dedicated terminal, start the UMI source and inspect its live health:
 
