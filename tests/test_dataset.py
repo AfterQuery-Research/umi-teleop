@@ -452,6 +452,100 @@ def test_finalized_dataset_rejects_mismatched_encoded_video_count(
         validate_finalized_dataset(dataset)
 
 
+def test_finalized_dataset_accepts_shared_video_files_across_episodes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "dataset"
+    root.mkdir()
+    video_keys = [f"observation.images.{name}" for name in CAMERA_NAMES]
+    relative_paths = {
+        key: Path("videos") / key / "chunk-000" / "file-000.mp4" for key in video_keys
+    }
+    for path in relative_paths.values():
+        target = root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.touch()
+
+    class SharedMediaMeta:
+        features = dataset_features()
+        fps = 30
+        total_episodes = 2
+        total_frames = 15
+        episodes = [
+            {"length": 10, "dataset_from_index": 0, "dataset_to_index": 10},
+            {"length": 5, "dataset_from_index": 10, "dataset_to_index": 15},
+        ]
+
+        @staticmethod
+        def get_video_file_path(_episode_index: int, video_key: str) -> Path:
+            return relative_paths[video_key]
+
+    dataset = type("FinalizedDataset", (), {"root": root, "meta": SharedMediaMeta()})()
+    inspected: list[Path] = []
+
+    def frame_count(path: Path) -> int:
+        inspected.append(path)
+        return 15
+
+    monkeypatch.setattr("umi_teleop.dataset._video_frame_count", frame_count)
+
+    validate_finalized_dataset(dataset)
+
+    assert sorted(inspected) == sorted(root / path for path in relative_paths.values())
+
+
+def test_enable_starts_episode_when_no_startup_episode_is_active(tmp_path) -> None:
+    recorder, dataset, _cameras = recorder_fixture(tmp_path)
+    measured_joints, measured_grippers = robot_values(0.25)
+    commanded_joints, commanded_grippers = robot_values(0.5)
+
+    prepared = prepare_dataset_step(
+        recorder,
+        was_armed=False,
+        is_armed=True,
+        invalid_frame_reason=None,
+        measured_joints=measured_joints,
+        measured_grippers=measured_grippers,
+        commanded_joints=commanded_joints,
+        commanded_grippers=commanded_grippers,
+    )
+    commit_dataset_step(
+        recorder,
+        prepared,
+        was_armed=False,
+        is_armed=True,
+        disarm_reason="enabled",
+    )
+    prepared = prepare_dataset_step(
+        recorder,
+        was_armed=True,
+        is_armed=True,
+        invalid_frame_reason=None,
+        measured_joints=measured_joints,
+        measured_grippers=measured_grippers,
+        commanded_joints=commanded_joints,
+        commanded_grippers=commanded_grippers,
+    )
+    commit_dataset_step(
+        recorder,
+        prepared,
+        was_armed=True,
+        is_armed=True,
+        disarm_reason="enabled",
+    )
+    commit_dataset_step(
+        recorder,
+        None,
+        was_armed=True,
+        is_armed=False,
+        disarm_reason="enable toggled off",
+    )
+    recorder.close()
+
+    assert len(dataset.episodes) == 1
+    assert len(dataset.episodes[0]) == 2
+
+
 def test_enable_continues_episode_that_started_during_ready_motion(tmp_path) -> None:
     recorder, dataset, _cameras = recorder_fixture(tmp_path)
     recorder.start_episode()

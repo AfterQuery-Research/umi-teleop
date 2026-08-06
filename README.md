@@ -225,7 +225,7 @@ robot translation while preventing a larger raw motion from producing an unbound
 | Control | Action |
 |---|---|
 | E tap while disabled | Request enable; commits after 3 quiet seconds with fresh poses and widths |
-| E tap while enabled | Disable immediately and hold the last commanded robot pose |
+| E tap while enabled | Disable immediately; a recording run saves, then returns both arms to base |
 | E hold for 1 second | Cancel/disarm immediately |
 | Z tap | Disable, wait 0.4 seconds for fresh poses, then capture a new zero |
 | Z hold for 1 second | Ask the source and YAM controller to quit |
@@ -288,14 +288,18 @@ then run:
 ```
 
 The default launch does not command or record a startup trajectory. Recording begins on the first
-successful E enable, and tapping E to stop saves the episode. Later E enable/disable cycles create
-additional episodes normally. The idle wait for ZERO/E is not recorded. An automatic, recorded
-teleop-ready startup remains available only when `--move-to-ready` is passed explicitly;
-`--move-to-base` is also opt-in and its parking motion is not recorded. Z while armed, CANCEL, a
-safety disarm, camera failure, sustained timing failure, source restart, or Ctrl+C during an episode
-discards that incomplete episode. A transient scheduling backlog gets 0.5 seconds to recover before
-it can invalidate the episode. Ordinary degraded or holding IK records the final bounded/held
-command without ending the episode. After the desired episode has printed `DATASET episode saved`,
+successful E enable. Tapping E to stop saves the episode, then automatically returns both arms to
+the all-zero base posture without recording the return. The previous Cartesian ZERO is invalidated;
+after the terminal prints `robots at unrecorded base pose`, place the UMIs at their next neutral
+poses, tap Z, wait for the cooldown, and tap E to record another episode without restarting any
+process. The idle wait for ZERO/E is not recorded. An automatic, recorded teleop-ready startup
+remains available only when `--move-to-ready` is passed explicitly; an unrecorded startup parking
+motion remains available only with `--move-to-base`. Z while armed, CANCEL, a safety disarm, camera
+failure, sustained timing failure, source restart, or Ctrl+C during an episode discards that
+incomplete episode and holds the last safe pose rather than initiating an automatic return. A
+transient scheduling backlog gets 0.5 seconds to recover before it can invalidate the episode.
+Ordinary degraded or holding IK records the final bounded/held command without ending the episode.
+After the desired episode has printed `DATASET episode saved` and the arms have returned to base,
 support the arms and press Ctrl+C. Both robots close first; the dataset then finalizes, validates
 locally, and uploads privately. The local dataset is retained if login or upload fails.
 
@@ -306,8 +310,9 @@ three camera encoders can keep up with capture without starving arm control. Add
 `--dataset.video-codec libsvtav1` only when AV1 file-level parity is required and the slower encoder
 has been tested on this hardware. Final validation decodes the
 first and last saved frames with PyAV, avoiding TorchCodec's optional GPU-linked runtime on ARM64.
-It also requires every camera video to contain exactly the number of frames declared in its episode
-metadata. A streaming encoder drop discards the active episode instead of saving misaligned views.
+It also requires every camera video file to contain exactly the combined number of frames declared
+by the episodes that reference it; LeRobot may pack multiple episodes into one shared file. A
+streaming encoder drop discards the active episode instead of saving misaligned views.
 Use a new dataset root/repository for these `480x270` recordings; they cannot be appended to an
 existing `640x360` LeRobot schema.
 
@@ -339,9 +344,9 @@ If upload fails after the robots have closed, retry it without opening cameras o
 - **Vive or width telemetry is stale:** make both trackers visible and both ArUco tag pairs visible;
   do not enable until both ages recover.
 - **YAM controller disarms while the source still says enabled:** tap E once to synchronize the
-  source back to disabled. To continue from the current robot pose, hold the UMIs neutral, tap Z,
-  wait 5 seconds, then tap E. To return to the canonical posture, disable, support the arms, stop the
-  controller, clear the workspace, and rerun it.
+  source back to disabled. To continue from the current robot pose after a safety disarm, hold the
+  UMIs neutral, tap Z, wait 5 seconds, then tap E. An intentional recording stop returns to the
+  all-zero base posture automatically and then requires a new Z.
 - **An exact IK target is unreachable:** each arm independently searches toward the target while
   relaxing orientation. It reports `degraded_ik` when a nearby target solves and `holding_ik` when
   it must hold that arm's last safe command. IK runs in one latest-target worker per arm, so a slow

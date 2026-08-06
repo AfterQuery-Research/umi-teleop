@@ -18,6 +18,7 @@ from umi_teleop.controller import (
     world_frame_delta,
 )
 from umi_teleop.yam import (
+    DEFAULT_BASE_JOINTS,
     DEFAULT_SIM_INITIAL_JOINTS,
     Config,
     SafetyStop,
@@ -30,6 +31,10 @@ from umi_teleop.yam import (
     rpy_degrees_to_matrix,
     set_sim_initial_pose,
 )
+
+
+def test_base_pose_is_all_zero():
+    np.testing.assert_allclose(DEFAULT_BASE_JOINTS, np.zeros(6))
 
 
 def packet(
@@ -257,6 +262,21 @@ def test_new_session_requires_a_new_zero_then_separate_enable():
     assert zeroed.zero_captured and zeroed.zeroed and not zeroed.armed
     enabled = step(m, packet(seq=12, enabled=True, zero=5, toggle=1))
     assert enabled.armed and enabled.targets is not None
+
+
+def test_external_robot_reset_invalidates_zero_and_requires_a_fresh_one():
+    m = machine()
+    step(m, packet())
+    assert step(m, packet(seq=1, zero=1)).zeroed
+    assert step(m, packet(seq=2, enabled=True, zero=1, toggle=1)).armed
+
+    m.invalidate_zero("returned to base pose; tap ZERO")
+
+    rejected = step(m, packet(seq=3, enabled=True, zero=1, toggle=2))
+    assert not rejected.armed and not rejected.zeroed
+    assert "tap ZERO" in rejected.reason
+    zeroed = step(m, packet(seq=4, zero=2, toggle=2))
+    assert zeroed.zeroed and zeroed.zero_captured
 
 
 def test_zero_rejected_when_either_pose_stale():

@@ -29,11 +29,15 @@ finalized dataset to the Hugging Face Hub.
   a successful `E` enable starts the first episode.
 - The idle wait for ZERO and E is not recorded or padded with duplicate frames.
 - An intentional `E` disable transition commits the active episode.
+- After that commit is queued, both arms automatically return to the all-zero base posture without
+  recording the return. The old Cartesian reference is invalidated, so a new Z is required before
+  the next E enable.
+- Repeated Z/E/disable cycles start and commit additional episodes without restarting the source,
+  controller, cameras, CAN connections, or dataset writer.
 - Passing `--move-to-ready` explicitly starts the first episode immediately before the first
   startup-motion command. Every startup observation and bounded joint command is recorded, and the
   first successful `E` enable continues that same episode.
-- Later `E` enable/disable cycles start and commit additional episodes normally. The automatic
-  move-to-base parking operation is also opt-in and is not recorded.
+- Passing `--move-to-base` explicitly performs an unrecorded startup parking operation.
 - ZERO while armed, CANCEL, source restart, stale telemetry, tracking loss, a configured persistent
   IK-hold timeout, camera failure, or process shutdown discards the active episode. Ordinary
   degraded/holding IK remains armed and records the final bounded or held action actually sent.
@@ -65,8 +69,9 @@ finalized dataset to the Hugging Face Hub.
 - A bimanual frame is queued only after both arm commands return successfully.
 - Previously committed episodes remain local if capture, finalization, login, or
   upload fails.
-- Final validation checks contiguous episode row ranges and requires every encoded
-  camera video to have exactly the declared episode length before Hub upload.
+- Final validation checks contiguous episode row ranges and requires every encoded camera video
+  file to have exactly the combined length of all episodes that reference it before Hub upload.
+  This covers LeRobot's multi-episode shared-video layout without weakening frame-count checks.
 - Finalization is mandatory and idempotent. Upload begins only after both robots
   have been closed and the local dataset has finalized. Writer shutdown is
   bounded; a hung encoder reports an error and leaves the local files untouched
