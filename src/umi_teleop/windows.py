@@ -1,4 +1,4 @@
-"""Stream all valid SteamVR trackers from Windows to the UMI source Pi."""
+"""Broadcast all valid SteamVR trackers to receivers on the local network."""
 
 from __future__ import annotations
 
@@ -11,12 +11,16 @@ from typing import Any
 
 import tyro
 
+LOCAL_BROADCAST = "255.255.255.255"
+
 
 @dataclass(frozen=True)
 class Config:
     """Windows SteamVR sender settings."""
 
-    target_host: str = "10.103.3.43"
+    target_host: str = LOCAL_BROADCAST
+    """UDP destination; local broadcast lets multiple receivers consume the same stream."""
+
     target_port: int = 9001
     rate_hz: float = 50.0
 
@@ -89,6 +93,13 @@ def tracker_packet(
     return {"t": time.time() if timestamp is None else timestamp, "trackers": trackers}
 
 
+def udp_socket() -> socket.socket:
+    """Create a UDP socket that supports local-network broadcast destinations."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    return sock
+
+
 def run(config: Config) -> None:
     if config.rate_hz <= 0:
         raise ValueError("rate-hz must be positive")
@@ -101,7 +112,7 @@ def run(config: Config) -> None:
     vr_system = openvr.VRSystem()
     target = (config.target_host, config.target_port)
     period = 1.0 / config.rate_hz
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock = udp_socket()
     print(
         f"Streaming SteamVR trackers to {config.target_host}:{config.target_port} "
         f"at {config.rate_hz:g} Hz (Ctrl+C to stop)",
