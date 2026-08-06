@@ -10,9 +10,14 @@ finalized dataset to the Hugging Face Hub.
 
 - Record at exactly 30 Hz on the YAM controller computer.
 - Store three ordered RGB views named `top`, `left`, and `right`.
-- Store every image as RGB `uint8` with shape `(270, 480, 3)`.
-- Capture the top D435 at `640x480`, center-crop it to `640x360`, and downsample it
-  to `480x270`; capture the two side D405 cameras natively at `480x270`.
+- Store every image as RGB `uint8`. The default RealSense profile stores all three views with shape
+  `(270, 480, 3)`. The optional ultrawide profile stores `top` at `(270, 480, 3)` and `left`/`right`
+  at `(312, 416, 3)`.
+- Capture the top D435 at `640x480`, center-crop it to `640x360`, and downsample it to `480x270`.
+  Capture the default side D405 cameras natively at `480x270`, or capture the optional side
+  ultrawides as MJPEG at `640x480` with a requested 60 fps setting that delivers 30 fps on the
+  tested hardware, then downsample them to `416x312` for storage and encoding. This exact 4:3
+  frame has 129,792 pixels, within 0.15% of each stored `480x270` RealSense frame.
 - Store `observation.state` as 14 `float32` values in this order:
   left joints 0-5, left gripper, right joints 0-5, right gripper.
 - Store `action` in the same order. The action is the final joint/gripper target
@@ -52,11 +57,15 @@ finalized dataset to the Hugging Face Hub.
   change the normal controller path when disabled.
 - Dataset metadata and all three cameras are validated before CAN is opened or
   either robot is constructed.
+- RealSense remains the default side-camera backend. Ultrawide mode requires distinct stable
+  `/dev/v4l/by-path` paths because the two cameras expose identical USB serials.
 - Camera capture and dataset writes use a bounded asynchronous queue so video or
   Parquet work does not run in the 30 Hz motor-control thread.
 - Any frame drop reported by a streaming encoder invalidates and discards the
   episode rather than committing camera streams of different lengths.
-- Queue overflow and background writer failures fail closed.
+- A writer backlog invalidates and discards the active episode before the bounded queue can fill,
+  leaving the controller alive and the motors holding position. Unexpected queue overflow and
+  background writer failures still fail closed.
 - Require a configurable free-disk reserve before initialization and before each
   episode.
 - Per-arm IK and bounded fallback search run in latest-target background workers. The foreground
@@ -66,6 +75,11 @@ finalized dataset to the Hugging Face Hub.
   backlog that remains over the limit for the configured grace period, or a single cycle exceeding
   the combined limit and grace, discards the episode. LeRobot timestamps are otherwise synthesized
   at the declared 30 Hz.
+- Use two H.264 encoder workers per camera. A one-worker hardware trial saturated an ultrawide
+  encoder after roughly 32 seconds, earlier than the two-worker baseline.
+- Convert RGB arrays directly into PyAV frames and defer per-camera image statistics until each
+  completed MP4 can be decoded after the episode. This keeps statistics complete without spending
+  histogram CPU in the live encoder threads.
 - A bimanual frame is queued only after both arm commands return successfully.
 - Previously committed episodes remain local if capture, finalization, login, or
   upload fails.
@@ -95,5 +109,5 @@ their current dependencies and behavior.
   v3 dataset when the recording extra is installed.
 - The end-to-end test drives the existing Windows-to-source UDP path into the
   recording session with simulated robot state and synthetic camera frames.
-- Hardware acceptance is one short supervised episode with all three RealSense
-  cameras, followed by private Hub upload and remote reopen verification.
+- Hardware acceptance is one short supervised episode with the selected camera profile, followed
+  by local frame-count/shape validation, Hub upload, and remote reopen verification.
