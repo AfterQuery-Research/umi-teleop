@@ -13,7 +13,7 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -37,7 +37,22 @@ from umi_teleop.controller import (
     rotation_angle,
     world_frame_delta,
 )
-from umi_teleop.ik_policy import FallbackIkSolver, IkFallbackResult, fallback_diagnostic
+from umi_teleop.dataset import (
+    ControlLagMonitor,
+    DatasetConfig,
+    DatasetFrameError,
+    DatasetRecorder,
+    DatasetRecordingError,
+    commit_dataset_step,
+    create_dataset_recorder,
+    prepare_dataset_step,
+)
+from umi_teleop.ik_policy import (
+    AsyncFallbackIkSolver,
+    FallbackIkSolver,
+    IkFallbackResult,
+    fallback_diagnostic,
+)
 
 KNOWN_CONTROL_PATTERNS = (
     "umi-yam",
@@ -91,7 +106,7 @@ class Config:
     max_joint_speed: float = 0.45
     max_gripper_speed: float = 1.50
     joint_limit_margin: float = 0.03
-    move_to_ready: bool = True
+    move_to_ready: bool = False
     move_to_base: bool = False
     ready_bend_joints: tuple[float, float] = DEFAULT_READY_BEND_JOINTS
     ready_joint_speed: float = 0.10
@@ -102,11 +117,13 @@ class Config:
     ik_ori_threshold: float = 2e-3
     ik_fallback_attempts_per_cycle: int = 2
     ik_hold_disarm_s: float = 0.0
+    ik_result_max_age_s: float = 0.25
     stream_timeout: float = 20.0
     monitor_only: bool = False
     simulate: bool = False
     sim_initial_joints: tuple[float, float, float, float, float, float] = DEFAULT_SIM_INITIAL_JOINTS
     confirm_clear: bool = False
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
 
 
 class SafetyStop(RuntimeError):
@@ -270,13 +287,29 @@ def check_can_interface(channel: str) -> None:
     output = proc.stdout
     if "state ERROR-ACTIVE" not in output or "UP" not in output.split(">", 1)[0]:
         raise SafetyStop(f"CAN interface {channel!r} is not UP and ERROR-ACTIVE")
+    counter_error = can_error_counter_error(output)
+    if counter_error is not None:
+        raise SafetyStop(f"CAN interface {channel!r} {counter_error}")
+
+
+def can_error_counter_error(output: str) -> str | None:
+    """Return a current CAN fault while tolerating recovered cumulative transitions."""
     match = re.search(
         r"re-started\s+bus-errors\s+arbit-lost\s+error-warn\s+error-pass\s+bus-off\s*\n"
         r"\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)",
         output,
     )
-    if match is None or any(int(v) for v in match.groups()):
-        raise SafetyStop(f"CAN interface {channel!r} has unreadable/non-zero error counters")
+    if match is None:
+        return "has unreadable error counters"
+    _restarted, bus_errors, _arbitration_lost, _error_warn, _error_pass, bus_off = (
+        int(value) for value in match.groups()
+    )
+    # warning/passive are cumulative transition counters. They may remain nonzero after the bus
+    # has recovered to ERROR-ACTIVE, so treating them as current faults prevents safe reuse until
+    # a privileged interface reset. Actual bus errors and bus-off events remain fail-closed.
+    if bus_errors or bus_off:
+        return f"has bus-errors={bus_errors}, bus-off={bus_off}"
+    return None
 
 
 def acquire_locks(channels: tuple[str, str]) -> list[Any]:
@@ -319,8 +352,7 @@ def arm_joints(robot: Any) -> np.ndarray:
     return np.asarray(obs["joint_pos"], dtype=np.float64).copy()
 
 
-def gripper_position(robot: Any) -> float:
-    obs = robot.get_observations()
+def _gripper_position_from_observation(obs: dict[str, Any]) -> float:
     value = float(np.asarray(obs["gripper_pos"]).ravel()[0])
     if not math.isfinite(value) or value < -0.1 or value > 1.1:
         raise SafetyStop(
@@ -328,6 +360,23 @@ def gripper_position(robot: Any) -> float:
             "verify I2RT gripper limits before commanding"
         )
     return float(np.clip(value, 0.0, 1.0))
+
+
+def gripper_position(robot: Any) -> float:
+    return _gripper_position_from_observation(robot.get_observations())
+
+
+def read_pair_state(
+    robots: dict[str, Any],
+) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+    """Read joints and gripper together, acquiring each I2RT state lock once."""
+    joints: dict[str, np.ndarray] = {}
+    grippers: dict[str, float] = {}
+    for name in ARM_NAMES:
+        observation = robots[name].get_observations()
+        joints[name] = np.asarray(observation["joint_pos"], dtype=np.float64).copy()
+        grippers[name] = _gripper_position_from_observation(observation)
+    return joints, grippers
 
 
 def gripper_limits_for_mode(limits: list[float], simulate: bool) -> np.ndarray:
@@ -431,6 +480,14 @@ def check_joint_target(robot: Any, target: np.ndarray, margin: float) -> bool:
 def joint_limit_reason(robot: Any, target: np.ndarray, margin: float) -> str | None:
     """Describe the first joint that is invalid or inside the configured limit margin."""
     limits = np.asarray(robot.get_robot_info()["joint_limits"], dtype=np.float64)
+    return joint_limit_reason_from_limits(limits, target, margin)
+
+
+def joint_limit_reason_from_limits(
+    limits: np.ndarray, target: np.ndarray, margin: float
+) -> str | None:
+    """Validate joints against a cached limit table without touching a hardware object."""
+    limits = np.asarray(limits, dtype=np.float64)
     if target.shape != (6,) or not np.isfinite(target).all() or limits.shape != (6, 2):
         return "has invalid joint data"
     for index, (value, bounds) in enumerate(zip(target, limits, strict=True), start=1):
@@ -472,6 +529,7 @@ def move_pair_to_ready(
     hz: float,
     margin: float,
     readback_tolerance: float = DEFAULT_STARTUP_READBACK_TOLERANCE,
+    recorder: DatasetRecorder | None = None,
 ) -> dict[str, np.ndarray]:
     """Move both arms through a safe bend to the canonical teleoperation pose."""
     bend_targets = {name: ready_joint_target(joints[name], bend_joints) for name in ARM_NAMES}
@@ -489,6 +547,7 @@ def move_pair_to_ready(
             f"J2={math.degrees(float(bend_joints[0])):.1f}deg "
             f"J3={math.degrees(float(bend_joints[1])):.1f}deg"
         ),
+        recorder=recorder,
     )
     canonical_targets = {
         name: np.asarray(DEFAULT_READY_JOINTS, dtype=np.float64).copy() for name in ARM_NAMES
@@ -503,6 +562,7 @@ def move_pair_to_ready(
         margin,
         readback_tolerance,
         label="canonical teleop-ready pose [0, 23, 46, 0, 0, 0]deg",
+        recorder=recorder,
     )
 
 
@@ -539,6 +599,7 @@ def move_pair_to_joint_targets(
     margin: float,
     readback_tolerance: float,
     label: str,
+    recorder: DatasetRecorder | None = None,
 ) -> dict[str, np.ndarray]:
     """Linearly interpolate both arms to validated joint targets."""
     if speed_rad_s <= 0.0 or hz <= 0.0 or readback_tolerance <= 0.0:
@@ -559,19 +620,21 @@ def move_pair_to_joint_targets(
         flush=True,
     )
     period = 1.0 / hz
+    next_step = time.monotonic()
     for step_index in range(1, steps + 1):
         alpha = step_index / steps
         commanded = {
             name: starts[name] + alpha * (targets[name] - starts[name]) for name in ARM_NAMES
         }
-        command_pair(robots, commanded, grips)
-        time.sleep(period)
+        command_startup_pair(robots, commanded, grips, recorder)
+        next_step += period
+        time.sleep(max(0.0, next_step - time.monotonic()))
 
     deadline = time.monotonic() + 3.0
     observed: dict[str, np.ndarray] = {}
     while True:
-        command_pair(robots, targets, grips)
-        observed = {name: arm_joints(robots[name]) for name in ARM_NAMES}
+        command_startup_pair(robots, targets, grips, recorder)
+        observed, _ = read_pair_state(robots)
         max_error = max(float(np.max(np.abs(observed[name] - targets[name]))) for name in ARM_NAMES)
         if max_error <= readback_tolerance:
             break
@@ -581,7 +644,8 @@ def move_pair_to_joint_targets(
                 f"{math.degrees(max_error):.1f}deg",
                 observed,
             )
-        time.sleep(period)
+        next_step += period
+        time.sleep(max(0.0, next_step - time.monotonic()))
     for name in ARM_NAMES:
         values = ",".join(f"{value:+.1f}" for value in np.degrees(observed[name]))
         print(f"{label} verified {name} joints_deg=[{values}]", flush=True)
@@ -611,6 +675,28 @@ def command_pair(
         if server_thread is not None and not server_thread.is_alive():
             raise SafetyStop(f"{name} robot command thread stopped")
         robots[name].command_joint_pos(np.concatenate([joints[name], [grips[name]]]))
+
+
+def command_startup_pair(
+    robots: dict[str, Any],
+    joints: dict[str, np.ndarray],
+    grips: dict[str, float],
+    recorder: DatasetRecorder | None,
+) -> None:
+    """Capture a startup observation, dispatch both arms, then commit its action."""
+    prepared_frame = None
+    if recorder is not None:
+        measured_joints, measured_grippers = read_pair_state(robots)
+        prepared_frame = recorder.prepare_frame(
+            measured_joints=measured_joints,
+            measured_grippers=measured_grippers,
+            commanded_joints=joints,
+            commanded_grippers=grips,
+        )
+    command_pair(robots, joints, grips)
+    if recorder is not None:
+        assert prepared_frame is not None
+        recorder.commit_frame(prepared_frame)
 
 
 def monitor_only(receiver: UdpTeleopReceiver) -> None:
@@ -662,10 +748,14 @@ def monitor_only(receiver: UdpTeleopReceiver) -> None:
 def run(args: Config) -> None:
     if args.move_to_ready and args.move_to_base:
         raise SafetyStop("move-to-ready and move-to-base are mutually exclusive")
+    if args.monitor_only and args.dataset.enabled:
+        raise SafetyStop("dataset recording cannot be combined with monitor-only mode")
     if args.ik_fallback_attempts_per_cycle < 1:
         raise SafetyStop("--ik-fallback-attempts-per-cycle must be at least one")
     if args.ik_hold_disarm_s < 0.0:
         raise SafetyStop("--ik-hold-disarm-s must be nonnegative")
+    if args.ik_result_max_age_s <= 0.0:
+        raise SafetyStop("--ik-result-max-age-s must be positive")
     if not args.monitor_only and not args.simulate and not args.confirm_clear:
         raise SafetyStop(
             "this command can move physical arms; clear the workspace and pass --confirm-clear"
@@ -678,14 +768,14 @@ def run(args: Config) -> None:
             receiver.close()
         return
 
-    for field in (
+    for config_field in (
         "left_gripper_limits",
         "right_gripper_limits",
         "left_input_width_mm",
         "right_input_width_mm",
     ):
-        if getattr(args, field) is None:
-            raise SafetyStop(f"--{field.replace('_', '-')} is required for motor control")
+        if getattr(args, config_field) is None:
+            raise SafetyStop(f"--{config_field.replace('_', '-')} is required for motor control")
 
     limits = TeleopLimits(
         max_packet_age_s=args.max_packet_age,
@@ -720,7 +810,11 @@ def run(args: Config) -> None:
     )
 
     # Mink/MuJoCo allocation can hold the GIL; do it before any motor command thread exists.
-    ik = {
+    fk_models = {
+        name: IkModel(args.ik_max_iters, args.ik_pos_threshold, args.ik_ori_threshold)
+        for name in ARM_NAMES
+    }
+    solve_models = {
         name: IkModel(args.ik_max_iters, args.ik_pos_threshold, args.ik_ori_threshold)
         for name in ARM_NAMES
     }
@@ -736,11 +830,27 @@ def run(args: Config) -> None:
             "UMI source must be disabled before an automatic startup motion; hold CANCEL"
         )
 
-    channels_by_side = resolve_arm_channels(args)
-    channels = tuple(channels_by_side[name] for name in ARM_NAMES)
+    channels: tuple[str, ...] = ()
     locks: list[Any] = []
     robots: dict[str, Any] = {}
+    async_ik: dict[str, AsyncFallbackIkSolver] = {}
+    recorder = None
     try:
+        try:
+            recorder = create_dataset_recorder(args.dataset, args.hz)
+        except DatasetRecordingError as exc:
+            raise SafetyStop(str(exc)) from exc
+        if recorder is not None:
+            print(
+                f"DATASET ready repo={args.dataset.repo_id} root={args.dataset.root} "
+                f"resume={args.dataset.resume} upload={args.dataset.push_to_hub} "
+                f"pipeline={'streaming' if args.dataset.streaming_encoding else 'png-staging'} "
+                f"codec={args.dataset.video_codec} gop={args.dataset.encoder_gop_size}",
+                flush=True,
+            )
+
+        channels_by_side = resolve_arm_channels(args)
+        channels = tuple(channels_by_side[name] for name in ARM_NAMES)
         if not args.simulate:
             check_no_other_control_processes()
             for channel in channels:
@@ -761,8 +871,13 @@ def run(args: Config) -> None:
                 f"{np.asarray(args.sim_initial_joints)}",
                 flush=True,
             )
-        joints = {name: arm_joints(robots[name]) for name in ARM_NAMES}
-        grips = {name: gripper_position(robots[name]) for name in ARM_NAMES}
+        joints, grips = read_pair_state(robots)
+        startup_recorder = recorder if args.move_to_ready else None
+        if startup_recorder is not None:
+            initial_poses = {name: fk_models[name].fk(joints[name]) for name in ARM_NAMES}
+            state.step(initial_packet, 0.0, initial_poses)
+            startup_recorder.start_episode()
+            print("DATASET recording includes teleop-ready startup motion", flush=True)
         if args.move_to_base:
             try:
                 joints = move_pair_to_base(
@@ -788,11 +903,19 @@ def run(args: Config) -> None:
                     args.hz,
                     args.joint_limit_margin,
                     args.startup_readback_tolerance,
+                    recorder=startup_recorder,
                 )
                 startup_blocked = None
             except StartupReadbackError as exc:
                 joints = exc.observed
                 startup_blocked = str(exc)
+                if startup_recorder is not None:
+                    startup_recorder.finish_episode(commit=False, reason=startup_blocked)
+            except DatasetFrameError as exc:
+                joints, _ = read_pair_state(robots)
+                startup_blocked = f"dataset episode invalid during startup: {exc}"
+                assert startup_recorder is not None
+                startup_recorder.finish_episode(commit=False, reason=startup_blocked)
         else:
             startup_blocked = None
         command_pair(robots, joints, grips)
@@ -810,17 +933,50 @@ def run(args: Config) -> None:
         period = 1.0 / args.hz
         max_joint_step = args.max_joint_speed / args.hz
         max_gripper_step = args.max_gripper_speed / args.hz
-        fallback_solvers: dict[str, FallbackIkSolver] = {}
         for name in ARM_NAMES:
-            fallback_solvers[name] = FallbackIkSolver(
-                ik[name].solve,
-                lambda target, name=name: joint_limit_reason(
-                    robots[name], target, args.joint_limit_margin
+            limits = np.asarray(robots[name].get_robot_info()["joint_limits"], dtype=np.float64)
+
+            def validate_target(target: np.ndarray, limits: np.ndarray = limits) -> str | None:
+                return joint_limit_reason_from_limits(limits, target, args.joint_limit_margin)
+
+            async_ik[name] = AsyncFallbackIkSolver(
+                FallbackIkSolver(
+                    solve_models[name].solve,
+                    validate_target,
+                    fallback_attempts_per_cycle=args.ik_fallback_attempts_per_cycle,
                 ),
-                fallback_attempts_per_cycle=args.ik_fallback_attempts_per_cycle,
+                name=name,
             )
-        last_good_poses = {name: ik[name].fk(joints[name]) for name in ARM_NAMES}
+        joint_goals = {name: joints[name].copy() for name in ARM_NAMES}
+        # The state machine only consumes live robot FK when ZERO is captured.  Keep the latest
+        # pose that produced a valid IK result for fallback search instead of recomputing FK for
+        # both arms on every control tick.  Per-frame FK contends with the background MuJoCo IK
+        # workers and can make an otherwise short control cycle miss the dataset deadline.
+        ik_reference_poses = {name: fk_models[name].fk(joints[name]) for name in ARM_NAMES}
+        ik_generation = 0
+        latest_ik_results: dict[str, IkFallbackResult] = {}
         ik_holding_since: dict[str, float | None] = {name: None for name in ARM_NAMES}
+        lag_monitor = (
+            ControlLagMonitor(
+                args.dataset.max_control_lag_s,
+                args.dataset.control_lag_grace_s,
+            )
+            if recorder is not None
+            else None
+        )
+        timing_warning_active = False
+        timing_window_started: float | None = None
+        timing_samples: dict[str, list[float]] = {
+            name: [] for name in ("cycle", "robot_read", "control", "dataset", "dispatch")
+        }
+
+        def invalidate_ik() -> None:
+            nonlocal ik_generation, joint_goals, latest_ik_results, ik_holding_since
+            ik_generation += 1
+            joint_goals = {name: joints[name].copy() for name in ARM_NAMES}
+            latest_ik_results.clear()
+            ik_holding_since = {name: None for name in ARM_NAMES}
+
         last_log = 0.0
         stop = False
 
@@ -832,16 +988,58 @@ def run(args: Config) -> None:
         signal.signal(signal.SIGTERM, _signal)
         next_step = time.monotonic()
         while not stop:
+            cycle_started = time.monotonic()
             packet, packet_age = receiver.poll()
             if packet is None or packet_age is None:
+                was_armed = state.armed
                 state.disarm("waiting for telemetry")
+                if was_armed:
+                    invalidate_ik()
+                if recorder is not None and was_armed:
+                    try:
+                        recorder.finish_episode(commit=False, reason=state.reason)
+                    except DatasetRecordingError as exc:
+                        raise SafetyStop(str(exc)) from exc
                 command_pair(robots, joints, grips)
                 time.sleep(period)
                 continue
-            current_joints = {name: arm_joints(robots[name]) for name in ARM_NAMES}
-            current_poses = {name: ik[name].fk(current_joints[name]) for name in ARM_NAMES}
-            result = state.step(packet, packet_age, current_poses)
+            current_joints, current_grips = read_pair_state(robots)
+            zero_capture_requested = (
+                state.session_id == packet["session_id"]
+                and packet["seq"] > state.last_seq
+                and packet["zero_id"] > state.zero_id
+            )
+            robot_poses = (
+                {name: fk_models[name].fk(current_joints[name]) for name in ARM_NAMES}
+                if zero_capture_requested
+                else ik_reference_poses
+            )
+            observation_done = time.monotonic()
+            was_armed = state.armed
+            previous_session_id = state.session_id
+            previous_cancel_id = state.cancel_id
+            result = state.step(packet, packet_age, robot_poses)
+            prearm_episode_fault = None
+            if recorder is not None and recorder.active and not was_armed and not result.armed:
+                if previous_session_id is not None and packet["session_id"] != previous_session_id:
+                    prearm_episode_fault = "source restarted before teleoperation enabled"
+                elif packet["cancel_id"] > previous_cancel_id:
+                    prearm_episode_fault = "cancel button"
+                elif result.reason.startswith("telemetry stale"):
+                    prearm_episode_fault = result.reason
+                elif "stale" in result.reason or result.reason.startswith("ZERO rejected"):
+                    prearm_episode_fault = result.reason
+                if prearm_episode_fault is not None:
+                    try:
+                        recorder.finish_episode(commit=False, reason=prearm_episode_fault)
+                    except DatasetRecordingError as exc:
+                        raise SafetyStop(str(exc)) from exc
             if result.quit:
+                if recorder is not None:
+                    try:
+                        recorder.finish_episode(commit=False, reason=state.reason)
+                    except DatasetRecordingError as exc:
+                        raise SafetyStop(str(exc)) from exc
                 break
             if startup_blocked is not None:
                 message = f"startup reset incomplete: {startup_blocked}"
@@ -850,7 +1048,6 @@ def run(args: Config) -> None:
                     reject = f"ZERO rejected: {message}"
                     state.reject_zero(reject)
                     print(reject, flush=True)
-                current_joints = {name: arm_joints(robots[name]) for name in ARM_NAMES}
                 command_pair(robots, joints, grips)
                 now = time.monotonic()
                 if now - last_log >= 0.5:
@@ -870,11 +1067,12 @@ def run(args: Config) -> None:
                 continue
             if result.zero_captured:
                 joints = {name: current_joints[name].copy() for name in ARM_NAMES}
-                grips = {name: gripper_position(robots[name]) for name in ARM_NAMES}
-                last_good_poses = {name: current_poses[name].copy() for name in ARM_NAMES}
-                ik_holding_since = {name: None for name in ARM_NAMES}
-                for solver in fallback_solvers.values():
-                    solver.reset()
+                grips = dict(current_grips)
+                ik_reference_poses = {
+                    name: np.asarray(robot_poses[name], dtype=np.float64).copy()
+                    for name in ARM_NAMES
+                }
+                invalidate_ik()
                 for name in ARM_NAMES:
                     reason = joint_limit_reason(
                         robots[name], current_joints[name], args.joint_limit_margin
@@ -884,25 +1082,52 @@ def run(args: Config) -> None:
                         state.reject_zero(message)
                         print(message, flush=True)
                         break
-            ik_results: dict[str, IkFallbackResult] = {}
+            held_joints = {name: joints[name].copy() for name in ARM_NAMES}
+            held_grips = dict(grips)
             if result.armed and result.targets is not None:
+                request_time = time.monotonic()
                 for name in ARM_NAMES:
-                    ik_results[name] = fallback_solvers[name].solve_target(
-                        result.targets[name], last_good_poses[name], joints[name]
+                    async_ik[name].submit(
+                        result.targets[name],
+                        ik_reference_poses[name],
+                        current_joints[name],
+                        generation=ik_generation,
+                        submitted_at=request_time,
                     )
                 cycle_now = time.monotonic()
                 for name in ARM_NAMES:
-                    outcome = ik_results[name]
+                    completion = async_ik[name].poll(generation=ik_generation)
+                    if completion is None:
+                        continue
+                    if cycle_now - completion.submitted_at > args.ik_result_max_age_s:
+                        joint_goals[name] = joints[name].copy()
+                        latest_ik_results.pop(name, None)
+                        ik_holding_since[name] = None
+                        continue
+                    outcome = completion.outcome
+                    latest_ik_results[name] = outcome
+                    joint_goals[name] = (
+                        joints[name].copy()
+                        if outcome.mode == "holding_ik"
+                        else outcome.joints.copy()
+                    )
+                    if outcome.mode != "holding_ik":
+                        ik_reference_poses[name] = outcome.target_pose.copy()
+                for name in ARM_NAMES:
+                    outcome = latest_ik_results.get(name)
+                    if outcome is None:
+                        continue
                     if outcome.mode == "holding_ik":
                         if ik_holding_since[name] is None:
                             ik_holding_since[name] = cycle_now
                     else:
-                        delta = np.clip(
-                            outcome.joints - joints[name], -max_joint_step, max_joint_step
-                        )
-                        joints[name] += delta
-                        last_good_poses[name] = ik[name].fk(joints[name])
                         ik_holding_since[name] = None
+
+                for name in ARM_NAMES:
+                    delta = np.clip(
+                        joint_goals[name] - joints[name], -max_joint_step, max_joint_step
+                    )
+                    joints[name] += delta
 
                     desired_grip = result.grippers[name]
                     if desired_grip is not None:
@@ -911,8 +1136,16 @@ def run(args: Config) -> None:
                         )
                         grips[name] = float(np.clip(grips[name] + grip_delta, 0.0, 1.0))
 
-                holding = [name for name in ARM_NAMES if ik_results[name].mode == "holding_ik"]
-                degraded = [name for name in ARM_NAMES if ik_results[name].mode == "degraded_ik"]
+                holding = [
+                    name
+                    for name, outcome in latest_ik_results.items()
+                    if outcome.mode == "holding_ik"
+                ]
+                degraded = [
+                    name
+                    for name, outcome in latest_ik_results.items()
+                    if outcome.mode == "degraded_ik"
+                ]
                 if args.ik_hold_disarm_s > 0.0:
                     expired = [
                         name
@@ -938,10 +1171,96 @@ def run(args: Config) -> None:
                     if result.envelope_clamps and (holding or degraded):
                         state.reason += "; " + result.reason
             elif not result.armed:
+                joint_goals = {name: joints[name].copy() for name in ARM_NAMES}
+                latest_ik_results.clear()
                 ik_holding_since = {name: None for name in ARM_NAMES}
-                for solver in fallback_solvers.values():
-                    solver.reset()
+            if was_armed and not state.armed:
+                invalidate_ik()
+            control_done = time.monotonic()
+            prepared_dataset_frame = None
+            if recorder is not None:
+                try:
+                    prepared_dataset_frame = prepare_dataset_step(
+                        recorder,
+                        was_armed=was_armed,
+                        is_armed=state.armed,
+                        invalid_frame_reason=None,
+                        measured_joints=current_joints,
+                        measured_grippers=current_grips,
+                        commanded_joints=joints,
+                        commanded_grippers=grips,
+                    )
+                except DatasetFrameError as exc:
+                    state.disarm(f"dataset episode invalid: {exc}")
+                    joints = held_joints
+                    grips = held_grips
+                    invalidate_ik()
+                    try:
+                        recorder.finish_episode(commit=False, reason=state.reason)
+                    except DatasetRecordingError as finish_exc:
+                        raise SafetyStop(str(finish_exc)) from finish_exc
+                except DatasetRecordingError as exc:
+                    state.disarm(f"dataset failure: {exc}")
+                    raise SafetyStop(state.reason) from exc
+            dataset_done = time.monotonic()
             command_pair(robots, joints, grips)
+
+            if recorder is not None:
+                try:
+                    commit_dataset_step(
+                        recorder,
+                        prepared_dataset_frame,
+                        was_armed=was_armed,
+                        is_armed=state.armed,
+                        disarm_reason=state.reason,
+                    )
+                except DatasetRecordingError as exc:
+                    state.disarm(f"dataset failure: {exc}")
+                    raise SafetyStop(state.reason) from exc
+            dispatch_done = time.monotonic()
+
+            if state.armed or was_armed:
+                if timing_window_started is None:
+                    timing_window_started = cycle_started
+                for name, duration in (
+                    ("cycle", dispatch_done - cycle_started),
+                    ("robot_read", observation_done - cycle_started),
+                    ("control", control_done - observation_done),
+                    ("dataset", dataset_done - control_done),
+                    ("dispatch", dispatch_done - dataset_done),
+                ):
+                    timing_samples[name].append(duration * 1000.0)
+                timing_duration = dispatch_done - timing_window_started
+                if timing_duration >= 0.5:
+                    pieces = []
+                    for name, samples in timing_samples.items():
+                        percentiles = np.percentile(samples, (50, 95, 99))
+                        pieces.append(
+                            f"{name}[p50={percentiles[0]:.1f} p95={percentiles[1]:.1f} "
+                            f"p99={percentiles[2]:.1f}]ms"
+                        )
+                    queue_text = ""
+                    if recorder is not None:
+                        queue_text = (
+                            " queues["
+                            + " ".join(
+                                f"{name}={depth}" for name, depth in recorder.queue_depths().items()
+                            )
+                            + "]"
+                        )
+                    print(
+                        f"TIMING effective_hz={len(timing_samples['cycle']) / timing_duration:.1f} "
+                        + " ".join(pieces)
+                        + queue_text,
+                        flush=True,
+                    )
+                    timing_window_started = None
+                    for samples in timing_samples.values():
+                        samples.clear()
+            else:
+                timing_window_started = None
+                for samples in timing_samples.values():
+                    samples.clear()
 
             now = time.monotonic()
             if now - last_log >= 0.5:
@@ -971,12 +1290,13 @@ def run(args: Config) -> None:
                         )
                     clamp_text = " command_clamped[" + " | ".join(pieces) + "]"
                 ik_text = ""
-                if ik_results and result.targets is not None:
+                if latest_ik_results and result.targets is not None:
                     ik_text = (
                         " ik["
                         + " | ".join(
-                            fallback_diagnostic(name, ik_results[name], result.targets[name])
+                            fallback_diagnostic(name, latest_ik_results[name], result.targets[name])
                             for name in ARM_NAMES
+                            if name in latest_ik_results
                         )
                         + "]"
                     )
@@ -989,14 +1309,90 @@ def run(args: Config) -> None:
                 )
                 last_log = now
             next_step += period
+            timing_now = time.monotonic()
+            control_lag = max(0.0, timing_now - next_step)
+            cycle_overrun = max(0.0, dispatch_done - cycle_started - period)
+            if recorder is not None and recorder.active:
+                assert lag_monitor is not None
+                decision = lag_monitor.observe(
+                    control_lag,
+                    cycle_overrun_s=cycle_overrun,
+                    now=timing_now,
+                )
+                if decision.over_limit and not timing_warning_active:
+                    print(
+                        f"DATASET timing recovery lag={control_lag:.3f}s; "
+                        f"allowing {args.dataset.control_lag_grace_s:.3f}s to catch up",
+                        flush=True,
+                    )
+                    timing_warning_active = True
+                elif not decision.over_limit:
+                    if timing_warning_active:
+                        print("DATASET timing recovered", flush=True)
+                    timing_warning_active = False
+                if not decision.fault:
+                    time.sleep(max(0.0, next_step - time.monotonic()))
+                    continue
+                reason = (
+                    f"control loop lagged by {control_lag:.3f}s for "
+                    f"{decision.over_limit_for_s:.3f}s; "
+                    f"last cycle={(dispatch_done - cycle_started) * 1000:.1f}ms "
+                    f"robot_read={(observation_done - cycle_started) * 1000:.1f}ms "
+                    f"control/IK={(control_done - observation_done) * 1000:.1f}ms "
+                    f"dataset={(dataset_done - control_done) * 1000:.1f}ms "
+                    f"dispatch={(dispatch_done - dataset_done) * 1000:.1f}ms"
+                )
+                state.disarm(f"dataset episode invalid: {reason}")
+                invalidate_ik()
+                try:
+                    recorder.finish_episode(
+                        commit=False,
+                        reason=state.reason,
+                    )
+                except DatasetRecordingError as exc:
+                    raise SafetyStop(str(exc)) from exc
+                timing_warning_active = False
+                lag_monitor.reset()
+            else:
+                if lag_monitor is not None:
+                    lag_monitor.reset()
+                timing_warning_active = False
             time.sleep(max(0.0, next_step - time.monotonic()))
     finally:
+        pending_exception = sys.exc_info()[0] is not None
+        cleanup_errors: list[str] = []
+        for name in reversed(ARM_NAMES):
+            if name in async_ik:
+                async_ik[name].close()
         for name in reversed(ARM_NAMES):
             if name in robots:
-                close_robot(robots[name])
-        receiver.close()
+                try:
+                    close_robot(robots[name])
+                except Exception as exc:
+                    cleanup_errors.append(f"failed to close {name} robot: {exc}")
+        for name in reversed(ARM_NAMES):
+            if name in async_ik and not async_ik[name].close(timeout_s=1.0):
+                cleanup_errors.append(f"{name} IK worker did not stop within 1.0s")
+        try:
+            receiver.close()
+        except Exception as exc:
+            cleanup_errors.append(f"failed to close telemetry receiver: {exc}")
         for lock in locks:
-            lock.close()
+            try:
+                lock.close()
+            except Exception as exc:
+                cleanup_errors.append(f"failed to close CAN lock: {exc}")
+        if recorder is not None:
+            try:
+                recorder.close(upload=not pending_exception and not cleanup_errors)
+            except DatasetRecordingError as exc:
+                cleanup_errors.append(f"dataset cleanup failed: {exc}")
+        if cleanup_errors:
+            detail = "; ".join(cleanup_errors)
+            if pending_exception:
+                print(f"CLEANUP ERROR: {detail}", file=sys.stderr, flush=True)
+            else:
+                raise SafetyStop(detail)
 
 
 def main() -> None:

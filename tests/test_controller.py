@@ -21,9 +21,11 @@ from umi_teleop.yam import (
     DEFAULT_SIM_INITIAL_JOINTS,
     Config,
     SafetyStop,
+    can_error_counter_error,
     find_control_processes,
     gripper_limits_for_mode,
     gripper_position,
+    read_pair_state,
     resolve_arm_channels,
     rpy_degrees_to_matrix,
     set_sim_initial_pose,
@@ -76,6 +78,13 @@ def machine(**limit_overrides):
     )
 
 
+def test_automatic_startup_motion_is_opt_in() -> None:
+    config = Config()
+
+    assert not config.move_to_ready
+    assert not config.move_to_base
+
+
 @pytest.mark.parametrize(
     ("limits", "message"),
     [
@@ -118,6 +127,15 @@ def test_process_guard_ignores_own_launch_ancestors_but_not_other_controllers():
         "400     100 python   python experiments/launch_yaml.py",
         "500     100 python   python experiments/launch_vive_teleop.py --simulate",
     ]
+
+
+def test_can_counter_guard_allows_recovered_warning_and_passive_transitions():
+    header = "re-started bus-errors arbit-lost error-warn error-pass bus-off\n"
+
+    assert can_error_counter_error(header + "0 0 0 0 63 0") is None
+    assert "bus-errors=2" in (can_error_counter_error(header + "0 2 0 0 63 0") or "")
+    assert "bus-off=1" in (can_error_counter_error(header + "0 0 0 0 63 1") or "")
+    assert "unreadable" in (can_error_counter_error("missing") or "")
 
 
 def test_physical_can_channels_follow_adapter_serials_not_kernel_order():
@@ -177,6 +195,29 @@ def test_gripper_readback_must_be_normalized_before_any_command():
     assert gripper_position(FakeRobot(1.05)) == pytest.approx(1.0)
     with pytest.raises(SafetyStop, match="outside normalized"):
         gripper_position(FakeRobot(1.224))
+
+
+def test_pair_state_reads_each_robot_once_for_joints_and_gripper():
+    class FakeRobot:
+        def __init__(self, offset):
+            self.offset = offset
+            self.reads = 0
+
+        def get_observations(self):
+            self.reads += 1
+            return {
+                "joint_pos": np.arange(6, dtype=np.float64) + self.offset,
+                "gripper_pos": np.array([0.25 + self.offset / 100]),
+            }
+
+    robots = {"left": FakeRobot(0.0), "right": FakeRobot(10.0)}
+
+    joints, grippers = read_pair_state(robots)
+
+    np.testing.assert_allclose(joints["left"], np.arange(6))
+    np.testing.assert_allclose(joints["right"], np.arange(6) + 10)
+    assert grippers == {"left": pytest.approx(0.25), "right": pytest.approx(0.35)}
+    assert {name: robot.reads for name, robot in robots.items()} == {"left": 1, "right": 1}
 
 
 def test_simulation_starts_at_validated_nonsingular_pose():

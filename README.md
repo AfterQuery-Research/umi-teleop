@@ -2,7 +2,8 @@
 
 Standalone Vive teleoperation for two camera-equipped UMIs and two YAM robot arms.
 
-> **Physical safety:** `umi-yam --confirm-clear` energizes both arms and moves them automatically.
+> **Physical safety:** `umi-yam --confirm-clear` energizes both arms and holds their current joint
+> positions. Automatic startup motion is opt-in through `--move-to-ready` or `--move-to-base`.
 > Clear the complete workspace first. Stopping the process releases active holding, so support the
 > arms before pressing Ctrl+C. Never connect or disconnect powered hardware.
 
@@ -13,10 +14,14 @@ flowchart LR
     W["Windows 10.103.3.44<br/>SteamVR + umi-vive-sender"]
     S["UMI Pi 10.103.3.43<br/>trackers + cameras + buttons"]
     Y["YAM Pi 10.103.3.85<br/>safety + IK + motor control"]
+    C["3 RealSense policy cameras<br/>optional dataset recording"]
+    H["Hugging Face dataset<br/>optional private upload"]
     L["Left YAM<br/>USB serial to current canN"]
     R["Right YAM<br/>USB serial to current canN"]
     W -->|"broadcast tracker JSON/UDP :9001"| S
     S -->|"poses + widths + controls JSON/UDP :9140"| Y
+    C -->|"top + left + right RGB"| Y
+    Y -.->|"finalized LeRobot v3 dataset"| H
     Y --> L
     Y --> R
 ```
@@ -25,8 +30,9 @@ The Windows sender broadcasts raw SteamVR poses to UDP port `9001`, so the UMI P
 computers on the same local network can receive the stream simultaneously. The UMI Pi converts
 poses to `+X` forward, `+Y` left, `+Z` up; measures both grippers from calibrated ArUco tags; reads
 the E/Z buttons; and sends one validated packet at 30 Hz. The YAM Pi owns zeroing, workspace limits,
-inverse kinematics, joint limits, slew limits, CAN access, and motor commands. Images never leave
-the UMI Pi.
+inverse kinematics, joint limits, slew limits, CAN access, and motor commands. The two UMI
+ArUco-camera images never leave the UMI Pi. Optional policy-dataset images come from three separate
+RealSense cameras connected to the YAM Pi and leave it only when explicit Hub upload is enabled.
 
 One root `pyproject.toml` and lockfile keep the protocol and safety code on one version. Install only
 the relevant hardware extra on each device: `windows`, `source`, or `yam`. Every CLI uses Tyro;
@@ -107,6 +113,16 @@ cd /home/yam/Documents/Repos/umi-teleop
 uv sync --locked --extra yam --no-dev
 ```
 
+To record MolmoAct2-compatible LeRobot datasets on this computer, install the optional Python
+3.12 recording stack as well:
+
+```bash
+uv sync --locked --extra yam --extra dataset --no-dev
+```
+
+This adds LeRobot's dataset writer and RealSense support only on the YAM computer. It is not
+needed on Windows or the UMI source Pi.
+
 #### Discover and configure CAN
 
 Stop robot-control processes, then list the adapters without opening a CAN bus or sending frames:
@@ -168,8 +184,9 @@ was replugged.
    Keep this terminal open. Continue only when its logs show `enabled=False`, left/right
    `pose_age` and `width_age` below `0.5`, nonempty left/right `width_mm`, and `bad_vive=0`.
 
-4. Clear the full arm workspace. In a dedicated terminal, connect to the YAM Pi, set the same two
-   adapter serials used during CAN setup, and start the controller:
+4. Put both arms in the intended base pose and clear the full arm workspace. In a dedicated
+   terminal, connect to the YAM Pi, set the same two adapter serials used during CAN setup, and
+   start the controller:
 
    ```bash
    ssh -t yam@10.103.3.85
@@ -183,8 +200,9 @@ was replugged.
    ```
 
    It resolves each USB serial to its current `canN` name, refuses competing controllers, validates
-   both CAN buses, waits for fresh disabled telemetry, and slowly moves both arms through a bent
-   posture to `[0, 23, 46, 0, 0, 0]` degrees. Wait for:
+   both CAN buses, waits for fresh telemetry, energizes the arms, and holds their current positions.
+   It does not command a startup trajectory unless `--move-to-ready` or `--move-to-base` is passed
+   explicitly. Wait for:
 
    ```text
    robots holding current pose; tap the Pi ZERO button before enable
@@ -216,6 +234,90 @@ A new source process always creates a new session ID, so the YAM controller requ
 it can enable. Z can be used again during a session; it disarms first and captures the current UMI
 and robot poses as the next references.
 
+## Record A LeRobot Dataset
+
+Recording is optional and runs inside `umi-yam`, which remains the only process allowed to own the
+YAM CAN buses. Do not run `lerobot-record`, policy inference, or another `umi-yam` at the same time.
+The UMI source Pi keeps owning its two ArUco cameras; the YAM computer separately owns three
+RealSense policy cameras.
+
+First discover and identify the RealSense cameras from the LeRobot checkout:
+
+```bash
+cd /home/yam/Documents/Repos/lerobot
+uv run lerobot-find-cameras realsense
+```
+
+Inspect the saved previews, then assign three distinct serials in the fixed MolmoAct2 view order:
+
+```bash
+export TOP_CAMERA=TOP_REALSENSE_SERIAL
+export LEFT_CAMERA=LEFT_REALSENSE_SERIAL
+export RIGHT_CAMERA=RIGHT_REALSENSE_SERIAL
+```
+
+The top D435 is captured at RGB `640x480` at 30 Hz and center-cropped to `640x360`. The left and
+right D405 cameras are captured natively at RGB `640x360` at 30 Hz. Recording validates and opens
+all three before it opens CAN or constructs either robot, and requires at least 5 GiB of free
+dataset storage before each episode. Authenticate once before requesting upload; the token stays
+in Hugging Face's normal credential store and is never passed to `umi-yam`:
+
+```bash
+cd /home/yam/Documents/Repos/umi-teleop
+.venv/bin/hf auth login
+```
+
+Choose a new Hub repository ID and a local path that does not exist yet, clear the robot workspace,
+then run:
+
+```bash
+.venv/bin/umi-yam \
+  --left-adapter-serial "$LEFT_CAN" \
+  --right-adapter-serial "$RIGHT_CAN" \
+  --dataset.repo-id AfterQuery-Research/YOUR_DATASET_NAME \
+  --dataset.root /home/yam/Datasets/YOUR_DATASET_NAME \
+  --dataset.task "Pick up the oranges and put them in the bowl" \
+  --dataset.top-camera-serial "$TOP_CAMERA" \
+  --dataset.left-camera-serial "$LEFT_CAMERA" \
+  --dataset.right-camera-serial "$RIGHT_CAMERA" \
+  --dataset.streaming-encoding \
+  --dataset.push-to-hub \
+  --confirm-clear
+```
+
+The default launch does not command or record a startup trajectory. Recording begins on the first
+successful E enable, and tapping E to stop saves the episode. Later E enable/disable cycles create
+additional episodes normally. The idle wait for ZERO/E is not recorded. An automatic, recorded
+teleop-ready startup remains available only when `--move-to-ready` is passed explicitly;
+`--move-to-base` is also opt-in and its parking motion is not recorded. Z while armed, CANCEL, a
+safety disarm, camera failure, sustained timing failure, source restart, or Ctrl+C during an episode
+discards that incomplete episode. A transient scheduling backlog gets 0.5 seconds to recover before
+it can invalidate the episode. Ordinary degraded or holding IK records the final bounded/held
+command without ending the episode. After the desired episode has printed `DATASET episode saved`,
+support the arms and press Ctrl+C. Both robots close first; the dataset then finalizes, validates
+locally, and uploads privately. The local dataset is retained if login or upload fails.
+
+To append during a later run, use the same repo ID and root and add `--dataset.resume`. Omit
+`--dataset.push-to-hub` to collect and validate locally without uploading. H.264/yuv420p is the
+Raspberry Pi default. Streaming H.264 uses a 30-frame GOP and the `ultrafast` x264 preset so the
+three camera encoders can keep up with capture without starving arm control. Add
+`--dataset.video-codec libsvtav1` only when AV1 file-level parity is required and the slower encoder
+has been tested on this hardware. Final validation decodes the
+first and last saved frames with PyAV, avoiding TorchCodec's optional GPU-linked runtime on ARM64.
+
+The resulting LeRobot v3 schema matches `MolmoAct2-BimanualYAM-Dataset`: `top`, `left`, and `right`
+RGB images plus 14-value `observation.state` and `action` vectors ordered as left joints 0-5, left
+gripper, right joints 0-5, right gripper. State is measured immediately before control. Action is
+the final bounded target successfully sent to both arms.
+
+If upload fails after the robots have closed, retry it without opening cameras or CAN:
+
+```bash
+.venv/bin/umi-dataset-upload \
+  --repo-id AfterQuery-Research/YOUR_DATASET_NAME \
+  --root /home/yam/Datasets/YOUR_DATASET_NAME
+```
+
 ## Stop
 
 1. Tap **E** once if the source is enabled; verify `enabled=False` in the source log.
@@ -236,9 +338,12 @@ and robot poses as the next references.
   controller, clear the workspace, and rerun it.
 - **An exact IK target is unreachable:** each arm independently searches toward the target while
   relaxing orientation. It reports `degraded_ik` when a nearby target solves and `holding_ik` when
-  it must hold that arm's last safe command. It stays armed and retries, so moving the UMI back into
-  a reachable region recovers automatically. Set `--ik-hold-disarm-s` to a positive timeout only if
-  a deployment should disarm after a sustained hold; the default `0` never disarms for IK alone.
+  it must hold that arm's last safe command. IK runs in one latest-target worker per arm, so a slow
+  fallback search cannot stall 30 Hz observation, command, or dataset capture. The foreground loop
+  rejects an IK result older than `--ik-result-max-age-s` (default `0.25`) and continues holding the
+  last validated goal. It stays armed and retries, so moving the UMI back into a reachable region
+  recovers automatically. Set `--ik-hold-disarm-s` to a positive timeout only if a deployment should
+  disarm after a sustained hold; the default `0` never disarms for IK alone.
 - **The UMI input envelope is exceeded:** the translation vector is projected to `0.50 m` and/or
   the relative rotation is projected to `90 deg`. The controller stays armed and reports
   `input_clamped`, including raw and commanded deltas in its periodic log.
@@ -261,4 +366,6 @@ uv build
 The test suite covers SteamVR packet construction, OpenVR coordinate conversion, strict protocol
 validation, GPIO state guards, camera buffering, calibrated ArUco geometry, serial-based CAN
 discovery/setup, zero/enable/session behavior, Cartesian limits, gripper mapping, the I2RT
-encoder-wrap correction, and a UDP integration test across the Windows, source, and YAM layers.
+encoder-wrap correction, dataset episode and schema behavior, and UDP integration across the
+Windows, source, YAM, and recorder layers. With the `dataset` extra installed, it also writes,
+finalizes, reopens, and decodes a real local LeRobot v3 video dataset.

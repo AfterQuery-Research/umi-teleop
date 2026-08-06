@@ -1,9 +1,9 @@
-"""I2RT YAM factory with safe arm-only encoder wrap correction.
+"""I2RT YAM factory with safe encoder wrap correction.
 
 Derived from i2rt.robots.get_robot at commit 5d47b358 under the MIT license.
 The upstream implementation rebases every motor outside +/-pi, including a calibrated
-linear gripper whose raw position legitimately exceeds pi. This copy limits rebasing to
-the six arm motors so gripper normalization remains valid.
+linear gripper whose raw position legitimately exceeds pi. This copy uses the upstream
+rule for the six arm motors and rebases the gripper only against its calibrated endpoints.
 
 Copyright (c) I2RT Robotics
 
@@ -47,7 +47,10 @@ from i2rt.robots.utils import (
     combine_arm_and_gripper_xml,
 )
 
-from umi_teleop.i2rt_compat import apply_arm_motor_wrap_offsets
+from umi_teleop.i2rt_compat import (
+    apply_arm_motor_wrap_offsets,
+    apply_gripper_motor_wrap_offset,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -302,6 +305,14 @@ def get_yam_robot(
     motor_positions = np.asarray([state.pos for state in motor_states], dtype=np.float64)
     logging.info(f"current_pos: {motor_positions.tolist()}")
     apply_arm_motor_wrap_offsets(motor_chain.motor_offset, motor_positions, n_arm_joints)
+    if with_gripper and gripper_limits is not None:
+        apply_gripper_motor_wrap_offset(
+            motor_chain.motor_offset,
+            motor_positions,
+            motor_chain.motor_direction,
+            n_arm_joints,
+            gripper_limits,
+        )
 
     logging.info(f"adjusted motor_offsets: {motor_chain.motor_offset.tolist()}")
 

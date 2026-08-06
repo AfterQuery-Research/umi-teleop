@@ -21,12 +21,18 @@ source = [
 yam = [
     "i2rt @ https://github.com/i2rt-robotics/i2rt/archive/refs/tags/v1.2.4.tar.gz",
 ]
+dataset = [
+    "lerobot[dataset,intelrealsense] @ https://github.com/AfterQuery-Research/lerobot/archive/2d6e22c776883d55414351c76b51f02bdf28c3f3.tar.gz ; python_version >= '3.12'",
+    "torch>=2.11,<2.12 ; python_version >= '3.12' and sys_platform == 'linux'",
+    "torchvision>=0.26,<0.27 ; python_version >= '3.12' and sys_platform == 'linux'",
+]
 
 [project.scripts]
 umi-vive-sender = "umi_teleop.windows:main"
 umi-source = "umi_teleop.source:main"
 umi-setup-can = "umi_teleop.setup_can:main"
 umi-yam = "umi_teleop.yam:main"
+umi-dataset-upload = "umi_teleop.dataset_cli:main"
 
 [build-system]
 requires = ["uv_build>=0.11.14,<0.13.0"]
@@ -42,9 +48,25 @@ dev = [
 [tool.uv]
 build-constraint-dependencies = ["scikit-build-core<0.10"]
 
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'linux'" },
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    "integration: exercises multiple runtime components or optional LeRobot dependencies",
+]
 
 [tool.ruff]
 line-length = 100
