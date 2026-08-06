@@ -106,7 +106,7 @@ class Config:
     max_joint_speed: float = 0.45
     max_gripper_speed: float = 1.50
     joint_limit_margin: float = 0.03
-    move_to_ready: bool = True
+    move_to_ready: bool = False
     move_to_base: bool = False
     ready_bend_joints: tuple[float, float] = DEFAULT_READY_BEND_JOINTS
     ready_joint_speed: float = 0.10
