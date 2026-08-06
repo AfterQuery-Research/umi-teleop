@@ -1,8 +1,9 @@
+import socket
 from types import SimpleNamespace
 
 import numpy as np
 
-from umi_teleop.windows import matrix_to_quaternion, tracker_packet
+from umi_teleop.windows import Config, matrix_to_quaternion, tracker_packet, udp_socket
 
 
 class FakeOpenVr:
@@ -45,3 +46,15 @@ def test_tracker_packet_contains_valid_and_invalid_trackers() -> None:
         "quat": [1.0, 0.0, 0.0, 0.0],
     }
     assert packet["trackers"][1] == {"serial": "TRACKER-1", "valid": False}
+
+
+def test_sender_defaults_to_local_network_broadcast() -> None:
+    assert Config().target_host == "255.255.255.255"
+
+
+def test_udp_socket_enables_broadcast() -> None:
+    sock = udp_socket()
+    try:
+        assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST) != 0
+    finally:
+        sock.close()

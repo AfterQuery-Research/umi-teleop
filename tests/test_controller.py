@@ -78,6 +78,13 @@ def machine(**limit_overrides):
     )
 
 
+def test_automatic_startup_motion_is_opt_in() -> None:
+    config = Config()
+
+    assert not config.move_to_ready
+    assert not config.move_to_base
+
+
 @pytest.mark.parametrize(
     ("limits", "message"),
     [

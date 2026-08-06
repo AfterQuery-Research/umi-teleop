@@ -2,7 +2,8 @@
 
 Standalone Vive teleoperation for two camera-equipped UMIs and two YAM robot arms.
 
-> **Physical safety:** `umi-yam --confirm-clear` energizes both arms and moves them automatically.
+> **Physical safety:** `umi-yam --confirm-clear` energizes both arms and holds their current joint
+> positions. Automatic startup motion is opt-in through `--move-to-ready` or `--move-to-base`.
 > Clear the complete workspace first. Stopping the process releases active holding, so support the
 > arms before pressing Ctrl+C. Never connect or disconnect powered hardware.
 
@@ -17,7 +18,7 @@ flowchart LR
     H["Hugging Face dataset<br/>optional private upload"]
     L["Left YAM<br/>USB serial to current canN"]
     R["Right YAM<br/>USB serial to current canN"]
-    W -->|"raw tracker JSON/UDP :9001"| S
+    W -->|"broadcast tracker JSON/UDP :9001"| S
     S -->|"poses + widths + controls JSON/UDP :9140"| Y
     C -->|"top + left + right RGB"| Y
     Y -.->|"finalized LeRobot v3 dataset"| H
@@ -25,12 +26,13 @@ flowchart LR
     Y --> R
 ```
 
-The Windows sender publishes raw SteamVR poses. The UMI Pi converts them to `+X` forward, `+Y`
-left, `+Z` up; measures both grippers from calibrated ArUco tags; reads the E/Z buttons; and sends
-one validated packet at 30 Hz. The YAM Pi owns zeroing, workspace limits, inverse kinematics, joint
-limits, slew limits, CAN access, and motor commands. The two UMI ArUco-camera images never leave
-the UMI Pi. Optional policy-dataset images come from three separate RealSense cameras connected to
-the YAM Pi and leave it only when explicit Hub upload is enabled.
+The Windows sender broadcasts raw SteamVR poses to UDP port `9001`, so the UMI Pi and monitoring
+computers on the same local network can receive the stream simultaneously. The UMI Pi converts
+poses to `+X` forward, `+Y` left, `+Z` up; measures both grippers from calibrated ArUco tags; reads
+the E/Z buttons; and sends one validated packet at 30 Hz. The YAM Pi owns zeroing, workspace limits,
+inverse kinematics, joint limits, slew limits, CAN access, and motor commands. The two UMI
+ArUco-camera images never leave the UMI Pi. Optional policy-dataset images come from three separate
+RealSense cameras connected to the YAM Pi and leave it only when explicit Hub upload is enabled.
 
 One root `pyproject.toml` and lockfile keep the protocol and safety code on one version. Install only
 the relevant hardware extra on each device: `windows`, `source`, or `yam`. Every CLI uses Tyro;
@@ -40,7 +42,7 @@ run any command with `--help` to override its typed defaults.
 
 | Role | Address / mapping |
 |---|---|
-| Windows SteamVR host | `aq@10.103.3.44` |
+| Windows SteamVR host | `aq@10.103.3.44`, broadcasts raw poses on UDP `9001` |
 | UMI source Pi | `aq@10.103.3.43`, receives UDP `9001`, sends to `10.103.3.85:9140` |
 | YAM controller Pi | `yam@10.103.3.85`, receives UDP `9140` |
 | Left leader | UMI2, tracker `LHR-BBAF093A`, camera tags `2/3` |
@@ -167,6 +169,11 @@ was replugged.
    .\.venv\Scripts\umi-vive-sender.exe
    ```
 
+   The default destination is the local broadcast address `255.255.255.255`, allowing any receiver
+   bound to UDP `9001` on the same broadcast network to consume the packets. Use `--target-host`
+   only when a specific unicast destination is required. The UDP stream is unauthenticated and
+   unencrypted, so broadcast it only on a trusted local network.
+
 3. In a dedicated terminal, start the UMI source and inspect its live health:
 
    ```bash
@@ -177,8 +184,9 @@ was replugged.
    Keep this terminal open. Continue only when its logs show `enabled=False`, left/right
    `pose_age` and `width_age` below `0.5`, nonempty left/right `width_mm`, and `bad_vive=0`.
 
-4. Clear the full arm workspace. In a dedicated terminal, connect to the YAM Pi, set the same two
-   adapter serials used during CAN setup, and start the controller:
+4. Put both arms in the intended base pose and clear the full arm workspace. In a dedicated
+   terminal, connect to the YAM Pi, set the same two adapter serials used during CAN setup, and
+   start the controller:
 
    ```bash
    ssh -t yam@10.103.3.85
@@ -192,8 +200,9 @@ was replugged.
    ```
 
    It resolves each USB serial to its current `canN` name, refuses competing controllers, validates
-   both CAN buses, waits for fresh disabled telemetry, and slowly moves both arms through a bent
-   posture to `[0, 23, 46, 0, 0, 0]` degrees. Wait for:
+   both CAN buses, waits for fresh telemetry, energizes the arms, and holds their current positions.
+   It does not command a startup trajectory unless `--move-to-ready` or `--move-to-base` is passed
+   explicitly. Wait for:
 
    ```text
    robots holding current pose; tap the Pi ZERO button before enable
@@ -278,18 +287,17 @@ then run:
   --confirm-clear
 ```
 
-With the default automatic move to the teleop-ready pose, recording starts immediately before the
-arms begin that upward motion. Those startup frames and commands become the beginning of episode 1;
-the idle wait for ZERO/E is omitted, and the first successful E enable continues the same episode.
-Tapping E to stop saves it. Later E enable/disable cycles create additional episodes normally. If
-automatic move-to-ready is disabled, E enable starts the first episode as before. Z while armed,
-CANCEL, a safety disarm, camera failure, sustained timing failure, source restart, or Ctrl+C during
-an episode discards that incomplete episode. A transient scheduling backlog gets 0.5 seconds to
-recover before it can invalidate the episode. Ordinary degraded or holding IK records the final
-bounded/held command without ending the episode. After the desired episode has printed
-`DATASET episode saved`, support the arms and press Ctrl+C. Both robots close first; the dataset then
-finalizes, validates locally, and uploads privately. The local dataset is retained if login or
-upload fails.
+The default launch does not command or record a startup trajectory. Recording begins on the first
+successful E enable, and tapping E to stop saves the episode. Later E enable/disable cycles create
+additional episodes normally. The idle wait for ZERO/E is not recorded. An automatic, recorded
+teleop-ready startup remains available only when `--move-to-ready` is passed explicitly;
+`--move-to-base` is also opt-in and its parking motion is not recorded. Z while armed, CANCEL, a
+safety disarm, camera failure, sustained timing failure, source restart, or Ctrl+C during an episode
+discards that incomplete episode. A transient scheduling backlog gets 0.5 seconds to recover before
+it can invalidate the episode. Ordinary degraded or holding IK records the final bounded/held
+command without ending the episode. After the desired episode has printed `DATASET episode saved`,
+support the arms and press Ctrl+C. Both robots close first; the dataset then finalizes, validates
+locally, and uploads privately. The local dataset is retained if login or upload fails.
 
 To append during a later run, use the same repo ID and root and add `--dataset.resume`. Omit
 `--dataset.push-to-hub` to collect and validate locally without uploading. H.264/yuv420p is the
