@@ -74,6 +74,14 @@ static void handle_signal(int signal_number) {
 
 static void log_to_stderr(SurviveContext *context, SurviveLogLevel level, const char *message) {
     (void)context;
+    if (!options.calibrate && level != SURVIVE_LOG_LEVEL_ERROR &&
+        level != SURVIVE_LOG_LEVEL_WARNING) {
+        return;
+    }
+    if (signal_received && level == SURVIVE_LOG_LEVEL_WARNING &&
+        strstr(message, "Libusb poll failed") != NULL) {
+        return;
+    }
     const char *name = "info";
     if (level == SURVIVE_LOG_LEVEL_ERROR) {
         name = "error";

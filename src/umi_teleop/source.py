@@ -71,6 +71,8 @@ class Config:
     quit_burst_s: float = 0.75
     arm_only: bool = False
     """Skip gripper cameras and require only fresh Vive poses for ZERO and enable."""
+    quiet: bool = False
+    """Show only controls, state changes, warnings, and errors."""
 
 
 def _calib(path: str) -> Path:
@@ -97,7 +99,10 @@ def run(cfg: Config) -> None:
         or cfg.zero_timeout_s <= cfg.zero_settle_s
     ):
         raise ValueError("rates, age limits, button hold, and enable timing must be positive")
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.WARNING if cfg.quiet else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
     log = logging.getLogger("umi-yam-source")
 
     vive = VivePacketReceiver(
@@ -200,19 +205,22 @@ def run(cfg: Config) -> None:
                     if event in (Event.STOP, Event.CANCEL, Event.QUIT):
                         zero_guard.cancel()
                     action = enable_guard.handle(state, event, now)
-                log.info(
-                    "button=%s action=%s enabled=%s enable_pending=%s zero_pending=%s zero_id=%d "
-                    "toggle_id=%d cancel_id=%d quit_id=%d",
-                    event.name,
-                    action,
-                    state.requested_enabled,
-                    enable_guard.pending,
-                    zero_guard.pending,
-                    state.zero_id,
-                    state.toggle_id,
-                    state.cancel_id,
-                    state.quit_id,
-                )
+                if cfg.quiet:
+                    print(f"{event.name}: {action}", flush=True)
+                else:
+                    log.info(
+                        "button=%s action=%s enabled=%s enable_pending=%s zero_pending=%s "
+                        "zero_id=%d toggle_id=%d cancel_id=%d quit_id=%d",
+                        event.name,
+                        action,
+                        state.requested_enabled,
+                        enable_guard.pending,
+                        zero_guard.pending,
+                        state.zero_id,
+                        state.toggle_id,
+                        state.cancel_id,
+                        state.quit_id,
+                    )
                 if state.quitting and quit_until is None:
                     quit_until = time.monotonic() + cfg.quit_burst_s
                 now = time.monotonic()
@@ -236,12 +244,15 @@ def run(cfg: Config) -> None:
                 for name in ARM_NAMES
             }
             if (zero_action := zero_guard.update(state, now, poses_fresh=poses_fresh)) is not None:
-                log.info(
-                    "%s enabled=%s zero_id=%d",
-                    zero_action,
-                    state.requested_enabled,
-                    state.zero_id,
-                )
+                if cfg.quiet:
+                    print(zero_action, flush=True)
+                else:
+                    log.info(
+                        "%s enabled=%s zero_id=%d",
+                        zero_action,
+                        state.requested_enabled,
+                        state.zero_id,
+                    )
             widths_fresh = cfg.arm_only or all(
                 widths[name]["width_mm"] is not None
                 and widths[name]["age_s"] <= cfg.max_width_age_s
@@ -258,18 +269,21 @@ def run(cfg: Config) -> None:
                     ),
                 )
             ) is not None:
-                log.info(
-                    "%s enabled=%s toggle_id=%d cancel_id=%d",
-                    enable_action,
-                    state.requested_enabled,
-                    state.toggle_id,
-                    state.cancel_id,
-                )
+                if cfg.quiet:
+                    print(enable_action, flush=True)
+                else:
+                    log.info(
+                        "%s enabled=%s toggle_id=%d cancel_id=%d",
+                        enable_action,
+                        state.requested_enabled,
+                        state.toggle_id,
+                        state.cancel_id,
+                    )
             packet = state.packet(seq, poses, widths)
             sock.sendto(encode_teleop_packet(packet), target)
             seq += 1
 
-            if now - last_status >= 1.0:
+            if not cfg.quiet and now - last_status >= 1.0:
                 log.info(
                     "enabled=%s enable_pending=%s zero_pending=%s pose_age[L=%s R=%s] "
                     "width_mm[L=%s R=%s] width_age[L=%s R=%s] bad_vive=%d",

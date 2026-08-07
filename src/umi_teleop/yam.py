@@ -107,6 +107,8 @@ class Config:
     max_gripper_speed: float = 1.50
     arm_only: bool = False
     """Hold both grippers at startup readback and require only fresh Vive poses to arm."""
+    quiet: bool = False
+    """Suppress continuous controller telemetry while preserving safety messages."""
     joint_limit_margin: float = 0.03
     move_to_ready: bool = False
     move_to_base: bool = False
@@ -807,14 +809,15 @@ def run(args: Config) -> None:
         zero_frame_source=args.zero_frame_source,
         zero_frame_axis_map=args.zero_frame_axis_map,
     )
-    print(
-        "Vive world -> robot base RPY(deg)="
-        f"{np.asarray(args.vive_to_robot_rpy_deg, dtype=np.float64)}; "
-        f"zero_frame_source={args.zero_frame_source}; "
-        f"zero_frame_axis_map={args.zero_frame_axis_map}; "
-        "fixed ROS +X=forward +Y=left +Z=up before ZERO-frame correction",
-        flush=True,
-    )
+    if not args.quiet:
+        print(
+            "Vive world -> robot base RPY(deg)="
+            f"{np.asarray(args.vive_to_robot_rpy_deg, dtype=np.float64)}; "
+            f"zero_frame_source={args.zero_frame_source}; "
+            f"zero_frame_axis_map={args.zero_frame_axis_map}; "
+            "fixed ROS +X=forward +Y=left +Z=up before ZERO-frame correction",
+            flush=True,
+        )
 
     # Mink/MuJoCo allocation can hold the GIL; do it before any motor command thread exists.
     fk_models = {
@@ -1069,7 +1072,7 @@ def run(args: Config) -> None:
                     print(reject, flush=True)
                 command_pair(robots, joints, grips)
                 now = time.monotonic()
-                if now - last_log >= 0.5:
+                if not args.quiet and now - last_log >= 0.5:
                     hold_error = max(
                         float(np.max(np.abs(current_joints[name] - joints[name])))
                         for name in ARM_NAMES
@@ -1310,7 +1313,7 @@ def run(args: Config) -> None:
                 last_log = 0.0
                 continue
 
-            if state.armed or was_armed:
+            if (state.armed or was_armed) and not args.quiet:
                 if timing_window_started is None:
                     timing_window_started = cycle_started
                 for name, duration in (
@@ -1354,7 +1357,7 @@ def run(args: Config) -> None:
                     samples.clear()
 
             now = time.monotonic()
-            if now - last_log >= 0.5:
+            if not args.quiet and now - last_log >= 0.5:
                 input_text = ""
                 if result.input_deltas is not None:
                     pieces = []
@@ -1487,9 +1490,13 @@ def run(args: Config) -> None:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args = tyro.cli(Config)
+    logging.basicConfig(
+        level=logging.WARNING if args.quiet else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
     try:
-        run(tyro.cli(Config))
+        run(args)
     except SafetyStop as exc:
         print(f"SAFETY STOP: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc

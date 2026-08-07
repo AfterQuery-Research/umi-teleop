@@ -16,6 +16,8 @@ def test_physical_local_launcher_is_arm_only_and_has_no_dataset_flags(monkeypatc
     assert "--buttons" in commands["source"]
     assert "keyboard" in commands["source"]
     assert "--arm-only" in commands["controller"]
+    assert "--quiet" in commands["source"]
+    assert "--quiet" in commands["controller"]
     assert "--confirm-clear" in commands["controller"]
     assert local.DEFAULT_LEFT_CAN in commands["controller"]
     assert local.DEFAULT_RIGHT_CAN in commands["controller"]

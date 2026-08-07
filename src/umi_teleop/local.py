@@ -67,6 +67,7 @@ def build_commands(config: Config, bin_dir: Path | None = None) -> dict[str, lis
             "1.0",
             "--enable-cooldown-s",
             "0.5",
+            "--quiet",
         ],
         "controller": [
             str(binaries / "umi-yam"),
@@ -77,6 +78,7 @@ def build_commands(config: Config, bin_dir: Path | None = None) -> dict[str, lis
             "0.25",
             "--max-pose-age",
             "0.20",
+            "--quiet",
         ],
     }
     if config.simulate:
