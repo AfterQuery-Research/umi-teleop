@@ -84,6 +84,7 @@ class E2ERobot:
 
 class E2EIk:
     instances: list[E2EIk] = []
+    solve_delay_s = 0.05
 
     def __init__(self, *_args: Any) -> None:
         self.fk_calls = 0
@@ -94,7 +95,7 @@ class E2EIk:
         return np.eye(4)
 
     def solve(self, _target: np.ndarray, initial: np.ndarray) -> tuple[bool, np.ndarray]:
-        time.sleep(0.05)
+        time.sleep(self.solve_delay_s)
         return True, np.asarray(initial, dtype=np.float64) + 0.005
 
 
@@ -173,8 +174,9 @@ def stream_source(port: int, done: threading.Event) -> None:
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("synchronous_ik", [False, True], ids=["async-ik", "sync-ik"])
 def test_production_yam_loop_records_final_dispatched_simulated_actions(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synchronous_ik: bool
 ) -> None:
     port = free_udp_port()
     dataset_config = DatasetConfig(
@@ -214,6 +216,7 @@ def test_production_yam_loop_records_final_dispatched_simulated_actions(
     monkeypatch.setattr(yam, "make_robot", make_robot)
     monkeypatch.setattr(yam.signal, "signal", lambda *_args: None)
     E2EIk.instances.clear()
+    monkeypatch.setattr(E2EIk, "solve_delay_s", 0.0 if synchronous_ik else 0.05)
 
     sender_done = threading.Event()
     sender = threading.Thread(target=stream_source, args=(port, sender_done), daemon=True)
@@ -225,6 +228,7 @@ def test_production_yam_loop_records_final_dispatched_simulated_actions(
             move_to_base=True,
             base_joint_speed=100.0,
             simulate=True,
+            synchronous_ik=synchronous_ik,
             stream_timeout=2.0,
             dataset=dataset_config,
         )
@@ -255,11 +259,14 @@ def test_production_yam_loop_records_final_dispatched_simulated_actions(
             yam.DEFAULT_BASE_JOINTS,
             atol=1e-9,
         )
-        np.testing.assert_allclose(
-            first_frame["action"][:6],
-            yam.DEFAULT_BASE_JOINTS,
-            atol=1e-9,
-        )
+        if synchronous_ik:
+            assert not np.allclose(first_frame["action"][:6], yam.DEFAULT_BASE_JOINTS)
+        else:
+            np.testing.assert_allclose(
+                first_frame["action"][:6],
+                yam.DEFAULT_BASE_JOINTS,
+                atol=1e-9,
+            )
     assert all(np.allclose(robot.joints, yam.DEFAULT_BASE_JOINTS, atol=1e-9) for robot in robots)
     np.testing.assert_allclose(
         [robot.gripper for robot in robots],

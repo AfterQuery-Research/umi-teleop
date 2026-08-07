@@ -19,8 +19,11 @@ def test_physical_local_launcher_is_arm_only_and_has_no_dataset_flags(monkeypatc
     assert "--quiet" in commands["source"]
     assert "--quiet" in commands["controller"]
     assert commands["controller"][commands["controller"].index("--position-scale") + 1] == "2"
-    assert commands["controller"][commands["controller"].index("--max-joint-speed") + 1] == "0.6"
-    assert commands["controller"][commands["controller"].index("--hz") + 1] == "60"
+    assert commands["tracking"][commands["tracking"].index("--rate-hz") + 1] == "120"
+    assert commands["source"][commands["source"].index("--send-hz") + 1] == "120"
+    assert commands["controller"][commands["controller"].index("--max-joint-speed") + 1] == "1"
+    assert commands["controller"][commands["controller"].index("--hz") + 1] == "100"
+    assert "--synchronous-ik" in commands["controller"]
     assert "--confirm-clear" in commands["controller"]
     assert local.DEFAULT_LEFT_CAN in commands["controller"]
     assert local.DEFAULT_RIGHT_CAN in commands["controller"]
@@ -58,6 +61,8 @@ def test_simulated_launcher_never_passes_can_or_clear_confirmation(monkeypatch):
     [
         ("position_scale", 3.1, "position scale"),
         ("max_joint_speed", 1.1, "max joint speed"),
+        ("tracking_hz", 241.0, "tracking rate"),
+        ("source_hz", 241.0, "source rate"),
         ("controller_hz", 101.0, "controller rate"),
     ],
 )

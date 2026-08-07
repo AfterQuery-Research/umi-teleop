@@ -122,6 +122,8 @@ class Config:
     ik_fallback_attempts_per_cycle: int = 2
     ik_hold_disarm_s: float = 0.0
     ik_result_max_age_s: float = 0.25
+    synchronous_ik: bool = False
+    """Solve IK in the control cycle instead of accepting it one cycle later."""
     stream_timeout: float = 20.0
     monitor_only: bool = False
     simulate: bool = False
@@ -845,6 +847,7 @@ def run(args: Config) -> None:
     locks: list[Any] = []
     robots: dict[str, Any] = {}
     async_ik: dict[str, AsyncFallbackIkSolver] = {}
+    synchronous_ik: dict[str, FallbackIkSolver] = {}
     recorder = None
     try:
         try:
@@ -959,14 +962,15 @@ def run(args: Config) -> None:
             def validate_target(target: np.ndarray, limits: np.ndarray = limits) -> str | None:
                 return joint_limit_reason_from_limits(limits, target, args.joint_limit_margin)
 
-            async_ik[name] = AsyncFallbackIkSolver(
-                FallbackIkSolver(
-                    solve_models[name].solve,
-                    validate_target,
-                    fallback_attempts_per_cycle=args.ik_fallback_attempts_per_cycle,
-                ),
-                name=name,
+            solver = FallbackIkSolver(
+                solve_models[name].solve,
+                validate_target,
+                fallback_attempts_per_cycle=args.ik_fallback_attempts_per_cycle,
             )
+            if args.synchronous_ik:
+                synchronous_ik[name] = solver
+            else:
+                async_ik[name] = AsyncFallbackIkSolver(solver, name=name)
         joint_goals = {name: joints[name].copy() for name in ARM_NAMES}
         # The state machine only consumes live robot FK when ZERO is captured.  Keep the latest
         # pose that produced a valid IK result for fallback search instead of recomputing FK for
@@ -996,6 +1000,8 @@ def run(args: Config) -> None:
             joint_goals = {name: joints[name].copy() for name in ARM_NAMES}
             latest_ik_results.clear()
             ik_holding_since = {name: None for name in ARM_NAMES}
+            for solver in synchronous_ik.values():
+                solver.reset()
 
         last_log = 0.0
         stop = False
@@ -1123,34 +1129,50 @@ def run(args: Config) -> None:
             held_joints = {name: joints[name].copy() for name in ARM_NAMES}
             held_grips = dict(grips)
             if result.armed and result.targets is not None:
-                request_time = time.monotonic()
-                for name in ARM_NAMES:
-                    async_ik[name].submit(
-                        result.targets[name],
-                        ik_reference_poses[name],
-                        current_joints[name],
-                        generation=ik_generation,
-                        submitted_at=request_time,
-                    )
                 cycle_now = time.monotonic()
-                for name in ARM_NAMES:
-                    completion = async_ik[name].poll(generation=ik_generation)
-                    if completion is None:
-                        continue
-                    if cycle_now - completion.submitted_at > args.ik_result_max_age_s:
-                        joint_goals[name] = joints[name].copy()
-                        latest_ik_results.pop(name, None)
-                        ik_holding_since[name] = None
-                        continue
-                    outcome = completion.outcome
-                    latest_ik_results[name] = outcome
-                    joint_goals[name] = (
-                        joints[name].copy()
-                        if outcome.mode == "holding_ik"
-                        else outcome.joints.copy()
-                    )
-                    if outcome.mode != "holding_ik":
-                        ik_reference_poses[name] = outcome.target_pose.copy()
+                if args.synchronous_ik:
+                    for name in ARM_NAMES:
+                        outcome = synchronous_ik[name].solve_target(
+                            result.targets[name],
+                            ik_reference_poses[name],
+                            current_joints[name],
+                        )
+                        latest_ik_results[name] = outcome
+                        joint_goals[name] = (
+                            joints[name].copy()
+                            if outcome.mode == "holding_ik"
+                            else outcome.joints.copy()
+                        )
+                        if outcome.mode != "holding_ik":
+                            ik_reference_poses[name] = outcome.target_pose.copy()
+                else:
+                    request_time = time.monotonic()
+                    for name in ARM_NAMES:
+                        async_ik[name].submit(
+                            result.targets[name],
+                            ik_reference_poses[name],
+                            current_joints[name],
+                            generation=ik_generation,
+                            submitted_at=request_time,
+                        )
+                    for name in ARM_NAMES:
+                        completion = async_ik[name].poll(generation=ik_generation)
+                        if completion is None:
+                            continue
+                        if cycle_now - completion.submitted_at > args.ik_result_max_age_s:
+                            joint_goals[name] = joints[name].copy()
+                            latest_ik_results.pop(name, None)
+                            ik_holding_since[name] = None
+                            continue
+                        outcome = completion.outcome
+                        latest_ik_results[name] = outcome
+                        joint_goals[name] = (
+                            joints[name].copy()
+                            if outcome.mode == "holding_ik"
+                            else outcome.joints.copy()
+                        )
+                        if outcome.mode != "holding_ik":
+                            ik_reference_poses[name] = outcome.target_pose.copy()
                 for name in ARM_NAMES:
                     outcome = latest_ik_results.get(name)
                     if outcome is None:

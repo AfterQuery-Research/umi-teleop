@@ -29,10 +29,16 @@ class Config:
     right_tracker_serial: str = "LHR-C891E882"
     position_scale: float = 2.0
     """Robot translation requested per meter of tracker translation."""
-    max_joint_speed: float = 0.60
+    max_joint_speed: float = 1.0
     """Maximum commanded speed for each joint in radians per second."""
-    controller_hz: float = 60.0
+    tracking_hz: float = 120.0
+    """Native Vive packet rate."""
+    source_hz: float = 120.0
+    """Local source packet rate."""
+    controller_hz: float = 100.0
     """Dual-arm controller update rate."""
+    synchronous_ik: bool = True
+    """Solve normal IK in the control cycle to avoid one-frame worker latency."""
     confirm_clear: bool = False
     """Confirm that the complete physical arm workspace is clear."""
     simulate: bool = False
@@ -52,6 +58,10 @@ def build_commands(config: Config, bin_dir: Path | None = None) -> dict[str, lis
         raise ValueError("position scale must be greater than zero and at most 3.0")
     if not math.isfinite(config.max_joint_speed) or not 0.0 < config.max_joint_speed <= 1.0:
         raise ValueError("max joint speed must be greater than zero and at most 1.0 rad/s")
+    if not math.isfinite(config.tracking_hz) or not 30.0 <= config.tracking_hz <= 240.0:
+        raise ValueError("tracking rate must be between 30 and 240 Hz")
+    if not math.isfinite(config.source_hz) or not 30.0 <= config.source_hz <= 240.0:
+        raise ValueError("source rate must be between 30 and 240 Hz")
     if not math.isfinite(config.controller_hz) or not 10.0 <= config.controller_hz <= 100.0:
         raise ValueError("controller rate must be between 10 and 100 Hz")
     if not config.simulate:
@@ -62,7 +72,11 @@ def build_commands(config: Config, bin_dir: Path | None = None) -> dict[str, lis
 
     binaries = Path(sys.executable).parent if bin_dir is None else bin_dir
     commands = {
-        "tracking": [str(binaries / "umi-vive-linux"), "--rate-hz", "60"],
+        "tracking": [
+            str(binaries / "umi-vive-linux"),
+            "--rate-hz",
+            f"{config.tracking_hz:g}",
+        ],
         "source": [
             str(binaries / "umi-source"),
             "--arm-only",
@@ -73,7 +87,7 @@ def build_commands(config: Config, bin_dir: Path | None = None) -> dict[str, lis
             "--right-serial",
             config.right_tracker_serial,
             "--send-hz",
-            "60",
+            f"{config.source_hz:g}",
             "--max-pose-age-s",
             "0.20",
             "--enable-confirm-s",
@@ -110,6 +124,8 @@ def build_commands(config: Config, bin_dir: Path | None = None) -> dict[str, lis
                 "--confirm-clear",
             ]
         )
+    if config.synchronous_ik:
+        commands["controller"].append("--synchronous-ik")
     return commands
 
 
@@ -154,7 +170,10 @@ def run(
     )
     print(
         f"Profile: translation={config.position_scale:g}x "
-        f"joint_speed={config.max_joint_speed:g}rad/s controller={config.controller_hz:g}Hz",
+        f"joint_speed={config.max_joint_speed:g}rad/s "
+        f"tracking={config.tracking_hz:g}Hz source={config.source_hz:g}Hz "
+        f"controller={config.controller_hz:g}Hz "
+        f"ik={'sync' if config.synchronous_ik else 'async'}",
         flush=True,
     )
     processes: list[tuple[str, Any]] = []
