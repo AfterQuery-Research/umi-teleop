@@ -32,12 +32,18 @@ class KeyboardButtons(Buttons):
         "q": Event.QUIT,
     }
 
+    def __init__(self) -> None:
+        self._closed = False
+
     def poll(self) -> Event | None:
+        if self._closed:
+            return None
         readable, _, _ = select.select([sys.stdin], [], [], 0)
         if not readable:
             return None
         line = sys.stdin.readline()
         if line == "":  # stdin closed
+            self._closed = True
             return Event.QUIT
         return self.KEYMAP.get(line.strip().lower())
 

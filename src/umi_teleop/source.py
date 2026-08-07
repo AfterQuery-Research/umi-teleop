@@ -190,7 +190,7 @@ def run(cfg: Config) -> None:
         next_send = time.monotonic()
         while True:
             now = time.monotonic()
-            while (event := buttons.poll()) is not None:
+            while not state.quitting and (event := buttons.poll()) is not None:
                 if event is Event.ZERO:
                     enable_guard.force_block(now)
                     action = zero_guard.request(state, now)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import socket
 import time
@@ -7,6 +8,7 @@ import time
 import numpy as np
 import pytest
 
+from umi_teleop import buttons as buttons_module
 from umi_teleop.buttons import KeyboardButtons
 from umi_teleop.protocol import (
     ButtonState,
@@ -86,6 +88,16 @@ def test_default_side_mapping_keeps_each_physical_umi_paired():
 def test_keyboard_has_deterministic_start_and_stop_keys():
     assert KeyboardButtons.KEYMAP["e"] is Event.START
     assert KeyboardButtons.KEYMAP["s"] is Event.STOP
+
+
+def test_keyboard_closed_stdin_quits_once(monkeypatch):
+    stdin = io.StringIO("")
+    monkeypatch.setattr(buttons_module.sys, "stdin", stdin)
+    monkeypatch.setattr(buttons_module.select, "select", lambda *_: ([stdin], [], []))
+    buttons = KeyboardButtons()
+
+    assert buttons.poll() is Event.QUIT
+    assert buttons.poll() is None
 
 
 def test_packet_round_trip_and_rejects_nonfinite_or_bad_quaternion():
