@@ -47,7 +47,7 @@ def build_commands(config: Config, bin_dir: Path | None = None) -> dict[str, lis
         if config.left_adapter_serial.casefold() == config.right_adapter_serial.casefold():
             raise ValueError("left and right CAN adapter serials must be different")
 
-    binaries = Path(sys.executable).resolve().parent if bin_dir is None else bin_dir
+    binaries = Path(sys.executable).parent if bin_dir is None else bin_dir
     commands = {
         "tracking": [str(binaries / "umi-vive-linux"), "--rate-hz", "60"],
         "source": [

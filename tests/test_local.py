@@ -22,6 +22,17 @@ def test_physical_local_launcher_is_arm_only_and_has_no_dataset_flags(monkeypatc
     assert not any("dataset" in value for command in commands.values() for value in command)
 
 
+def test_launcher_finds_sibling_virtual_environment_commands(monkeypatch):
+    monkeypatch.setattr(local.sys, "platform", "linux")
+    monkeypatch.setattr(local.sys, "executable", "/repo/.venv/bin/python")
+
+    commands = local.build_commands(local.Config(confirm_clear=True))
+
+    assert commands["tracking"][0] == "/repo/.venv/bin/umi-vive-linux"
+    assert commands["source"][0] == "/repo/.venv/bin/umi-source"
+    assert commands["controller"][0] == "/repo/.venv/bin/umi-yam"
+
+
 def test_physical_launcher_requires_clear_workspace_confirmation(monkeypatch):
     monkeypatch.setattr(local.sys, "platform", "linux")
     with pytest.raises(ValueError, match="confirm-clear"):
