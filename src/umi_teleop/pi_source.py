@@ -314,6 +314,7 @@ def run(args: Args) -> None:
     started_at = time.monotonic()
     preflight_deadline = started_at + args.preflight_timeout_s
     ready = False
+    startup_ready = False
     seq = 0
     quit_at: float | None = None
     next_send = started_at
@@ -349,10 +350,15 @@ def run(args: Args) -> None:
                 and snapshots[name]["age_s"] <= args.width_timeout_s
                 for name in ARM_NAMES
             )
-            if ready and args.preflight_only:
-                print("PI PREFLIGHT OK: both cameras and both ArUco pairs are fresh", flush=True)
-                return
-            if not ready and now >= preflight_deadline:
+            if ready:
+                startup_ready = True
+                if args.preflight_only:
+                    print(
+                        "PI PREFLIGHT OK: both cameras and both ArUco pairs are fresh",
+                        flush=True,
+                    )
+                    return
+            if not startup_ready and now >= preflight_deadline:
                 detail = "; ".join(packet["diagnostics"]) or "sensor readiness unknown"
                 raise RuntimeError(
                     f"Pi preflight timed out after {args.preflight_timeout_s:g}s: {detail}"

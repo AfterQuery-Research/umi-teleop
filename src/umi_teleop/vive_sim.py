@@ -31,11 +31,14 @@ def run(args: Args) -> None:
     try:
         while args.max_packets is None or seq < args.max_packets:
             packet = {
+                "t": time.time(),
+                "seq": seq,
                 "frame": "libsurvive_tracking",
                 "trackers": [
                     {
                         "serial": args.left_id,
                         "valid": True,
+                        "continuity_id": 0,
                         "pose_age_s": 0.0,
                         "pos": [0.0, 0.0, 0.0],
                         "quat": [1.0, 0.0, 0.0, 0.0],
@@ -43,6 +46,7 @@ def run(args: Args) -> None:
                     {
                         "serial": args.right_id,
                         "valid": True,
+                        "continuity_id": 0,
                         "pose_age_s": 0.0,
                         "pos": [0.2, 0.0, 0.0],
                         "quat": [1.0, 0.0, 0.0, 0.0],

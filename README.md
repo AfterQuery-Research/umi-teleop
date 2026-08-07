@@ -84,7 +84,9 @@ cd /home/aq/umi-teleop
 
 The process validates both camera devices, calibration files, GPIO pins, and both configured tag
 pairs. It exits with a specific error if they do not become healthy within 20 seconds. Keep this
-terminal open. Press `Ctrl+C` to stop only the Pi publisher.
+terminal open. After startup succeeds, a later tag occlusion is published as invalid telemetry
+instead of terminating the Pi process; the aq-yam controller disarms until the tags recover. Press
+`Ctrl+C` to stop only the Pi publisher.
 
 Run a one-time camera/GPIO check without leaving the publisher online:
 
@@ -305,12 +307,22 @@ bound the robot response independently of tracker motion. Workspace limits remai
 scaling and filtering.
 
 Native tracking uses the pinned `collabora/libsurvive` build in `scripts/build-linux-vive.sh`.
+The launcher selects libsurvive's `KalmanOnly` poser by default because it produced stable,
+low-latency dual-tracker output on the aq-yam host; `MPFIT` remains available through
+`--tracking.poser MPFIT` for diagnostics. Unsupported poser names fail validation.
 Before fusion, it rejects non-monotonic or physically impossible pose steps (defaults: `8 m/s`
 and `1440 deg/s`) and publishes that tracker as invalid until `250 ms` of plausible samples have
 arrived. These thresholds can be changed with `--tracking.max-linear-speed-m-s`,
 `--tracking.max-angular-speed-deg-s`, and `--tracking.reacquire-ms`; increasing them weakens the
 first tracking safety boundary. Independently, the controller invalidates ZERO if a tracker moves
 more than `0.75 m` or `150 deg` from the captured reference.
+
+At startup, the launcher listens directly to native tracking before it starts fusion or the robot
+controller. Both configured serials must remain valid for `0.75 s`. An intermittent tracker-only
+startup is retried up to three times while no controller process exists; after fusion starts, no
+child is automatically restarted. Tune this bounded pre-control gate with
+`--tracking.startup-timeout-s`, `--tracking.startup-stable-s`, and
+`--tracking.startup-attempts`.
 
 ## Safety Behavior
 

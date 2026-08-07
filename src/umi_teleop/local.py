@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -16,6 +18,7 @@ from typing import Any
 import tyro
 
 from umi_teleop.dataset import DatasetConfig
+from umi_teleop.vive import tracker_updates
 
 DEFAULT_LEFT_CAN = "209D378045465008"
 DEFAULT_RIGHT_CAN = "206237A845465006"
@@ -54,6 +57,18 @@ class TrackingArgs:
 
     reacquire_ms: float = 250.0
     """Continuous plausible tracking required after a rejected sample."""
+
+    poser: str = "KalmanOnly"
+    """libsurvive pose solver: stable KalmanOnly default or expert MPFIT override."""
+
+    startup_timeout_s: float = 8.0
+    """Per-attempt timeout for both trackers to become continuously valid."""
+
+    startup_stable_s: float = 0.75
+    """Continuous two-tracker validity required before fusion and control start."""
+
+    startup_attempts: int = 3
+    """Tracker-only startup attempts allowed before any controller process starts."""
 
     simulate: bool = False
     """Use a deterministic synthetic Vive sender for non-moving tests."""
@@ -218,11 +233,17 @@ def validate_args(args: Args) -> None:
         ("tracking linear speed", args.tracking.max_linear_speed_m_s, 0.1, 100.0),
         ("tracking angular speed", args.tracking.max_angular_speed_deg_s, 10.0, 10_000.0),
         ("tracking reacquisition", args.tracking.reacquire_ms, 10.0, 5_000.0),
+        ("tracking startup timeout", args.tracking.startup_timeout_s, 2.0, 60.0),
+        ("tracking startup stability", args.tracking.startup_stable_s, 0.1, 5.0),
     ):
         if not math.isfinite(value) or not low <= value <= high:
             errors.append(f"{name} must be between {low:g} and {high:g}")
     if args.control.translation_deadband_m < 0:
         errors.append("translation deadband must be non-negative")
+    if not 1 <= args.tracking.startup_attempts <= 5:
+        errors.append("tracking startup attempts must be between 1 and 5")
+    if args.tracking.poser not in {"KalmanOnly", "MPFIT"}:
+        errors.append("tracking poser must be KalmanOnly or MPFIT")
     if not 0 <= args.control.rotation_deadband_deg <= 10:
         errors.append("rotation deadband must be between 0 and 10 degrees")
     if not 0 < args.control.max_translation_m <= 1.0:
@@ -406,6 +427,8 @@ def build_commands(args: Args, bin_dir: Path | None = None) -> dict[str, list[st
                 f"{args.tracking.max_angular_speed_deg_s:g}",
                 "--reacquire-ms",
                 f"{args.tracking.reacquire_ms:g}",
+                "--poser",
+                args.tracking.poser,
             ]
         )
     if args.simulate:
@@ -467,6 +490,149 @@ def coordinated_shutdown_status(
         time.sleep(0.05)
 
 
+def wait_for_tracking_ready(
+    receiver: socket.socket,
+    process: Any,
+    *,
+    expected_serials: set[str],
+    timeout_s: float,
+    stable_s: float,
+) -> None:
+    """Wait for both tracker serials to remain valid before any controller child starts."""
+    deadline = time.monotonic() + timeout_s
+    stable_since: float | None = None
+    stable_continuity: tuple[tuple[str, int | None], ...] | None = None
+    last_sequence: int | None = None
+    latest_valid_serials: set[str] = set()
+    continuity_changes = 0
+    last_problem = "no native tracking packets received"
+    receiver.settimeout(min(0.25, timeout_s))
+    while time.monotonic() < deadline:
+        return_code = process.poll()
+        if return_code is not None:
+            raise RuntimeError(f"native tracking exited with status {return_code} during startup")
+        try:
+            payload, _address = receiver.recvfrom(65_535)
+            packet = json.loads(payload)
+            if not isinstance(packet, dict) or packet.get("frame") != "libsurvive_tracking":
+                raise ValueError("not a native libsurvive tracking packet")
+            sequence = packet.get("seq")
+            if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+                raise ValueError("native tracking sequence must be a non-negative integer")
+            if last_sequence is not None and sequence <= last_sequence:
+                raise ValueError("native tracking sequence did not advance")
+            updates = tracker_updates(packet)
+        except TimeoutError:
+            stable_since = None
+            stable_continuity = None
+            last_problem = "native tracking packet stream timed out"
+            continue
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+        ) as exc:
+            stable_since = None
+            stable_continuity = None
+            last_problem = f"invalid native tracking packet: {exc}"
+            continue
+
+        last_sequence = sequence
+        valid = {
+            serial: update
+            for serial, update in updates.items()
+            if update.pose is not None and update.continuity_id is not None
+        }
+        latest_valid_serials = expected_serials.intersection(valid)
+        if not expected_serials.issubset(valid):
+            stable_since = None
+            stable_continuity = None
+            missing = sorted(expected_serials - latest_valid_serials)
+            last_problem = f"missing or invalid: {', '.join(missing)}"
+            continue
+        continuity = tuple(
+            sorted((serial, valid[serial].continuity_id) for serial in expected_serials)
+        )
+        last_problem = "both trackers did not stay continuously valid"
+        now = time.monotonic()
+        if stable_since is None or continuity != stable_continuity:
+            if stable_since is not None:
+                continuity_changes += 1
+            stable_since = now
+            stable_continuity = continuity
+        elif now - stable_since >= stable_s:
+            return
+    missing = sorted(expected_serials - latest_valid_serials)
+    if missing:
+        detail = f"missing or invalid: {', '.join(missing)}"
+    elif continuity_changes:
+        detail = f"continuity changed {continuity_changes} time(s)"
+    else:
+        detail = last_problem
+    raise RuntimeError(
+        f"trackers did not remain valid for {stable_s:g}s within {timeout_s:g}s; {detail}"
+    )
+
+
+def start_tracking_process(
+    args: Args,
+    command: list[str],
+    *,
+    popen: Callable[..., Any] = subprocess.Popen,
+) -> Any:
+    """Start and, before control exists, retry native tracking until both poses are stable."""
+    expected_serials = {args.tracking.left_id, args.tracking.right_id}
+    last_error: RuntimeError | None = None
+    for attempt in range(1, args.tracking.startup_attempts + 1):
+        receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            receiver.bind((args.tracking.bind, args.tracking.port))
+        except OSError as exc:
+            receiver.close()
+            raise RuntimeError(
+                f"cannot bind tracking startup probe on "
+                f"{args.tracking.bind}:{args.tracking.port}: {exc}"
+            ) from exc
+        process: Any | None = None
+        try:
+            process = popen(command)
+            wait_for_tracking_ready(
+                receiver,
+                process,
+                expected_serials=expected_serials,
+                timeout_s=args.tracking.startup_timeout_s,
+                stable_s=args.tracking.startup_stable_s,
+            )
+            print(
+                f"tracking ready: both configured trackers stable for "
+                f"{args.tracking.startup_stable_s:g}s",
+                flush=True,
+            )
+            return process
+        except RuntimeError as exc:
+            last_error = exc
+            if process is not None:
+                stop_processes([("tracking", process)], timeout_s=2.0)
+            if attempt < args.tracking.startup_attempts:
+                print(
+                    f"tracking startup attempt {attempt} failed: {exc}; retrying before control",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(0.5)
+        except BaseException:
+            if process is not None:
+                stop_processes([("tracking", process)], timeout_s=2.0)
+            raise
+        finally:
+            receiver.close()
+    raise RuntimeError(
+        f"tracking startup failed after {args.tracking.startup_attempts} attempts: {last_error}"
+    )
+
+
 def run(args: Args, *, popen: Callable[..., Any] = subprocess.Popen) -> int:
     commands = build_commands(args)
     for name, command in commands.items():
@@ -489,7 +655,10 @@ def run(args: Args, *, popen: Callable[..., Any] = subprocess.Popen) -> int:
     )
     processes: list[tuple[str, Any]] = []
     try:
-        for name in ("tracking", "source", "controller"):
+        print("starting tracking...", flush=True)
+        tracking_process = start_tracking_process(args, commands["tracking"], popen=popen)
+        processes.append(("tracking", tracking_process))
+        for name in ("source", "controller"):
             print(f"starting {name}...", flush=True)
             processes.append((name, popen(commands[name])))
         while True:

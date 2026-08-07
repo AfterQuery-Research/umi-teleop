@@ -118,3 +118,45 @@ def test_pi_runtime_publishes_mocked_gpio_and_camera_state_over_udp(
     assert all(packet["events"]["zero"] == 1 for packet in packets)
     assert all(packet["arms"]["left"]["camera_ok"] for packet in packets)
     assert buttons.closed
+
+
+def test_pi_runtime_stays_online_after_post_startup_tag_occlusion(monkeypatch) -> None:
+    receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    receiver.bind(("127.0.0.1", 0))
+
+    class OccludingWorker(pi_source._SimulatedWorker):
+        def __init__(self, width_mm: float, *, occlude: bool = False) -> None:
+            super().__init__(width_mm)
+            self.occlude = occlude
+            self.snapshots = 0
+
+        def snapshot(self, now: float, *, camera_timeout_s: float):
+            snapshot = super().snapshot(now, camera_timeout_s=camera_timeout_s)
+            self.snapshots += 1
+            if self.occlude and self.snapshots > 1:
+                snapshot.update(tags_visible=False, width_mm=None, age_s=None)
+            return snapshot
+
+    monkeypatch.setattr(
+        pi_source,
+        "_workers",
+        lambda _args: {
+            "left": OccludingWorker(80.0),
+            "right": OccludingWorker(82.0, occlude=True),
+        },
+    )
+    args = pi_source.Args(
+        network=replace(
+            pi_source.NetworkArgs(),
+            target_host="127.0.0.1",
+            target_port=receiver.getsockname()[1],
+            publish_hz=120.0,
+        ),
+        preflight_timeout_s=0.001,
+        max_packets=3,
+        simulate=True,
+    )
+    try:
+        pi_source.run(args)
+    finally:
+        receiver.close()

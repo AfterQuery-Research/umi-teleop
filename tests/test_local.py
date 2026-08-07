@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+import socket
+import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -22,6 +26,8 @@ def test_tyro_parses_nested_runtime_hardware_and_control_arguments(monkeypatch):
             "10.0.0.3",
             "--control.position-scale",
             "2.4",
+            "--tracking.startup-attempts",
+            "4",
             "--simulate",
         ],
     )
@@ -29,6 +35,7 @@ def test_tyro_parses_nested_runtime_hardware_and_control_arguments(monkeypatch):
     assert args.tracking.left_id == "LEFT"
     assert args.pi.source_host == "10.0.0.3"
     assert args.control.position_scale == 2.4
+    assert args.tracking.startup_attempts == 4
 
 
 def test_physical_local_launcher_uses_pi_grippers_and_gpio(monkeypatch):
@@ -49,6 +56,7 @@ def test_physical_local_launcher_uses_pi_grippers_and_gpio(monkeypatch):
         commands["tracking"][commands["tracking"].index("--max-angular-speed-deg-s") + 1] == "1440"
     )
     assert commands["tracking"][commands["tracking"].index("--reacquire-ms") + 1] == "250"
+    assert commands["tracking"][commands["tracking"].index("--poser") + 1] == "KalmanOnly"
     assert commands["source"][commands["source"].index("--send-hz") + 1] == "120"
     assert commands["controller"][commands["controller"].index("--max-joint-speed") + 1] == "1"
     assert commands["controller"][commands["controller"].index("--hz") + 1] == "100"
@@ -110,6 +118,9 @@ def test_simulated_launcher_never_passes_can_or_clear_confirmation(monkeypatch):
         ("control", "controller_hz", 121.0, "controller rate"),
         ("tracking", "max_linear_speed_m_s", 100.1, "tracking linear speed"),
         ("tracking", "reacquire_ms", 5.0, "tracking reacquisition"),
+        ("tracking", "startup_timeout_s", 1.0, "tracking startup timeout"),
+        ("tracking", "startup_attempts", 0, "tracking startup attempts"),
+        ("tracking", "poser", "Unsupported", "tracking poser"),
         ("control", "max_zero_translation_m", 2.1, "ZERO residual translation"),
     ],
 )
@@ -176,11 +187,235 @@ def test_launcher_returns_success_for_coordinated_gpio_quit(monkeypatch):
         "controller": FakeProcess(0),
     }
     monkeypatch.setattr(local, "build_commands", lambda _args: commands)
+    monkeypatch.setattr(
+        local,
+        "start_tracking_process",
+        lambda _args, _command, *, popen: processes["tracking"],
+    )
 
     result = local.run(local.Config(simulate=True), popen=lambda command: processes[command[1]])
 
     assert result == 0
     assert processes["tracking"].poll() == 0
+
+
+def test_tracking_startup_probe_requires_both_serials_to_remain_valid():
+    receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    receiver.bind(("127.0.0.1", 0))
+    target = receiver.getsockname()
+    sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    process = FakeProcess(None)
+
+    def send_packets():
+        started = time.monotonic()
+        sequence = 0
+        while time.monotonic() - started < 0.15:
+            both_valid = time.monotonic() - started >= 0.03
+            packet = {
+                "seq": sequence,
+                "frame": "libsurvive_tracking",
+                "trackers": [
+                    {
+                        "serial": "LEFT",
+                        "valid": True,
+                        "continuity_id": 1,
+                        "pos": [0.0, 0.0, 0.0],
+                        "quat": [1.0, 0.0, 0.0, 0.0],
+                    },
+                    {
+                        "serial": "RIGHT",
+                        "valid": both_valid,
+                        "continuity_id": 1,
+                        "pos": [0.2, 0.0, 0.0],
+                        "quat": [1.0, 0.0, 0.0, 0.0],
+                    },
+                ],
+            }
+            sender.sendto(json.dumps(packet).encode(), target)
+            sequence += 1
+            time.sleep(0.005)
+
+    thread = threading.Thread(target=send_packets)
+    thread.start()
+    try:
+        local.wait_for_tracking_ready(
+            receiver,
+            process,
+            expected_serials={"LEFT", "RIGHT"},
+            timeout_s=0.5,
+            stable_s=0.04,
+        )
+    finally:
+        thread.join()
+        sender.close()
+        receiver.close()
+
+
+def test_tracking_startup_probe_rejects_single_tracker_stream():
+    receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    receiver.bind(("127.0.0.1", 0))
+    sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sender.sendto(
+        json.dumps(
+            {
+                "seq": 0,
+                "frame": "libsurvive_tracking",
+                "trackers": [
+                    {
+                        "serial": "LEFT",
+                        "valid": True,
+                        "continuity_id": 0,
+                        "pos": [0.0, 0.0, 0.0],
+                        "quat": [1.0, 0.0, 0.0, 0.0],
+                    }
+                ],
+            }
+        ).encode(),
+        receiver.getsockname(),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="did not remain valid") as exc_info:
+            local.wait_for_tracking_ready(
+                receiver,
+                FakeProcess(None),
+                expected_serials={"LEFT", "RIGHT"},
+                timeout_s=0.05,
+                stable_s=0.01,
+            )
+        assert "missing or invalid: RIGHT" in str(exc_info.value)
+    finally:
+        sender.close()
+        receiver.close()
+
+
+@pytest.mark.parametrize(
+    "packet",
+    [
+        {
+            "seq": 0,
+            "frame": "libsurvive_tracking",
+            "trackers": [
+                {"serial": "LEFT", "valid": True, "continuity_id": 0},
+                {"serial": "RIGHT", "valid": True, "continuity_id": 0},
+            ],
+        },
+        {
+            "seq": 0,
+            "frame": "openvr",
+            "trackers": [],
+        },
+    ],
+)
+def test_tracking_startup_probe_rejects_packets_without_native_valid_poses(packet):
+    receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    receiver.bind(("127.0.0.1", 0))
+    sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sender.sendto(json.dumps(packet).encode(), receiver.getsockname())
+    try:
+        with pytest.raises(RuntimeError, match="did not remain valid"):
+            local.wait_for_tracking_ready(
+                receiver,
+                FakeProcess(None),
+                expected_serials={"LEFT", "RIGHT"},
+                timeout_s=0.05,
+                stable_s=0.01,
+            )
+    finally:
+        sender.close()
+        receiver.close()
+
+
+def test_tracking_startup_probe_requires_advancing_packet_sequence():
+    receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    receiver.bind(("127.0.0.1", 0))
+    sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    packet = {
+        "seq": 7,
+        "frame": "libsurvive_tracking",
+        "trackers": [
+            {
+                "serial": serial,
+                "valid": True,
+                "continuity_id": 0,
+                "pos": [0.0, 0.0, 0.0],
+                "quat": [1.0, 0.0, 0.0, 0.0],
+            }
+            for serial in ("LEFT", "RIGHT")
+        ],
+    }
+
+    def repeat_packet():
+        for _attempt in range(20):
+            sender.sendto(json.dumps(packet).encode(), receiver.getsockname())
+            time.sleep(0.003)
+
+    thread = threading.Thread(target=repeat_packet)
+    thread.start()
+    try:
+        with pytest.raises(RuntimeError, match="did not remain valid"):
+            local.wait_for_tracking_ready(
+                receiver,
+                FakeProcess(None),
+                expected_serials={"LEFT", "RIGHT"},
+                timeout_s=0.1,
+                stable_s=0.02,
+            )
+    finally:
+        thread.join()
+        sender.close()
+        receiver.close()
+
+
+def test_tracking_process_retries_only_before_controller_start(monkeypatch):
+    attempts = []
+    processes = []
+
+    def fake_popen(command):
+        attempts.append(command)
+        process = FakeProcess(None)
+        processes.append(process)
+        return process
+
+    def readiness(_receiver, _process, **_kwargs):
+        if len(attempts) == 1:
+            raise RuntimeError("one tracker missing")
+
+    monkeypatch.setattr(local, "wait_for_tracking_ready", readiness)
+    monkeypatch.setattr(local.time, "sleep", lambda _seconds: None)
+    tracking = replace(
+        local.TrackingArgs(),
+        port=0,
+        startup_attempts=2,
+    )
+
+    result = local.start_tracking_process(
+        local.Args(tracking=tracking, simulate=True),
+        [local.sys.executable, "tracking"],
+        popen=fake_popen,
+    )
+
+    assert result is processes[1]
+    assert processes[0].poll() == 0
+    assert processes[1].poll() is None
+
+
+def test_tracking_startup_refuses_an_occupied_receiver_port():
+    occupied = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    occupied.bind(("127.0.0.1", 0))
+    tracking = replace(
+        local.TrackingArgs(),
+        bind="127.0.0.1",
+        port=occupied.getsockname()[1],
+    )
+    try:
+        with pytest.raises(RuntimeError, match="cannot bind tracking startup probe"):
+            local.start_tracking_process(
+                local.Args(tracking=tracking, simulate=True),
+                [local.sys.executable, "tracking"],
+                popen=lambda _command: pytest.fail("tracking must not start without the port"),
+            )
+    finally:
+        occupied.close()
 
 
 def test_coordinated_gpio_shutdown_propagates_child_failure():

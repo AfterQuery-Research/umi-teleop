@@ -28,6 +28,16 @@
 #define MAX_PACKET_BYTES 16384
 #define MAX_CONFIG_BYTES (1024 * 1024)
 
+typedef enum {
+    POSE_ACCEPTED = 0,
+    POSE_REJECTED_NONFINITE,
+    POSE_REJECTED_TIMECODE,
+    POSE_REJECTED_CONFIDENCE,
+    POSE_REJECTED_OPTICAL_CLOCK,
+    POSE_REJECTED_OPTICAL_AGE,
+    POSE_REJECTED_QUATERNION,
+} PoseRejectionReason;
+
 typedef struct {
     SurviveObject *object;
     bool connected;
@@ -37,6 +47,7 @@ typedef struct {
     uint64_t last_valid_monotonic_ns;
     uint64_t continuity_id;
     uint64_t rejected_pose_count;
+    PoseRejectionReason last_rejection_reason;
     survive_long_timecode timecode;
     survive_long_timecode candidate_timecode;
     survive_long_timecode reacquire_start_timecode;
@@ -47,6 +58,7 @@ typedef struct {
 typedef struct {
     char target_host[256];
     char config_dir[1024];
+    char poser[64];
     int target_port;
     double rate_hz;
     double max_pose_age_s;
@@ -140,17 +152,69 @@ static bool finite_pose(const SurvivePose *pose, double *quaternion_norm) {
     return true;
 }
 
+static double optical_age_seconds(survive_long_timecode timecode,
+                                  survive_long_timecode last_light, int32_t timebase_hz) {
+    if (timebase_hz > 0 && last_light > 0) {
+        /* The threaded poser can report a pose while the USB thread has already advanced
+         * last_light. That means fresh optical data, not a stale pose. */
+        survive_long_timecode age_ticks = timecode > last_light ? timecode - last_light : 0;
+        return (double)age_ticks / (double)timebase_hz;
+    }
+    return INFINITY;
+}
+
+static PoseRejectionReason pose_rejection_reason(
+    const SurvivePose *pose, survive_long_timecode timecode, survive_long_timecode last_light,
+    int32_t timebase_hz, double confidence, double *quaternion_norm, double *optical_age_s) {
+    *optical_age_s = optical_age_seconds(timecode, last_light, timebase_hz);
+    if (!finite_pose(pose, quaternion_norm)) {
+        return POSE_REJECTED_NONFINITE;
+    }
+    if (timecode <= 0) {
+        return POSE_REJECTED_TIMECODE;
+    }
+    if (!isfinite(confidence) || confidence <= 0.0) {
+        return POSE_REJECTED_CONFIDENCE;
+    }
+    if (timebase_hz <= 0 || last_light <= 0) {
+        return POSE_REJECTED_OPTICAL_CLOCK;
+    }
+    if (*optical_age_s > options.max_optical_age_s) {
+        return POSE_REJECTED_OPTICAL_AGE;
+    }
+    if (*quaternion_norm < 0.99 || *quaternion_norm > 1.01) {
+        return POSE_REJECTED_QUATERNION;
+    }
+    return POSE_ACCEPTED;
+}
+
 static bool pose_is_valid(const SurvivePose *pose, survive_long_timecode timecode,
                           survive_long_timecode last_light, int32_t timebase_hz,
                           double confidence) {
-    double optical_age_s = INFINITY;
-    if (timebase_hz > 0 && last_light > 0 && timecode >= last_light) {
-        optical_age_s = (double)(timecode - last_light) / (double)timebase_hz;
-    }
     double quaternion_norm = 0.0;
-    return finite_pose(pose, &quaternion_norm) && timecode > 0 && confidence > 0.0 &&
-           optical_age_s <= options.max_optical_age_s && quaternion_norm >= 0.99 &&
-           quaternion_norm <= 1.01;
+    double optical_age_s = INFINITY;
+    return pose_rejection_reason(pose, timecode, last_light, timebase_hz, confidence,
+                                 &quaternion_norm, &optical_age_s) == POSE_ACCEPTED;
+}
+
+static const char *pose_rejection_name(PoseRejectionReason reason) {
+    switch (reason) {
+    case POSE_REJECTED_NONFINITE:
+        return "non-finite pose";
+    case POSE_REJECTED_TIMECODE:
+        return "invalid timecode";
+    case POSE_REJECTED_CONFIDENCE:
+        return "non-positive confidence";
+    case POSE_REJECTED_OPTICAL_CLOCK:
+        return "missing optical clock";
+    case POSE_REJECTED_OPTICAL_AGE:
+        return "stale optical data";
+    case POSE_REJECTED_QUATERNION:
+        return "invalid quaternion norm";
+    case POSE_ACCEPTED:
+        return "accepted";
+    }
+    return "unknown";
 }
 
 static double quaternion_angle_rad(const SurvivePose *left, const SurvivePose *right) {
@@ -421,10 +485,14 @@ static int config_process(SurviveObject *object, char *config, int length) {
 static void pose_process(SurviveObject *object, survive_long_timecode timecode,
                          const SurvivePose *pose) {
     survive_default_pose_process(object, timecode, pose);
-    if (!pose_is_valid(pose, timecode, object->activations.last_light, object->timebase_hz,
-                       object->poseConfidence)) {
-        return;
-    }
+    survive_long_timecode last_light = object->activations.last_light;
+    int32_t timebase_hz = object->timebase_hz;
+    double confidence = object->poseConfidence;
+    double quaternion_norm = 0.0;
+    double optical_age_s = INFINITY;
+    PoseRejectionReason rejection =
+        pose_rejection_reason(pose, timecode, last_light, timebase_hz, confidence,
+                              &quaternion_norm, &optical_age_s);
     pthread_mutex_lock(&state_mutex);
     ObjectState *state = state_for(object, true);
     if (state != NULL) {
@@ -434,6 +502,20 @@ static void pose_process(SurviveObject *object, survive_long_timecode timecode,
             pthread_mutex_unlock(&state_mutex);
             return;
         }
+        if (rejection != POSE_ACCEPTED) {
+            if (rejection != state->last_rejection_reason) {
+                fprintf(stderr,
+                        "Vive tracker %s pose callback rejected (%s, confidence=%.6g "
+                        "optical_age=%.6gs timecode=%llu last_light=%llu qnorm=%.6g)\n",
+                        object->serial_number, pose_rejection_name(rejection), confidence,
+                        optical_age_s, (unsigned long long)timecode,
+                        (unsigned long long)last_light, quaternion_norm);
+            }
+            state->last_rejection_reason = rejection;
+            pthread_mutex_unlock(&state_mutex);
+            return;
+        }
+        state->last_rejection_reason = POSE_ACCEPTED;
 
         if (state->last_valid_monotonic_ns == 0 && !state->reacquiring) {
             begin_reacquisition(state, object->serial_number, "initial acquisition", 0.0, 0.0);
@@ -568,6 +650,7 @@ static void print_usage(FILE *stream, const char *program) {
             "  --max-linear-speed-m-s MPS  Reject faster position steps (default 8)\n"
             "  --max-angular-speed-deg-s D Reject faster orientation steps (default 1440)\n"
             "  --reacquire-ms MS           Stable tracking required after rejection (default 250)\n"
+            "  --poser NAME                KalmanOnly (default) or MPFIT\n"
             "  --config-dir PATH           Isolated XDG config root\n"
             "  --calibrate                 Run libsurvive's native Lighthouse solver\n"
             "  --self-test                 Run deterministic validity tests and exit\n"
@@ -607,6 +690,7 @@ static int parse_options(int argc, char **argv) {
     options.max_linear_speed_m_s = 8.0;
     options.max_angular_speed_rad_s = 1440.0 * acos(-1.0) / 180.0;
     options.reacquire_s = 0.25;
+    snprintf(options.poser, sizeof(options.poser), "KalmanOnly");
 
     enum {
         OPTION_TARGET_HOST = 1000,
@@ -617,6 +701,7 @@ static int parse_options(int argc, char **argv) {
         OPTION_MAX_LINEAR_SPEED_M_S,
         OPTION_MAX_ANGULAR_SPEED_DEG_S,
         OPTION_REACQUIRE_MS,
+        OPTION_POSER,
         OPTION_CONFIG_DIR,
         OPTION_CALIBRATE,
         OPTION_SELF_TEST,
@@ -630,6 +715,7 @@ static int parse_options(int argc, char **argv) {
         {"max-linear-speed-m-s", required_argument, NULL, OPTION_MAX_LINEAR_SPEED_M_S},
         {"max-angular-speed-deg-s", required_argument, NULL, OPTION_MAX_ANGULAR_SPEED_DEG_S},
         {"reacquire-ms", required_argument, NULL, OPTION_REACQUIRE_MS},
+        {"poser", required_argument, NULL, OPTION_POSER},
         {"config-dir", required_argument, NULL, OPTION_CONFIG_DIR},
         {"calibrate", no_argument, NULL, OPTION_CALIBRATE},
         {"self-test", no_argument, NULL, OPTION_SELF_TEST},
@@ -695,6 +781,12 @@ static int parse_options(int argc, char **argv) {
             }
             options.reacquire_s = value / 1000.0;
             break;
+        case OPTION_POSER:
+            if (strcmp(optarg, "KalmanOnly") != 0 && strcmp(optarg, "MPFIT") != 0) {
+                return -1;
+            }
+            snprintf(options.poser, sizeof(options.poser), "%s", optarg);
+            break;
         case OPTION_CONFIG_DIR:
             if (snprintf(options.config_dir, sizeof(options.config_dir), "%s", optarg) >=
                 (int)sizeof(options.config_dir)) {
@@ -733,6 +825,8 @@ static int run_self_tests(void) {
         }                                                                                      \
     } while (0)
     CHECK(pose_is_valid(&pose, now, now - 480000, 48000000, 1.0));
+    CHECK(pose_is_valid(&pose, now, now + 480000, 48000000, 1.0));
+    CHECK(!pose_is_valid(&pose, now, 0, 48000000, 1.0));
     CHECK(!pose_is_valid(&pose, now, now - 24000000, 48000000, 1.0));
     CHECK(!pose_is_valid(&pose, now, now - 480000, 48000000, 0.0));
     pose.Rot[0] = 0.5;
@@ -813,9 +907,10 @@ int main(int argc, char **argv) {
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
-    char *survive_argv[6] = {argv[0], "--globalscenesolver",
-                             options.calibrate ? "1" : "0", NULL, NULL, NULL};
-    int survive_argc = 3;
+    char *survive_argv[8] = {argv[0], "--globalscenesolver",
+                             options.calibrate ? "1" : "0", "-p", options.poser,
+                             NULL,    NULL,                    NULL};
+    int survive_argc = 5;
     if (options.calibrate) {
         survive_argv[survive_argc++] = "--force-calibrate";
         survive_argv[survive_argc++] = "1";
@@ -829,9 +924,13 @@ int main(int argc, char **argv) {
     survive_install_new_object_fn(context, new_object_process);
     survive_install_disconnect_fn(context, disconnect_process);
     survive_install_config_fn(context, config_process);
-    survive_install_pose_fn(context, pose_process);
 
     int result = survive_startup(context);
+    if (result == 0) {
+        /* Match libsurvive's SurviveSimple API: install pose delivery only after startup has
+         * finished constructing every USB object and threaded poser. */
+        survive_install_pose_fn(context, pose_process);
+    }
     pthread_t sender_thread;
     bool sender_started = false;
     if (result == 0) {
@@ -841,9 +940,11 @@ int main(int argc, char **argv) {
         } else {
             sender_started = true;
             fprintf(stderr,
-                    "Streaming native Vive poses to %s:%d at %.1f Hz; config=%s; mode=%s\n",
+                    "Streaming native Vive poses to %s:%d at %.1f Hz; config=%s; mode=%s; "
+                    "poser=%s\n",
                     options.target_host, options.target_port, options.rate_hz,
-                    options.config_dir, options.calibrate ? "calibrate" : "tracking");
+                    options.config_dir, options.calibrate ? "calibrate" : "tracking",
+                    options.poser);
         }
     }
     while (keep_running && result == 0) {
