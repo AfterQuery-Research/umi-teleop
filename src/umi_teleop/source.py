@@ -115,6 +115,25 @@ class _PiEventConsumer:
         return False, [Event.TOGGLE] * changed["toggle"]
 
 
+@dataclass
+class _ViveContinuityGuard:
+    ids: dict[str, int] | None = None
+
+    def update(self, poses: dict[str, dict[str, Any]]) -> bool:
+        if set(poses) != set(ARM_NAMES):
+            return False
+        values = {name: poses[name].get("continuity_id") for name in ARM_NAMES}
+        if any(value is None for value in values.values()):
+            return False
+        current = {name: int(values[name]) for name in ARM_NAMES}
+        if self.ids is None:
+            self.ids = current
+            return False
+        changed = current != self.ids
+        self.ids = current
+        return changed
+
+
 def _calib(path: str) -> Path:
     resolved = Path(path)
     if not resolved.is_file():
@@ -171,6 +190,7 @@ def run(cfg: Config) -> None:
         else None
     )
     pi_events = _PiEventConsumer()
+    vive_continuity = _ViveContinuityGuard()
     workers: dict[str, WidthWorker] = {}
     if not cfg.arm_only and cfg.buttons != "pi":
         from umi_teleop.camera import LocalGstCamera
@@ -320,6 +340,17 @@ def run(cfg: Config) -> None:
                 now = time.monotonic()
 
             poses = vive.snapshot(now)
+            if vive_continuity.update(poses):
+                state = ButtonState(session_id=uuid.uuid4().hex)
+                enable_guard = EnableRequestGuard(
+                    delay_s=cfg.enable_confirm_s,
+                    cooldown_s=cfg.enable_cooldown_s,
+                )
+                zero_guard = ZeroRequestGuard(
+                    settle_s=cfg.zero_settle_s,
+                    timeout_s=cfg.zero_timeout_s,
+                )
+                log.warning("Vive tracking continuity changed; teleoperation zero was invalidated")
             poses_fresh = all(
                 name in poses and poses[name]["age_s"] <= cfg.max_pose_age_s for name in ARM_NAMES
             )

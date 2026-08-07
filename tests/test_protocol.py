@@ -121,6 +121,20 @@ def test_tracking_status_identifies_missing_side_and_serial():
     assert status == "left(LHR-LEFT)=age=0.012s right(LHR-RIGHT)=missing"
 
 
+def test_vive_continuity_guard_detects_generation_change_only_with_both_trackers():
+    guard = source_module._ViveContinuityGuard()
+    poses = {
+        "left": {"continuity_id": 1},
+        "right": {"continuity_id": 2},
+    }
+    assert not guard.update(poses)
+    assert not guard.update(poses)
+    assert not guard.update({"left": {"continuity_id": 3}})
+    changed = {"left": {"continuity_id": 3}, "right": {"continuity_id": 2}}
+    assert guard.update(changed)
+    assert not guard.update(changed)
+
+
 def test_packet_round_trip_and_rejects_nonfinite_or_bad_quaternion():
     assert decode_teleop_packet(encode_teleop_packet(_packet())) == _packet()
     bad = _packet()
@@ -286,6 +300,7 @@ def test_native_vive_receiver_propagates_sensor_age_and_clears_invalid_pose():
                 {
                     "serial": "A",
                     "valid": True,
+                    "continuity_id": 4,
                     "pose_age_s": 0.08,
                     "pos": [0, 0, 0],
                     "quat": [1, 0, 0, 0],
@@ -297,10 +312,11 @@ def test_native_vive_receiver_propagates_sensor_age_and_clears_invalid_pose():
         while receiver.packet_count < 1 and time.time() < deadline:
             time.sleep(0.01)
         assert receiver.snapshot()["left"]["age_s"] >= 0.075
+        assert receiver.snapshot()["left"]["continuity_id"] == 4
 
         invalid = {
             "frame": "libsurvive_tracking",
-            "trackers": [{"serial": "A", "valid": False}],
+            "trackers": [{"serial": "A", "valid": False, "continuity_id": 5}],
         }
         sender.sendto(json.dumps(invalid).encode(), ("127.0.0.1", receiver.port))
         deadline = time.time() + 1.0

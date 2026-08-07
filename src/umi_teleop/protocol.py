@@ -306,6 +306,7 @@ class _StampedPose:
     serial: str
     pose: tuple[float, float, float, float, float, float, float]
     received_at: float
+    continuity_id: int | None
 
 
 class VivePacketReceiver:
@@ -377,6 +378,7 @@ class VivePacketReceiver:
                     serial=serial,
                     pose=pose,
                     received_at=received_at - update.sample_age_s,
+                    continuity_id=update.continuity_id,
                 )
             with self._lock:
                 self.packet_count += 1
@@ -393,6 +395,7 @@ class VivePacketReceiver:
                 "serial": sample.serial,
                 "pose": list(sample.pose),
                 "age_s": max(0.0, now - sample.received_at),
+                "continuity_id": sample.continuity_id,
             }
             for name, sample in latest.items()
         }

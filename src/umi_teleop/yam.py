@@ -103,6 +103,10 @@ class Config:
     max_width_age: float = 0.75
     max_translation: float = 0.50
     max_rotation_deg: float = 90.0
+    max_zero_translation: float = 0.75
+    """Raw tracker displacement from ZERO that invalidates ZERO instead of clamping."""
+    max_zero_rotation_deg: float = 150.0
+    """Raw tracker rotation from ZERO that invalidates ZERO instead of clamping."""
     position_scale: float = 1.50
     rotation_scale: float = 1.0
     translation_filter_hz: float = 0.0
@@ -859,6 +863,8 @@ def run(args: Config) -> None:
         max_width_age_s=args.max_width_age,
         max_translation_m=args.max_translation,
         max_rotation_rad=math.radians(args.max_rotation_deg),
+        max_zero_translation_m=args.max_zero_translation,
+        max_zero_rotation_rad=math.radians(args.max_zero_rotation_deg),
         position_scale=args.position_scale,
         rotation_scale=args.rotation_scale,
         translation_filter_hz=args.translation_filter_hz,

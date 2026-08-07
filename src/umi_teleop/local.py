@@ -46,6 +46,15 @@ class TrackingArgs:
     stale_timeout_s: float = 0.20
     """Maximum Vive pose age allowed while arming or controlling."""
 
+    max_linear_speed_m_s: float = 8.0
+    """Reject native tracker samples faster than this linear speed."""
+
+    max_angular_speed_deg_s: float = 1440.0
+    """Reject native tracker samples faster than this angular speed."""
+
+    reacquire_ms: float = 250.0
+    """Continuous plausible tracking required after a rejected sample."""
+
     simulate: bool = False
     """Use a deterministic synthetic Vive sender for non-moving tests."""
 
@@ -136,6 +145,12 @@ class ControlArgs:
     max_rotation_deg: float = 90.0
     """Maximum orientation displacement from each arm's ZERO pose."""
 
+    max_zero_translation_m: float = 0.75
+    """Raw tracker displacement from ZERO that invalidates the captured ZERO."""
+
+    max_zero_rotation_deg: float = 150.0
+    """Raw tracker rotation from ZERO that invalidates the captured ZERO."""
+
     synchronous_ik: bool = True
     """Solve IK in the current control cycle; disable for background one-cycle-late IK."""
 
@@ -200,6 +215,9 @@ def validate_args(args: Args) -> None:
         ("maximum joint acceleration", args.control.max_joint_acceleration, 0.01, 30.0),
         ("translation filter", args.control.translation_filter_hz, 0.0, 60.0),
         ("rotation filter", args.control.rotation_filter_hz, 0.0, 60.0),
+        ("tracking linear speed", args.tracking.max_linear_speed_m_s, 0.1, 100.0),
+        ("tracking angular speed", args.tracking.max_angular_speed_deg_s, 10.0, 10_000.0),
+        ("tracking reacquisition", args.tracking.reacquire_ms, 10.0, 5_000.0),
     ):
         if not math.isfinite(value) or not low <= value <= high:
             errors.append(f"{name} must be between {low:g} and {high:g}")
@@ -211,6 +229,14 @@ def validate_args(args: Args) -> None:
         errors.append("maximum translation must be greater than zero and at most 1 meter")
     if not 0 < args.control.max_rotation_deg <= 180:
         errors.append("maximum rotation must be greater than zero and at most 180 degrees")
+    if not 0 < args.control.max_zero_translation_m <= 2.0:
+        errors.append(
+            "maximum ZERO residual translation must be greater than zero and at most 2 meters"
+        )
+    if not 0 < args.control.max_zero_rotation_deg <= 180:
+        errors.append(
+            "maximum ZERO residual rotation must be greater than zero and at most 180 degrees"
+        )
     if args.pi.heartbeat_timeout_s <= 0 or args.pi.width_timeout_s <= 0:
         errors.append("Pi heartbeat and width timeouts must be positive")
     if not args.simulate:
@@ -340,6 +366,10 @@ def build_commands(args: Args, bin_dir: Path | None = None) -> dict[str, list[st
             f"{args.control.max_translation_m:g}",
             "--max-rotation-deg",
             f"{args.control.max_rotation_deg:g}",
+            "--max-zero-translation",
+            f"{args.control.max_zero_translation_m:g}",
+            "--max-zero-rotation-deg",
+            f"{args.control.max_zero_rotation_deg:g}",
             "--max-packet-age",
             "0.25",
             "--max-pose-age",
@@ -366,6 +396,17 @@ def build_commands(args: Args, bin_dir: Path | None = None) -> dict[str, list[st
     if args.tracking.simulate:
         commands["tracking"].extend(
             ["--left-id", args.tracking.left_id, "--right-id", args.tracking.right_id]
+        )
+    else:
+        commands["tracking"].extend(
+            [
+                "--max-linear-speed-m-s",
+                f"{args.tracking.max_linear_speed_m_s:g}",
+                "--max-angular-speed-deg-s",
+                f"{args.tracking.max_angular_speed_deg_s:g}",
+                "--reacquire-ms",
+                f"{args.tracking.reacquire_ms:g}",
+            ]
         )
     if args.simulate:
         commands["controller"].append("--simulate")
@@ -409,6 +450,23 @@ def stop_processes(processes: list[tuple[str, Any]], timeout_s: float = 5.0) -> 
                 process.wait(timeout=1.0)
 
 
+def coordinated_shutdown_status(
+    processes: list[tuple[str, Any]], timeout_s: float = 2.0
+) -> int | None:
+    """Recognize GPIO QUIT after both quit-aware children exit cleanly."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        statuses = {name: process.poll() for name, process in processes}
+        failures = [status for status in statuses.values() if status not in (None, 0)]
+        if failures:
+            return int(failures[0])
+        if statuses.get("source") == 0 and statuses.get("controller") == 0:
+            return 0
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.05)
+
+
 def run(args: Args, *, popen: Callable[..., Any] = subprocess.Popen) -> int:
     commands = build_commands(args)
     for name, command in commands.items():
@@ -441,8 +499,12 @@ def run(args: Args, *, popen: Callable[..., Any] = subprocess.Popen) -> int:
                     if return_code != 0:
                         print(f"{name} exited with status {return_code}", file=sys.stderr)
                     elif not args.preflight_only:
-                        print(f"{name} exited unexpectedly", file=sys.stderr)
-                        return_code = 1
+                        coordinated_status = coordinated_shutdown_status(processes)
+                        if coordinated_status is None:
+                            print(f"{name} exited unexpectedly", file=sys.stderr)
+                            return_code = 1
+                        else:
+                            return_code = coordinated_status
                     return int(return_code)
             time.sleep(0.1)
     except KeyboardInterrupt:

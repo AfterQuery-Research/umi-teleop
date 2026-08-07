@@ -304,11 +304,21 @@ add lag. Position and rotation scales change tracker sensitivity. Joint speed an
 bound the robot response independently of tracker motion. Workspace limits remain enforced after
 scaling and filtering.
 
+Native tracking uses the pinned `collabora/libsurvive` build in `scripts/build-linux-vive.sh`.
+Before fusion, it rejects non-monotonic or physically impossible pose steps (defaults: `8 m/s`
+and `1440 deg/s`) and publishes that tracker as invalid until `250 ms` of plausible samples have
+arrived. These thresholds can be changed with `--tracking.max-linear-speed-m-s`,
+`--tracking.max-angular-speed-deg-s`, and `--tracking.reacquire-ms`; increasing them weakens the
+first tracking safety boundary. Independently, the controller invalidates ZERO if a tracker moves
+more than `0.75 m` or `150 deg` from the captured reference.
+
 ## Safety Behavior
 
 - Missing or duplicate hardware identities fail before robot construction.
 - A new source or controller session always requires a new ZERO.
 - Stale Vive poses, Pi heartbeat, camera frames, ArUco widths, control packets, or IK results disarm.
+- A libsurvive discontinuity publishes an invalid pose during stable reacquisition; a large change
+  from the captured reference invalidates ZERO and requires the operator to tap ZERO again.
 - Camera or tag loss while active disarms both arms, not only the gripper command.
 - GPIO cancel, quit, and stop are immediate; enabling requires a quiet fresh-sensor interval.
 - Joint limits, workspace limits, command speed, command acceleration, CAN state, and competing
@@ -328,6 +338,8 @@ state transitions, warnings, episode results, and errors only.
 |---|---|
 | `Pi preflight timed out` | Both Pi camera paths, both calibration files, and tags `0 1 2 3` are visible |
 | `tracking stale` | Both Vive trackers are green, visible to the base stations, and use the configured serials |
+| `continuity lost` | Improve tracker/base-station visibility and check Watchman USB/radio stability; wait for both trackers to reacquire, then tap ZERO again |
+| `tracking frame changed after ZERO` | Do not enable; hold both handles neutral and tap ZERO again after tracking is stable |
 | `Pi heartbeat` or `unexpected source` | The Pi hostname resolves from aq-yam and UDP port `9139` is not blocked |
 | `camera preflight failed` | The top serial and both stable V4L2 paths are correct and unused by another process |
 | `CAN identity` or `CAN interface ... DOWN` | Run `umi-setup-can` and verify each USB serial is assigned to the intended arm |
@@ -336,6 +348,18 @@ state transitions, warnings, episode results, and errors only.
 
 After a child failure, `umi-teleop` stops only the children it launched. Fix the reported cause,
 confirm no controller remains, and rerun preflight before starting another physical session.
+
+To inspect native tracking without opening CAN or starting the robot controller, run the native
+sender and checker in separate aq-yam terminals:
+
+```bash
+.venv/bin/umi-vive-linux --target-host 127.0.0.1 --target-port 9001 --rate-hz 120
+scripts/check-linux-vive-stream.py --duration-s 30 \
+  --expect-serial LHR-BBAF093A --expect-serial LHR-C891E882
+```
+
+The checker fails on new continuity resets, rejected samples, timecode regressions, implausible
+rates, missing trackers, malformed packets, or insufficient valid-pose coverage.
 
 ## Development
 

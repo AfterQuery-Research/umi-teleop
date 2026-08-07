@@ -53,6 +53,7 @@ class TrackerUpdate:
 
     pose: TrackerPose | None
     sample_age_s: float = 0.0
+    continuity_id: int | None = None
 
 
 def normalize(q: np.ndarray) -> np.ndarray:
@@ -212,8 +213,17 @@ def tracker_updates(packet: Any) -> dict[str, TrackerUpdate]:
         if serial_value is None:
             continue
         serial = str(serial_value)
+        continuity_value = tracker.get("continuity_id")
+        if continuity_value is None:
+            continuity_id = None
+        elif isinstance(continuity_value, bool) or not isinstance(continuity_value, int):
+            raise ValueError("continuity_id must be a non-negative integer")
+        elif continuity_value < 0:
+            raise ValueError("continuity_id must be a non-negative integer")
+        else:
+            continuity_id = continuity_value
         if not tracker.get("valid"):
-            updates[serial] = TrackerUpdate(pose=None)
+            updates[serial] = TrackerUpdate(pose=None, continuity_id=continuity_id)
             continue
         fields = _tracker_pose_fields(tracker)
         if fields is None:
@@ -228,6 +238,7 @@ def tracker_updates(packet: Any) -> dict[str, TrackerUpdate]:
         updates[serial] = TrackerUpdate(
             pose=convert(pos, quat),
             sample_age_s=sample_age_s,
+            continuity_id=continuity_id,
         )
     return updates
 

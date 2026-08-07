@@ -261,6 +261,8 @@ class TeleopLimits:
     max_width_age_s: float = 0.75
     max_translation_m: float = 0.50
     max_rotation_rad: float = math.radians(100.0)
+    max_zero_translation_m: float = 0.75
+    max_zero_rotation_rad: float = math.radians(150.0)
     position_scale: float = 1.0
     rotation_scale: float = 1.0
     translation_filter_hz: float = 0.0
@@ -313,6 +315,16 @@ class TeleopStateMachine:
             or not 0.0 <= self.limits.max_rotation_rad <= math.pi
         ):
             raise ValueError("max rotation must be between zero and pi")
+        if (
+            not math.isfinite(self.limits.max_zero_translation_m)
+            or self.limits.max_zero_translation_m <= 0.0
+        ):
+            raise ValueError("maximum ZERO residual translation must be finite and positive")
+        if (
+            not math.isfinite(self.limits.max_zero_rotation_rad)
+            or not 0.0 < self.limits.max_zero_rotation_rad <= math.pi
+        ):
+            raise ValueError("maximum ZERO residual rotation must be between zero and pi")
         for name, value in (
             ("position scale", self.limits.position_scale),
             ("rotation scale", self.limits.rotation_scale),
@@ -427,6 +439,34 @@ class TeleopStateMachine:
             for name in ARM_NAMES
         )
 
+    def _input_deltas(self, packet: dict[str, Any]) -> dict[str, np.ndarray]:
+        return {
+            name: world_frame_delta(
+                self.input_zero[name],
+                pose_matrix(packet["arms"][name]["pose"], self.tip_offsets_m[name]),
+                self.zero_input_to_robot_rotation[name],
+            )
+            for name in ARM_NAMES
+        }
+
+    def _zero_discontinuity(self, input_deltas: dict[str, np.ndarray]) -> str | None:
+        violations: list[str] = []
+        for name, delta in input_deltas.items():
+            distance = float(np.linalg.norm(delta[:3, 3]))
+            angle = rotation_angle(delta[:3, :3])
+            if distance > self.limits.max_zero_translation_m:
+                violations.append(
+                    f"{name} translation {distance:.3f}m>{self.limits.max_zero_translation_m:.3f}m"
+                )
+            if angle > self.limits.max_zero_rotation_rad:
+                violations.append(
+                    f"{name} rotation {math.degrees(angle):.1f}deg"
+                    f">{math.degrees(self.limits.max_zero_rotation_rad):.1f}deg"
+                )
+        if not violations:
+            return None
+        return "tracking frame changed after ZERO (" + "; ".join(violations) + "); tap ZERO again"
+
     def step(
         self,
         packet: dict[str, Any],
@@ -486,6 +526,7 @@ class TeleopStateMachine:
             self.filtered_deltas = {name: np.eye(4, dtype=np.float64) for name in ARM_NAMES}
             self._last_filter_at = now_s
 
+        input_deltas: dict[str, np.ndarray] | None = None
         if toggle_changed:
             if not packet["requested_enabled"]:
                 self.disarm("enable toggled off")
@@ -496,8 +537,13 @@ class TeleopStateMachine:
             elif self.limits.require_width_to_arm and not self._fresh_widths(packet):
                 self.disarm("enable rejected: ArUco width stale")
             else:
-                self.armed = True
-                self.reason = "enabled"
+                input_deltas = self._input_deltas(packet)
+                discontinuity = self._zero_discontinuity(input_deltas)
+                if discontinuity is not None:
+                    self.invalidate_zero(discontinuity)
+                else:
+                    self.armed = True
+                    self.reason = "enabled"
 
         if not self.armed:
             return StepResult(False, self.zeroed, zero_captured=zero_captured, reason=self.reason)
@@ -507,6 +553,13 @@ class TeleopStateMachine:
         if self.limits.require_width_to_arm and not self._fresh_widths(packet):
             self.disarm("Pi camera or ArUco width stale; re-enable after recovery")
             return StepResult(False, self.zeroed, reason=self.reason)
+
+        if input_deltas is None:
+            input_deltas = self._input_deltas(packet)
+        discontinuity = self._zero_discontinuity(input_deltas)
+        if discontinuity is not None:
+            self.invalidate_zero(discontinuity)
+            return StepResult(False, False, reason=self.reason)
 
         dt = 0.0 if self._last_filter_at is None else max(0.0, now_s - self._last_filter_at)
         self._last_filter_at = now_s
@@ -521,14 +574,10 @@ class TeleopStateMachine:
 
         targets: dict[str, np.ndarray] = {}
         grippers: dict[str, float | None] = {}
-        input_deltas: dict[str, np.ndarray] = {}
         command_deltas: dict[str, np.ndarray] = {}
         envelope_clamps: dict[str, tuple[str, ...]] = {}
         for name in ARM_NAMES:
-            current = pose_matrix(packet["arms"][name]["pose"], self.tip_offsets_m[name])
-            delta = world_frame_delta(
-                self.input_zero[name], current, self.zero_input_to_robot_rotation[name]
-            )
+            delta = input_deltas[name]
             command_delta = delta.copy()
             translation = command_delta[:3, 3]
             translation_norm = float(np.linalg.norm(translation))
@@ -579,7 +628,6 @@ class TeleopStateMachine:
             target[:3, 3] += command_delta[:3, 3] * self.limits.position_scale
             target[:3, :3] = command_delta[:3, :3] @ target[:3, :3]
             targets[name] = target
-            input_deltas[name] = delta
             command_deltas[name] = command_delta
             arm = packet["arms"][name]
             if arm["width_mm"] is None or arm["width_age_s"] > self.limits.max_width_age_s:

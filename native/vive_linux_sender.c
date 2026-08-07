@@ -32,9 +32,16 @@ typedef struct {
     SurviveObject *object;
     bool connected;
     bool configured;
+    bool reacquiring;
+    bool has_candidate;
     uint64_t last_valid_monotonic_ns;
+    uint64_t continuity_id;
+    uint64_t rejected_pose_count;
     survive_long_timecode timecode;
+    survive_long_timecode candidate_timecode;
+    survive_long_timecode reacquire_start_timecode;
     SurvivePose pose;
+    SurvivePose candidate_pose;
 } ObjectState;
 
 typedef struct {
@@ -44,6 +51,9 @@ typedef struct {
     double rate_hz;
     double max_pose_age_s;
     double max_optical_age_s;
+    double max_linear_speed_m_s;
+    double max_angular_speed_rad_s;
+    double reacquire_s;
     bool calibrate;
     bool self_test;
 } Options;
@@ -143,6 +153,75 @@ static bool pose_is_valid(const SurvivePose *pose, survive_long_timecode timecod
            quaternion_norm <= 1.01;
 }
 
+static double quaternion_angle_rad(const SurvivePose *left, const SurvivePose *right) {
+    double left_norm_squared = 0.0;
+    double right_norm_squared = 0.0;
+    double dot = 0.0;
+    for (size_t index = 0; index < 4; ++index) {
+        left_norm_squared += left->Rot[index] * left->Rot[index];
+        right_norm_squared += right->Rot[index] * right->Rot[index];
+        dot += left->Rot[index] * right->Rot[index];
+    }
+    double denominator = sqrt(left_norm_squared * right_norm_squared);
+    if (!isfinite(denominator) || denominator <= 0.0) {
+        return INFINITY;
+    }
+    double normalized_dot = fabs(dot / denominator);
+    normalized_dot = fmin(1.0, fmax(0.0, normalized_dot));
+    return 2.0 * acos(normalized_dot);
+}
+
+static bool pose_step_is_plausible(const SurvivePose *previous,
+                                   survive_long_timecode previous_timecode,
+                                   const SurvivePose *current,
+                                   survive_long_timecode current_timecode, int32_t timebase_hz,
+                                   double *linear_speed_m_s,
+                                   double *angular_speed_rad_s) {
+    *linear_speed_m_s = INFINITY;
+    *angular_speed_rad_s = INFINITY;
+    if (timebase_hz <= 0 || current_timecode <= previous_timecode) {
+        return false;
+    }
+    double delta_s = (double)(current_timecode - previous_timecode) / (double)timebase_hz;
+    if (!isfinite(delta_s) || delta_s <= 0.0 || delta_s > options.max_pose_age_s) {
+        return false;
+    }
+    double distance_squared = 0.0;
+    for (size_t index = 0; index < 3; ++index) {
+        double delta = current->Pos[index] - previous->Pos[index];
+        distance_squared += delta * delta;
+    }
+    *linear_speed_m_s = sqrt(distance_squared) / delta_s;
+    *angular_speed_rad_s = quaternion_angle_rad(previous, current) / delta_s;
+    return isfinite(*linear_speed_m_s) && isfinite(*angular_speed_rad_s) &&
+           *linear_speed_m_s <= options.max_linear_speed_m_s &&
+           *angular_speed_rad_s <= options.max_angular_speed_rad_s;
+}
+
+static void begin_reacquisition(ObjectState *state, const char *serial, const char *reason,
+                                double linear_speed_m_s, double angular_speed_rad_s) {
+    if (!state->reacquiring) {
+        state->continuity_id++;
+        fprintf(stderr,
+                "Vive tracker %s continuity lost (%s, linear=%.3fm/s angular=%.1fdeg/s); "
+                "publishing invalid until %.0fms stable\n",
+                serial, reason, linear_speed_m_s, angular_speed_rad_s * 180.0 / acos(-1.0),
+                options.reacquire_s * 1000.0);
+    }
+    state->reacquiring = true;
+    state->has_candidate = false;
+    state->last_valid_monotonic_ns = 0;
+    state->rejected_pose_count++;
+}
+
+static void set_reacquisition_candidate(ObjectState *state, survive_long_timecode timecode,
+                                        const SurvivePose *pose) {
+    state->candidate_pose = *pose;
+    state->candidate_timecode = timecode;
+    state->reacquire_start_timecode = timecode;
+    state->has_candidate = true;
+}
+
 static bool append_format(char **cursor, size_t *remaining, const char *format, ...) {
     va_list arguments;
     va_start(arguments, format);
@@ -202,7 +281,7 @@ static size_t build_packet(char *buffer, size_t capacity, uint64_t now_monotonic
             pose_age_s = (double)(now_monotonic_ns - state->last_valid_monotonic_ns) /
                          1000000000.0;
         }
-        bool valid = state->connected && isfinite(pose_age_s) &&
+        bool valid = state->connected && !state->reacquiring && isfinite(pose_age_s) &&
                      pose_age_s <= options.max_pose_age_s;
         double quaternion_norm = 0.0;
         valid = valid && finite_pose(&state->pose, &quaternion_norm) &&
@@ -215,7 +294,13 @@ static size_t build_packet(char *buffer, size_t capacity, uint64_t now_monotonic
         first = false;
         if (!append_format(&cursor, &remaining, "{\"serial\":") ||
             !append_json_string(&cursor, &remaining, state->object->serial_number) ||
-            !append_format(&cursor, &remaining, ",\"valid\":%s", valid ? "true" : "false")) {
+            !append_format(&cursor, &remaining,
+                           ",\"valid\":%s,\"continuity_id\":%llu,\"rejected_poses\":%llu,"
+                           "\"timebase_hz\":%d",
+                           valid ? "true" : "false",
+                           (unsigned long long)state->continuity_id,
+                           (unsigned long long)state->rejected_pose_count,
+                           state->object->timebase_hz)) {
             pthread_mutex_unlock(&state_mutex);
             return 0;
         }
@@ -308,6 +393,10 @@ static void disconnect_process(SurviveObject *object) {
     if (state != NULL) {
         state->connected = false;
         state->last_valid_monotonic_ns = 0;
+        if (state->configured && keep_running) {
+            begin_reacquisition(state, object->serial_number, "device disconnected", INFINITY,
+                                INFINITY);
+        }
     }
     pthread_mutex_unlock(&state_mutex);
     survive_default_disconnect_process(object);
@@ -341,9 +430,60 @@ static void pose_process(SurviveObject *object, survive_long_timecode timecode,
     if (state != NULL) {
         state->connected = true;
         state->configured = stable_tracker_serial(object);
-        state->last_valid_monotonic_ns = clock_ns(CLOCK_MONOTONIC);
-        state->timecode = timecode;
-        state->pose = *pose;
+        if (!state->configured) {
+            pthread_mutex_unlock(&state_mutex);
+            return;
+        }
+
+        if (state->last_valid_monotonic_ns == 0 && !state->reacquiring) {
+            begin_reacquisition(state, object->serial_number, "initial acquisition", 0.0, 0.0);
+        }
+
+        if (state->reacquiring) {
+            if (!state->has_candidate) {
+                set_reacquisition_candidate(state, timecode, pose);
+            } else {
+                double linear_speed_m_s = INFINITY;
+                double angular_speed_rad_s = INFINITY;
+                bool plausible = pose_step_is_plausible(
+                    &state->candidate_pose, state->candidate_timecode, pose, timecode,
+                    object->timebase_hz, &linear_speed_m_s, &angular_speed_rad_s);
+                if (!plausible) {
+                    state->rejected_pose_count++;
+                    set_reacquisition_candidate(state, timecode, pose);
+                } else {
+                    state->candidate_pose = *pose;
+                    state->candidate_timecode = timecode;
+                    double stable_s =
+                        (double)(timecode - state->reacquire_start_timecode) /
+                        (double)object->timebase_hz;
+                    if (stable_s >= options.reacquire_s) {
+                        state->pose = state->candidate_pose;
+                        state->timecode = state->candidate_timecode;
+                        state->last_valid_monotonic_ns = clock_ns(CLOCK_MONOTONIC);
+                        state->reacquiring = false;
+                        state->has_candidate = false;
+                        fprintf(stderr, "Vive tracker %s continuity reacquired after %.0fms\n",
+                                object->serial_number, stable_s * 1000.0);
+                    }
+                }
+            }
+        } else {
+            double linear_speed_m_s = INFINITY;
+            double angular_speed_rad_s = INFINITY;
+            bool plausible = pose_step_is_plausible(
+                &state->pose, state->timecode, pose, timecode, object->timebase_hz,
+                &linear_speed_m_s, &angular_speed_rad_s);
+            if (!plausible) {
+                begin_reacquisition(state, object->serial_number, "impossible pose step",
+                                    linear_speed_m_s, angular_speed_rad_s);
+                set_reacquisition_candidate(state, timecode, pose);
+            } else {
+                state->last_valid_monotonic_ns = clock_ns(CLOCK_MONOTONIC);
+                state->timecode = timecode;
+                state->pose = *pose;
+            }
+        }
     }
     pthread_mutex_unlock(&state_mutex);
 }
@@ -425,6 +565,9 @@ static void print_usage(FILE *stream, const char *program) {
             "  --rate-hz HZ                Packet rate, 1-240 (default 60)\n"
             "  --max-pose-age-ms MS        Hold last optically valid pose this long (default 200)\n"
             "  --max-optical-age-ms MS     Reject poses older than this optically (default 200)\n"
+            "  --max-linear-speed-m-s MPS  Reject faster position steps (default 8)\n"
+            "  --max-angular-speed-deg-s D Reject faster orientation steps (default 1440)\n"
+            "  --reacquire-ms MS           Stable tracking required after rejection (default 250)\n"
             "  --config-dir PATH           Isolated XDG config root\n"
             "  --calibrate                 Run libsurvive's native Lighthouse solver\n"
             "  --self-test                 Run deterministic validity tests and exit\n"
@@ -461,6 +604,9 @@ static int parse_options(int argc, char **argv) {
     options.rate_hz = 60.0;
     options.max_pose_age_s = 0.2;
     options.max_optical_age_s = 0.2;
+    options.max_linear_speed_m_s = 8.0;
+    options.max_angular_speed_rad_s = 1440.0 * acos(-1.0) / 180.0;
+    options.reacquire_s = 0.25;
 
     enum {
         OPTION_TARGET_HOST = 1000,
@@ -468,6 +614,9 @@ static int parse_options(int argc, char **argv) {
         OPTION_RATE_HZ,
         OPTION_MAX_POSE_AGE_MS,
         OPTION_MAX_OPTICAL_AGE_MS,
+        OPTION_MAX_LINEAR_SPEED_M_S,
+        OPTION_MAX_ANGULAR_SPEED_DEG_S,
+        OPTION_REACQUIRE_MS,
         OPTION_CONFIG_DIR,
         OPTION_CALIBRATE,
         OPTION_SELF_TEST,
@@ -478,6 +627,9 @@ static int parse_options(int argc, char **argv) {
         {"rate-hz", required_argument, NULL, OPTION_RATE_HZ},
         {"max-pose-age-ms", required_argument, NULL, OPTION_MAX_POSE_AGE_MS},
         {"max-optical-age-ms", required_argument, NULL, OPTION_MAX_OPTICAL_AGE_MS},
+        {"max-linear-speed-m-s", required_argument, NULL, OPTION_MAX_LINEAR_SPEED_M_S},
+        {"max-angular-speed-deg-s", required_argument, NULL, OPTION_MAX_ANGULAR_SPEED_DEG_S},
+        {"reacquire-ms", required_argument, NULL, OPTION_REACQUIRE_MS},
         {"config-dir", required_argument, NULL, OPTION_CONFIG_DIR},
         {"calibrate", no_argument, NULL, OPTION_CALIBRATE},
         {"self-test", no_argument, NULL, OPTION_SELF_TEST},
@@ -522,6 +674,27 @@ static int parse_options(int argc, char **argv) {
             }
             options.max_optical_age_s = value / 1000.0;
             break;
+        case OPTION_MAX_LINEAR_SPEED_M_S:
+            value = parse_positive(optarg);
+            if (value < 0.1 || value > 100.0) {
+                return -1;
+            }
+            options.max_linear_speed_m_s = value;
+            break;
+        case OPTION_MAX_ANGULAR_SPEED_DEG_S:
+            value = parse_positive(optarg);
+            if (value < 10.0 || value > 10000.0) {
+                return -1;
+            }
+            options.max_angular_speed_rad_s = value * acos(-1.0) / 180.0;
+            break;
+        case OPTION_REACQUIRE_MS:
+            value = parse_positive(optarg);
+            if (value < 10.0 || value > 5000.0) {
+                return -1;
+            }
+            options.reacquire_s = value / 1000.0;
+            break;
         case OPTION_CONFIG_DIR:
             if (snprintf(options.config_dir, sizeof(options.config_dir), "%s", optarg) >=
                 (int)sizeof(options.config_dir)) {
@@ -546,6 +719,9 @@ static int parse_options(int argc, char **argv) {
 
 static int run_self_tests(void) {
     options.max_optical_age_s = 0.2;
+    options.max_pose_age_s = 0.2;
+    options.max_linear_speed_m_s = 8.0;
+    options.max_angular_speed_rad_s = 1440.0 * acos(-1.0) / 180.0;
     SurvivePose pose = {.Pos = {1.0, 2.0, 3.0}, .Rot = {1.0, 0.0, 0.0, 0.0}};
     survive_long_timecode now = 48000000;
     int failures = 0;
@@ -564,6 +740,30 @@ static int run_self_tests(void) {
     pose.Rot[0] = 1.0;
     pose.Pos[1] = NAN;
     CHECK(!pose_is_valid(&pose, now, now - 480000, 48000000, 1.0));
+    pose.Pos[1] = 2.0;
+    SurvivePose moved = pose;
+    moved.Pos[0] += 0.04;
+    double linear_speed_m_s = 0.0;
+    double angular_speed_rad_s = 0.0;
+    CHECK(pose_step_is_plausible(&pose, now, &moved, now + 480000, 48000000,
+                                 &linear_speed_m_s, &angular_speed_rad_s));
+    CHECK(fabs(linear_speed_m_s - 4.0) < 1e-9);
+    moved.Pos[0] = pose.Pos[0] + 0.2;
+    CHECK(!pose_step_is_plausible(&pose, now, &moved, now + 480000, 48000000,
+                                  &linear_speed_m_s, &angular_speed_rad_s));
+    moved = pose;
+    double half_angle = 5.0 * acos(-1.0) / 180.0;
+    moved.Rot[0] = cos(half_angle);
+    moved.Rot[3] = sin(half_angle);
+    CHECK(pose_step_is_plausible(&pose, now, &moved, now + 480000, 48000000,
+                                 &linear_speed_m_s, &angular_speed_rad_s));
+    half_angle = 15.0 * acos(-1.0) / 180.0;
+    moved.Rot[0] = cos(half_angle);
+    moved.Rot[3] = sin(half_angle);
+    CHECK(!pose_step_is_plausible(&pose, now, &moved, now + 480000, 48000000,
+                                  &linear_speed_m_s, &angular_speed_rad_s));
+    CHECK(!pose_step_is_plausible(&pose, now, &pose, now, 48000000, &linear_speed_m_s,
+                                  &angular_speed_rad_s));
 #undef CHECK
     if (failures == 0) {
         puts("umi-vive-linux self-test: PASS");

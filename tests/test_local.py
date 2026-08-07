@@ -44,6 +44,11 @@ def test_physical_local_launcher_uses_pi_grippers_and_gpio(monkeypatch):
     assert "--quiet" in commands["controller"]
     assert commands["controller"][commands["controller"].index("--position-scale") + 1] == "2"
     assert commands["tracking"][commands["tracking"].index("--rate-hz") + 1] == "120"
+    assert commands["tracking"][commands["tracking"].index("--max-linear-speed-m-s") + 1] == "8"
+    assert (
+        commands["tracking"][commands["tracking"].index("--max-angular-speed-deg-s") + 1] == "1440"
+    )
+    assert commands["tracking"][commands["tracking"].index("--reacquire-ms") + 1] == "250"
     assert commands["source"][commands["source"].index("--send-hz") + 1] == "120"
     assert commands["controller"][commands["controller"].index("--max-joint-speed") + 1] == "1"
     assert commands["controller"][commands["controller"].index("--hz") + 1] == "100"
@@ -53,6 +58,12 @@ def test_physical_local_launcher_uses_pi_grippers_and_gpio(monkeypatch):
     assert local.DEFAULT_RIGHT_CAN in commands["controller"]
     assert "--rotation-scale" in commands["controller"]
     assert "--max-joint-acceleration" in commands["controller"]
+    assert (
+        commands["controller"][commands["controller"].index("--max-zero-translation") + 1] == "0.75"
+    )
+    assert (
+        commands["controller"][commands["controller"].index("--max-zero-rotation-deg") + 1] == "150"
+    )
     assert not any(value.startswith("--dataset") for value in commands["controller"])
 
 
@@ -80,6 +91,13 @@ def test_simulated_launcher_never_passes_can_or_clear_confirmation(monkeypatch):
     assert "--simulate" in controller
     assert "--confirm-clear" not in controller
     assert not any("adapter-serial" in value for value in controller)
+    simulated_tracking = replace(local.TrackingArgs(), simulate=True)
+    tracking = local.build_commands(
+        local.Config(simulate=True, tracking=simulated_tracking), Path("/venv/bin")
+    )["tracking"]
+    assert "--max-linear-speed-m-s" not in tracking
+    assert "--max-angular-speed-deg-s" not in tracking
+    assert "--reacquire-ms" not in tracking
 
 
 @pytest.mark.parametrize(
@@ -90,6 +108,9 @@ def test_simulated_launcher_never_passes_can_or_clear_confirmation(monkeypatch):
         ("tracking", "rate_hz", 241.0, "tracking rate"),
         ("tracking", "fusion_hz", 241.0, "fusion rate"),
         ("control", "controller_hz", 121.0, "controller rate"),
+        ("tracking", "max_linear_speed_m_s", 100.1, "tracking linear speed"),
+        ("tracking", "reacquire_ms", 5.0, "tracking reacquisition"),
+        ("control", "max_zero_translation_m", 2.1, "ZERO residual translation"),
     ],
 )
 def test_launcher_rejects_unsafe_performance_values(monkeypatch, group, field, value, message):
@@ -99,3 +120,84 @@ def test_launcher_rejects_unsafe_performance_values(monkeypatch, group, field, v
 
     with pytest.raises(ValueError, match=message):
         local.build_commands(config, Path("/venv/bin"))
+
+
+class PollSequence:
+    def __init__(self, *statuses):
+        self.statuses = list(statuses)
+
+    def poll(self):
+        if len(self.statuses) > 1:
+            return self.statuses.pop(0)
+        return self.statuses[0]
+
+
+class FakeProcess:
+    def __init__(self, status):
+        self.status = status
+
+    def poll(self):
+        return self.status
+
+    def send_signal(self, _signal):
+        self.status = 0
+
+    def terminate(self):
+        self.status = 0
+
+    def kill(self):
+        self.status = 0
+
+    def wait(self, timeout=None):
+        del timeout
+        return self.status
+
+
+def test_coordinated_gpio_shutdown_accepts_clean_source_and_controller_exit(monkeypatch):
+    monkeypatch.setattr(local.time, "sleep", lambda _seconds: None)
+    processes = [
+        ("tracking", PollSequence(None)),
+        ("source", PollSequence(0)),
+        ("controller", PollSequence(None, 0)),
+    ]
+
+    assert local.coordinated_shutdown_status(processes) == 0
+
+
+def test_launcher_returns_success_for_coordinated_gpio_quit(monkeypatch):
+    commands = {
+        "tracking": [local.sys.executable, "tracking"],
+        "source": [local.sys.executable, "source"],
+        "controller": [local.sys.executable, "controller"],
+    }
+    processes = {
+        "tracking": FakeProcess(None),
+        "source": FakeProcess(0),
+        "controller": FakeProcess(0),
+    }
+    monkeypatch.setattr(local, "build_commands", lambda _args: commands)
+
+    result = local.run(local.Config(simulate=True), popen=lambda command: processes[command[1]])
+
+    assert result == 0
+    assert processes["tracking"].poll() == 0
+
+
+def test_coordinated_gpio_shutdown_propagates_child_failure():
+    processes = [
+        ("tracking", PollSequence(None)),
+        ("source", PollSequence(0)),
+        ("controller", PollSequence(3)),
+    ]
+
+    assert local.coordinated_shutdown_status(processes) == 3
+
+
+def test_single_clean_child_exit_is_still_unexpected():
+    processes = [
+        ("tracking", PollSequence(None)),
+        ("source", PollSequence(0)),
+        ("controller", PollSequence(None)),
+    ]
+
+    assert local.coordinated_shutdown_status(processes, timeout_s=0.0) is None

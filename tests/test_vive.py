@@ -55,18 +55,21 @@ def test_libsurvive_packet_preserves_pose_age_and_explicit_invalidation():
             {
                 "serial": "LEFT",
                 "valid": True,
+                "continuity_id": 7,
                 "pose_age_s": 0.075,
                 "pos": [1, 2, 3],
                 "quat": [1, 0, 0, 0],
             },
-            {"serial": "RIGHT", "valid": False},
+            {"serial": "RIGHT", "valid": False, "continuity_id": 8},
         ],
     }
 
     updates = tracker_updates(packet)
 
     assert updates["LEFT"].sample_age_s == pytest.approx(0.075)
+    assert updates["LEFT"].continuity_id == 7
     assert updates["RIGHT"].pose is None
+    assert updates["RIGHT"].continuity_id == 8
     assert updates["LEFT"].pose is not None
     expected = libsurvive_pose_to_ros([1, 2, 3], [1, 0, 0, 0])
     np.testing.assert_allclose(updates["LEFT"].pose[0], expected[0])
@@ -76,6 +79,22 @@ def test_libsurvive_packet_preserves_pose_age_and_explicit_invalidation():
 def test_unknown_vive_packet_frame_is_rejected():
     with pytest.raises(ValueError, match="unsupported Vive packet frame"):
         tracker_updates({"frame": "mystery", "trackers": []})
+
+
+@pytest.mark.parametrize("value", [-1, 1.5, True, "1"])
+def test_invalid_continuity_id_is_rejected(value):
+    with pytest.raises(ValueError, match="continuity_id"):
+        tracker_updates(
+            {
+                "trackers": [
+                    {
+                        "serial": "A",
+                        "valid": False,
+                        "continuity_id": value,
+                    }
+                ]
+            }
+        )
 
 
 def test_parse_trackers_returns_all_valid_and_skips_invalid():

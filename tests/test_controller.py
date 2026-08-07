@@ -95,6 +95,8 @@ def test_automatic_startup_motion_is_opt_in() -> None:
     [
         (TeleopLimits(max_translation_m=-0.1), "max translation"),
         (TeleopLimits(max_rotation_rad=math.pi + 0.01), "max rotation"),
+        (TeleopLimits(max_zero_translation_m=0.0), "ZERO residual translation"),
+        (TeleopLimits(max_zero_rotation_rad=math.pi + 0.01), "ZERO residual rotation"),
     ],
 )
 def test_invalid_motion_envelopes_are_rejected(limits, message):
@@ -394,7 +396,7 @@ def test_fixed_basis_maps_world_translation_and_rotation_about_robot_base_axes()
 def test_tip_offset_accounts_for_rotation_pivot():
     m = TeleopStateMachine(
         {"left": GripperMap(0, 1), "right": GripperMap(0, 1)},
-        TeleopLimits(max_translation_m=2.0),
+        TeleopLimits(max_translation_m=2.0, max_zero_translation_m=2.0),
         tip_offsets_m={"left": np.array([1.0, 0.0, 0.0]), "right": np.zeros(3)},
     )
     step(m, packet(width=0.5))
@@ -424,6 +426,49 @@ def test_stale_packet_or_pose_disarms_without_automatic_rearm():
     # Fresh data with the same toggle counter cannot silently re-arm.
     assert not step(m, packet(seq=4, enabled=True, zero=1, toggle=1)).armed
     assert step(m, packet(seq=5, enabled=True, zero=1, toggle=2)).armed
+
+
+def test_enable_invalidates_zero_after_impossible_tracker_translation():
+    m = machine(max_zero_translation_m=0.75)
+    step(m, packet())
+    assert step(m, packet(seq=1, zero=1)).zeroed
+
+    result = step(
+        m,
+        packet(
+            seq=2,
+            enabled=True,
+            zero=1,
+            toggle=1,
+            left_pose=[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        ),
+    )
+
+    assert not result.armed and not result.zeroed and result.targets is None
+    assert "tracking frame changed after ZERO" in result.reason
+    assert "left translation 1.000m>0.750m" in result.reason
+
+
+def test_impossible_tracker_rotation_while_armed_invalidates_zero():
+    m = machine(max_zero_rotation_rad=math.radians(150.0))
+    step(m, packet())
+    assert step(m, packet(seq=1, zero=1)).zeroed
+    assert step(m, packet(seq=2, enabled=True, zero=1, toggle=1)).armed
+    half_angle = math.radians(170.0) / 2.0
+
+    result = step(
+        m,
+        packet(
+            seq=3,
+            enabled=True,
+            zero=1,
+            toggle=1,
+            right_pose=[0.0, 0.0, 0.0, 0.0, 0.0, math.sin(half_angle), math.cos(half_angle)],
+        ),
+    )
+
+    assert not result.armed and not result.zeroed and result.targets is None
+    assert "right rotation 170.0deg>150.0deg" in result.reason
 
 
 def test_session_change_and_cancel_disarm():
