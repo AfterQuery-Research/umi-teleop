@@ -342,7 +342,7 @@ def test_production_yam_loop_records_final_dispatched_simulated_actions(
 
     recorder = create_dataset_recorder(
         dataset_config,
-        30.0,
+        100.0,
         dataset_factory=make_dataset,
         camera_factory=lambda _config: cameras,
     )
@@ -370,6 +370,7 @@ def test_production_yam_loop_records_final_dispatched_simulated_actions(
             port=port,
             move_to_base=True,
             base_joint_speed=100.0,
+            hz=100.0,
             simulate=True,
             synchronous_ik=synchronous_ik,
             stream_timeout=2.0,

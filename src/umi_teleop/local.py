@@ -116,6 +116,12 @@ class RobotArgs:
     right_input_width_mm: tuple[float, float] = (40.128507, 122.685643)
     """Measured right UMI gripper widths mapped to closed/open robot commands."""
 
+    move_to_ready: bool = False
+    """Explicitly move both arms to the unrecorded bent IK-ready pose during startup."""
+
+    ready_joint_speed: float = 0.10
+    """Maximum joint speed in rad/s for the explicitly requested startup motion."""
+
 
 @dataclass(frozen=True)
 class ControlArgs:
@@ -166,8 +172,8 @@ class ControlArgs:
     max_zero_rotation_deg: float = 150.0
     """Raw tracker rotation from ZERO that invalidates the captured ZERO."""
 
-    synchronous_ik: bool = True
-    """Solve IK in the current control cycle; disable for background one-cycle-late IK."""
+    synchronous_ik: bool = False
+    """Solve IK in the current control cycle instead of the default latest-target workers."""
 
     ik_max_iters: int = 40
     """Maximum numerical IK iterations per solve attempt."""
@@ -240,6 +246,7 @@ def validate_args(args: Args) -> None:
         ("rotation scale", args.control.rotation_scale, 0.01, 2.0),
         ("maximum joint speed", args.control.max_joint_speed, 0.01, 2.0),
         ("maximum joint acceleration", args.control.max_joint_acceleration, 0.01, 30.0),
+        ("ready-pose joint speed", args.robot.ready_joint_speed, 0.01, 0.50),
         ("translation filter", args.control.translation_filter_hz, 0.0, 60.0),
         ("rotation filter", args.control.rotation_filter_hz, 0.0, 60.0),
         ("tracking linear speed", args.tracking.max_linear_speed_m_s, 0.1, 100.0),
@@ -315,10 +322,16 @@ def _append_dataset(command: list[str], dataset: DatasetConfig) -> None:
         ("min-episode-frames", dataset.min_episode_frames),
         ("queue-size", dataset.queue_size),
         ("camera-max-age-ms", dataset.camera_max_age_ms),
+        ("max-control-lag-s", dataset.max_control_lag_s),
+        ("control-lag-grace-s", dataset.control_lag_grace_s),
         ("min-free-disk-gb", dataset.min_free_disk_gb),
+        ("image-writer-threads-per-camera", dataset.image_writer_threads_per_camera),
         ("encoder-threads", dataset.encoder_threads),
         ("encoder-queue-size", dataset.encoder_queue_size),
+        ("encoder-gop-size", dataset.encoder_gop_size),
+        ("encoder-preset", dataset.encoder_preset),
         ("video-codec", dataset.video_codec),
+        ("shutdown-timeout-s", dataset.shutdown_timeout_s),
     )
     command.append("--dataset.record")
     for name, value in values:
@@ -469,6 +482,10 @@ def build_commands(args: Args, bin_dir: Path | None = None) -> dict[str, list[st
         )
         if args.confirm_clear:
             commands["controller"].append("--confirm-clear")
+    if args.robot.move_to_ready:
+        commands["controller"].extend(
+            ["--move-to-ready", "--ready-joint-speed", f"{args.robot.ready_joint_speed:g}"]
+        )
     if args.control.synchronous_ik:
         commands["controller"].append("--synchronous-ik")
     if args.preflight_only:
@@ -674,7 +691,8 @@ def run(args: Args, *, popen: Callable[..., Any] = subprocess.Popen) -> int:
         f"Profile: translation={args.control.position_scale:g}x "
         f"rotation={args.control.rotation_scale:g}x "
         f"joint_speed={args.control.max_joint_speed:g}rad/s "
-        f"control={args.control.controller_hz:g}Hz dataset="
+        f"control={args.control.controller_hz:g}Hz "
+        f"ik={'sync' if args.control.synchronous_ik else 'async'} dataset="
         f"{'on' if args.dataset.enabled else 'off'}",
         flush=True,
     )

@@ -11,6 +11,7 @@ import pytest
 import tyro
 
 from umi_teleop import local
+from umi_teleop.dataset import DatasetConfig
 
 
 def test_tyro_parses_nested_runtime_hardware_and_control_arguments(monkeypatch):
@@ -60,7 +61,7 @@ def test_physical_local_launcher_uses_pi_grippers_and_gpio(monkeypatch):
     assert commands["source"][commands["source"].index("--send-hz") + 1] == "120"
     assert commands["controller"][commands["controller"].index("--max-joint-speed") + 1] == "1"
     assert commands["controller"][commands["controller"].index("--hz") + 1] == "100"
-    assert "--synchronous-ik" in commands["controller"]
+    assert "--synchronous-ik" not in commands["controller"]
     assert "--confirm-clear" in commands["controller"]
     assert local.DEFAULT_LEFT_CAN in commands["controller"]
     assert local.DEFAULT_RIGHT_CAN in commands["controller"]
@@ -73,6 +74,62 @@ def test_physical_local_launcher_uses_pi_grippers_and_gpio(monkeypatch):
         commands["controller"][commands["controller"].index("--max-zero-rotation-deg") + 1] == "150"
     )
     assert not any(value.startswith("--dataset") for value in commands["controller"])
+
+
+def test_launcher_can_explicitly_enable_synchronous_ik(monkeypatch):
+    monkeypatch.setattr(local.sys, "platform", "linux")
+    args = replace(
+        local.Args(confirm_clear=True), control=replace(local.ControlArgs(), synchronous_ik=True)
+    )
+
+    commands = local.build_commands(args, Path("/venv/bin"))
+
+    assert "--synchronous-ik" in commands["controller"]
+
+
+def test_launcher_exposes_explicit_unrecorded_ready_motion(monkeypatch):
+    monkeypatch.setattr(local.sys, "platform", "linux")
+    args = replace(
+        local.Args(confirm_clear=True),
+        robot=replace(local.RobotArgs(), move_to_ready=True, ready_joint_speed=0.08),
+    )
+
+    command = local.build_commands(args, Path("/venv/bin"))["controller"]
+
+    assert "--move-to-ready" in command
+    assert command[command.index("--ready-joint-speed") + 1] == "0.08"
+
+
+def test_launcher_forwards_all_advanced_dataset_options(monkeypatch, tmp_path):
+    monkeypatch.setattr(local.sys, "platform", "linux")
+    dataset = DatasetConfig(
+        repo_id="afterquery/forwarded-options",
+        root=tmp_path / "dataset",
+        task="Test forwarding",
+        top_camera_serial="top",
+        left_camera_serial="left",
+        right_camera_serial="right",
+        max_control_lag_s=0.22,
+        control_lag_grace_s=0.88,
+        image_writer_threads_per_camera=3,
+        encoder_gop_size=45,
+        encoder_preset="fast",
+        shutdown_timeout_s=75.0,
+    )
+    args = replace(local.Args(confirm_clear=True), dataset=dataset)
+
+    command = local.build_commands(args, Path("/venv/bin"))["controller"]
+
+    expected = {
+        "--dataset.max-control-lag-s": "0.22",
+        "--dataset.control-lag-grace-s": "0.88",
+        "--dataset.image-writer-threads-per-camera": "3",
+        "--dataset.encoder-gop-size": "45",
+        "--dataset.encoder-preset": "fast",
+        "--dataset.shutdown-timeout-s": "75.0",
+    }
+    for flag, value in expected.items():
+        assert command[command.index(flag) + 1] == value
 
 
 def test_debug_control_is_opt_in_and_passed_only_to_source(monkeypatch):
@@ -128,6 +185,7 @@ def test_simulated_launcher_never_passes_can_or_clear_confirmation(monkeypatch):
     [
         ("control", "position_scale", 3.1, "position scale"),
         ("control", "max_joint_speed", 2.1, "maximum joint speed"),
+        ("robot", "ready_joint_speed", 0.51, "ready-pose joint speed"),
         ("tracking", "rate_hz", 241.0, "tracking rate"),
         ("tracking", "fusion_hz", 241.0, "fusion rate"),
         ("control", "controller_hz", 121.0, "controller rate"),

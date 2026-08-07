@@ -112,10 +112,41 @@ class _PiEventConsumer:
             return False, [Event.CANCEL]
         if changed["zero"]:
             return False, [Event.ZERO]
-        if changed["toggle"] > 1:
-            # The exact ordering was lost during a network gap. Disarm instead of guessing.
+        toggle_count = changed["toggle"]
+        start_count = changed["start"]
+        stop_count = changed["stop"]
+        if toggle_count == 0 and start_count == 0 and stop_count == 0:
+            return False, []
+        if toggle_count != 1 or start_count + stop_count != 1 or start_count > 1 or stop_count > 1:
+            # The exact intent was lost during a network gap. Disarm instead of guessing.
             return False, [Event.CANCEL]
-        return False, [Event.TOGGLE] * changed["toggle"]
+        return False, [Event.START if start_count else Event.STOP]
+
+
+def _pi_widths(
+    packet: dict[str, Any] | None,
+    packet_age_s: float | None,
+    *,
+    heartbeat_timeout_s: float,
+) -> dict[str, dict[str, float | None]]:
+    """Keep a recent valid width through brief tag misses while its camera stays healthy."""
+    packet_fresh = (
+        packet is not None and packet_age_s is not None and packet_age_s <= heartbeat_timeout_s
+    )
+    widths: dict[str, dict[str, float | None]] = {}
+    for name in ARM_NAMES:
+        arm = {} if packet is None else packet["arms"][name]
+        usable = bool(
+            packet_fresh
+            and arm.get("camera_ok")
+            and arm.get("width_mm") is not None
+            and arm.get("width_age_s") is not None
+        )
+        widths[name] = {
+            "width_mm": float(arm["width_mm"]) if usable else None,
+            "age_s": (float(arm["width_age_s"]) + float(packet_age_s) if usable else None),
+        }
+    return widths
 
 
 @dataclass
@@ -436,22 +467,11 @@ def run(cfg: Config) -> None:
                     ),
                 )
             if pi_receiver is not None:
-                widths = {}
-                for name in ARM_NAMES:
-                    arm = {} if pi_packet is None else pi_packet["arms"][name]
-                    usable = bool(
-                        pi_packet is not None
-                        and pi_age is not None
-                        and pi_age <= cfg.pi_heartbeat_timeout_s
-                        and arm.get("camera_ok")
-                        and arm.get("tags_visible")
-                        and arm.get("width_mm") is not None
-                        and arm.get("width_age_s") is not None
-                    )
-                    widths[name] = {
-                        "width_mm": arm.get("width_mm") if usable else None,
-                        "age_s": (float(arm["width_age_s"]) + float(pi_age) if usable else None),
-                    }
+                widths = _pi_widths(
+                    pi_packet,
+                    pi_age,
+                    heartbeat_timeout_s=cfg.pi_heartbeat_timeout_s,
+                )
             else:
                 widths = {
                     name: (

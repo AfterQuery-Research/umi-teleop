@@ -180,7 +180,7 @@ def test_pi_event_consumer_baselines_history_and_preserves_new_safety_events():
 
     packet["events"] = dict(packet["events"], toggle=4, stop=2)
     changed, events = consumer.update(packet)
-    assert not changed and events == [Event.TOGGLE]
+    assert not changed and events == [Event.STOP]
 
     packet["events"] = dict(packet["events"], toggle=5, start=3, cancel=1)
     _changed, events = consumer.update(packet)
@@ -189,6 +189,59 @@ def test_pi_event_consumer_baselines_history_and_preserves_new_safety_events():
     packet["events"] = dict(packet["events"], toggle=7, start=4, stop=3)
     _changed, events = consumer.update(packet)
     assert events == [Event.CANCEL]
+
+
+def test_pi_event_consumer_preserves_stop_intent_after_local_safety_disarm():
+    consumer = source_module._PiEventConsumer()
+    packet = {
+        "session_id": "pi-stop-after-disarm",
+        "events": {
+            "zero": 1,
+            "toggle": 1,
+            "start": 1,
+            "stop": 0,
+            "cancel": 0,
+            "quit": 0,
+        },
+    }
+    assert consumer.update(packet) == (True, [])
+
+    packet["events"] = dict(packet["events"], toggle=2, stop=1)
+    assert consumer.update(packet) == (False, [Event.STOP])
+
+
+def test_pi_widths_retain_recent_measurement_during_brief_tag_miss():
+    arm = {
+        "width_mm": 81.5,
+        "width_age_s": 0.20,
+        "tags_visible": False,
+        "camera_ok": True,
+    }
+    packet = {"arms": {"left": dict(arm), "right": dict(arm)}}
+
+    widths = source_module._pi_widths(packet, 0.03, heartbeat_timeout_s=0.5)
+
+    assert widths == {
+        "left": {"width_mm": 81.5, "age_s": pytest.approx(0.23)},
+        "right": {"width_mm": 81.5, "age_s": pytest.approx(0.23)},
+    }
+
+
+def test_pi_widths_reject_stale_heartbeat_or_unhealthy_camera():
+    arm = {
+        "width_mm": 81.5,
+        "width_age_s": 0.20,
+        "tags_visible": True,
+        "camera_ok": True,
+    }
+    packet = {"arms": {"left": dict(arm), "right": dict(arm, camera_ok=False)}}
+
+    stale = source_module._pi_widths(packet, 0.51, heartbeat_timeout_s=0.5)
+    unhealthy = source_module._pi_widths(packet, 0.03, heartbeat_timeout_s=0.5)
+
+    assert all(value == {"width_mm": None, "age_s": None} for value in stale.values())
+    assert unhealthy["left"]["width_mm"] == 81.5
+    assert unhealthy["right"] == {"width_mm": None, "age_s": None}
 
 
 def test_stale_input_status_names_each_failed_freshness_gate():

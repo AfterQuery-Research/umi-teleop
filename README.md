@@ -183,6 +183,18 @@ cd /home/aq-yam/Documents/Repos/umi-teleop
 .venv/bin/umi-teleop --confirm-clear
 ```
 
+The repository-defined all-zero base pose is a poor Cartesian IK starting posture. If either arm
+is parked there, explicitly request the slow, unrecorded bent startup pose after clearing the full
+workspace:
+
+```bash
+.venv/bin/umi-teleop --robot.move-to-ready --confirm-clear
+```
+
+This motion is never implicit. Without `--robot.move-to-ready`, both arms hold their physical
+starting pose until ZERO and RECORD. The startup move must finish and verify before ZERO can arm
+teleoperation, and dataset recording does not begin until RECORD is tapped afterward.
+
 The current hardware defaults are:
 
 | Role | Runtime identity |
@@ -295,9 +307,11 @@ source .env
   --dataset.private
 ```
 
-The robot loop remains at 100 Hz. The recorder samples synchronized observations and dispatched
-actions at the MolmoAct2-compatible 30 Hz rate and performs resizing, encoding, and disk writes on
-bounded background workers. Stopping holds the current pose by default. Use
+The robot loop remains at 100 Hz. Latest-target IK runs in per-arm background workers by default,
+so a numerical solve cannot stall sensor checks, command interpolation, or the recorder. The
+recorder samples synchronized observations and dispatched actions at the MolmoAct2-compatible 30
+Hz rate and performs resizing, encoding, and disk writes on bounded background workers. Stopping
+holds the current pose by default. Use
 `--dataset.post-episode-action neutral` only when an automatic return is intentionally desired.
 
 Uploads happen after robot control closes. If upload fails, the finalized local dataset remains

@@ -31,20 +31,22 @@ finalized dataset to the Hugging Face Hub.
 ## Episode Contract
 
 - Automatic startup motion is disabled by default. The arms hold their physical starting pose, and
-  a successful `E` enable starts the first episode.
-- The idle wait for ZERO and E is not recorded or padded with duplicate frames.
-- An intentional `E` disable transition commits the active episode.
-- After that commit is queued, both arms automatically return to the all-zero base posture without
-  recording the return. The old Cartesian reference is invalidated, so a new Z is required before
-  the next E enable.
-- Repeated Z/E/disable cycles start and commit additional episodes without restarting the source,
-  controller, cameras, CAN connections, or dataset writer.
-- Passing `--move-to-ready` explicitly performs an unrecorded startup motion. RECORD still starts
-  teleoperation and the first dataset episode together after a valid ZERO.
-- Passing `--move-to-base` explicitly performs an unrecorded startup parking operation.
-- ZERO while armed, CANCEL, source restart, stale telemetry, tracking loss, a configured persistent
-  IK-hold timeout, camera failure, or process shutdown discards the active episode. Ordinary
-  degraded/holding IK remains armed and records the final bounded or held action actually sent.
+  a RECORD tap after a valid ZERO starts teleoperation and the first episode together.
+- The idle wait for ZERO and RECORD is not recorded or padded with duplicate frames.
+- An intentional RECORD stop commits the active episode and holds both arms by default.
+- `--dataset.post-episode-action neutral` explicitly returns both arms to the all-zero base posture
+  after the commit is queued. The return is not recorded, and the old Cartesian reference is
+  invalidated so a new ZERO is required before the next RECORD start.
+- Repeated ZERO/RECORD/stop cycles start and commit additional episodes without restarting the
+  source, controller, cameras, CAN connections, or dataset writer.
+- Passing `--robot.move-to-ready` to the one-command `umi-teleop` launcher (or
+  `--move-to-ready` to `umi-yam` directly) explicitly performs an unrecorded startup motion.
+  RECORD still starts teleoperation and the first dataset episode together after a valid ZERO.
+- Passing `--move-to-base` to `umi-yam` directly performs an unrecorded startup parking operation.
+- ZERO while armed, CANCEL, source restart, stale telemetry, tracking loss, control failure, camera
+  failure, or process shutdown discards the active episode. Ordinary degraded IK remains armed and
+  records the final bounded action actually sent; exhausting the bounded IK fallback search
+  disarms both arms and discards the episode.
 - Episodes shorter than the configured minimum are discarded.
 - A discarded episode must not change the count of saved episodes.
 - Apart from an explicitly requested automatic startup episode, a new episode can start only after
@@ -68,7 +70,7 @@ finalized dataset to the Hugging Face Hub.
 - Require a configurable free-disk reserve before initialization and before each
   episode.
 - Per-arm IK and bounded fallback search run in latest-target background workers. The foreground
-  loop accepts only fresh, validated results, applies its existing joint slew limit at 30 Hz, and
+  loop accepts only fresh, validated results, applies its existing joint slew limit at 100 Hz, and
   holds the last validated goal while a worker is busy.
 - A transient scheduling backlog over the configured timing limit is allowed to recover. Only a
   backlog that remains over the limit for the configured grace period, or a single cycle exceeding
