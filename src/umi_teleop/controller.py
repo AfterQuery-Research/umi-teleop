@@ -151,6 +151,49 @@ def limit_rotation_angle(rotation: np.ndarray, max_angle_rad: float) -> np.ndarr
     )
 
 
+def scale_rotation_angle(rotation: np.ndarray, scale: float) -> np.ndarray:
+    """Scale a proper rotation's angle while preserving its axis."""
+    checked = checked_rotation_matrix(rotation)
+    if not math.isfinite(scale) or scale < 0.0:
+        raise ValueError("rotation scale must be finite and non-negative")
+    angle = rotation_angle(checked)
+    if angle < 1e-12 or scale == 1.0:
+        return checked
+    target_angle = min(math.pi, angle * scale)
+    if scale <= 1.0:
+        return limit_rotation_angle(checked, target_angle)
+    if math.isclose(angle, math.pi, abs_tol=1e-6):
+        eigenvalues, eigenvectors = np.linalg.eig(checked)
+        axis = np.real(eigenvectors[:, int(np.argmin(np.abs(eigenvalues - 1.0)))])
+    else:
+        axis = np.array(
+            [
+                checked[2, 1] - checked[1, 2],
+                checked[0, 2] - checked[2, 0],
+                checked[1, 0] - checked[0, 1],
+            ],
+            dtype=np.float64,
+        ) / (2.0 * math.sin(angle))
+    axis /= np.linalg.norm(axis)
+    x, y, z = axis
+    skew = np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]], dtype=np.float64)
+    return (
+        np.eye(3, dtype=np.float64)
+        + math.sin(target_angle) * skew
+        + (1.0 - math.cos(target_angle)) * (skew @ skew)
+    )
+
+
+def filter_rotation(previous: np.ndarray, target: np.ndarray, alpha: float) -> np.ndarray:
+    """Interpolate from previous to target on SO(3)."""
+    if alpha >= 1.0:
+        return checked_rotation_matrix(target)
+    if alpha <= 0.0:
+        return checked_rotation_matrix(previous)
+    relative = checked_rotation_matrix(target) @ checked_rotation_matrix(previous).T
+    return scale_rotation_angle(relative, alpha) @ previous
+
+
 def checked_rotation_matrix(rotation: np.ndarray, name: str = "rotation") -> np.ndarray:
     """Return a finite, proper 3-D rotation matrix or raise ``ValueError``."""
     out = np.asarray(rotation, dtype=np.float64)
@@ -219,6 +262,11 @@ class TeleopLimits:
     max_translation_m: float = 0.50
     max_rotation_rad: float = math.radians(100.0)
     position_scale: float = 1.0
+    rotation_scale: float = 1.0
+    translation_filter_hz: float = 0.0
+    rotation_filter_hz: float = 0.0
+    translation_deadband_m: float = 0.0
+    rotation_deadband_rad: float = 0.0
     require_width_to_arm: bool = True
 
 
@@ -265,6 +313,20 @@ class TeleopStateMachine:
             or not 0.0 <= self.limits.max_rotation_rad <= math.pi
         ):
             raise ValueError("max rotation must be between zero and pi")
+        for name, value in (
+            ("position scale", self.limits.position_scale),
+            ("rotation scale", self.limits.rotation_scale),
+        ):
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive")
+        for name, value in (
+            ("translation filter", self.limits.translation_filter_hz),
+            ("rotation filter", self.limits.rotation_filter_hz),
+            ("translation deadband", self.limits.translation_deadband_m),
+            ("rotation deadband", self.limits.rotation_deadband_rad),
+        ):
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
         self.tip_offsets_m = {
             name: np.asarray((tip_offsets_m or {}).get(name, np.zeros(3)), dtype=np.float64)
             for name in ARM_NAMES
@@ -291,6 +353,8 @@ class TeleopStateMachine:
         self.input_zero: dict[str, np.ndarray] = {}
         self.robot_zero: dict[str, np.ndarray] = {}
         self.zero_input_to_robot_rotation: dict[str, np.ndarray] = {}
+        self.filtered_deltas: dict[str, np.ndarray] = {}
+        self._last_filter_at: float | None = None
 
     def disarm(self, reason: str) -> None:
         self.armed = False
@@ -301,6 +365,8 @@ class TeleopStateMachine:
         self.input_zero.clear()
         self.robot_zero.clear()
         self.zero_input_to_robot_rotation.clear()
+        self.filtered_deltas.clear()
+        self._last_filter_at = None
         self.zeroed = False
         self.disarm(reason)
 
@@ -319,6 +385,8 @@ class TeleopStateMachine:
         self.input_zero.clear()
         self.robot_zero.clear()
         self.zero_input_to_robot_rotation.clear()
+        self.filtered_deltas.clear()
+        self._last_filter_at = None
         self.disarm("new source session; tap ZERO")
         return StepResult(armed=False, zeroed=False, reason=self.reason)
 
@@ -364,7 +432,9 @@ class TeleopStateMachine:
         packet: dict[str, Any],
         packet_age_s: float,
         current_robot_poses: dict[str, np.ndarray],
+        now_s: float | None = None,
     ) -> StepResult:
+        now_s = time.monotonic() if now_s is None else now_s
         if self.session_id != packet["session_id"]:
             return self._new_session(packet)
         # This check must precede the sequence check: the launcher calls step repeatedly with the
@@ -413,6 +483,8 @@ class TeleopStateMachine:
             self.zero_input_to_robot_rotation = self._zero_frame_rotations()
             self.zeroed = True
             zero_captured = True
+            self.filtered_deltas = {name: np.eye(4, dtype=np.float64) for name in ARM_NAMES}
+            self._last_filter_at = now_s
 
         if toggle_changed:
             if not packet["requested_enabled"]:
@@ -432,6 +504,20 @@ class TeleopStateMachine:
         if not self._fresh_poses(packet):
             self.disarm("Vive tracking stale; re-enable after recovery")
             return StepResult(False, self.zeroed, reason=self.reason)
+        if self.limits.require_width_to_arm and not self._fresh_widths(packet):
+            self.disarm("Pi camera or ArUco width stale; re-enable after recovery")
+            return StepResult(False, self.zeroed, reason=self.reason)
+
+        dt = 0.0 if self._last_filter_at is None else max(0.0, now_s - self._last_filter_at)
+        self._last_filter_at = now_s
+
+        def alpha(cutoff_hz: float) -> float:
+            if cutoff_hz <= 0.0 or dt <= 0.0:
+                return 1.0
+            return 1.0 - math.exp(-2.0 * math.pi * cutoff_hz * dt)
+
+        translation_alpha = alpha(self.limits.translation_filter_hz)
+        rotation_alpha = alpha(self.limits.rotation_filter_hz)
 
         targets: dict[str, np.ndarray] = {}
         grippers: dict[str, float | None] = {}
@@ -444,9 +530,36 @@ class TeleopStateMachine:
                 self.input_zero[name], current, self.zero_input_to_robot_rotation[name]
             )
             command_delta = delta.copy()
+            translation = command_delta[:3, 3]
+            translation_norm = float(np.linalg.norm(translation))
+            if translation_norm <= self.limits.translation_deadband_m:
+                command_delta[:3, 3] = 0.0
+            elif self.limits.translation_deadband_m > 0.0:
+                command_delta[:3, 3] *= (
+                    translation_norm - self.limits.translation_deadband_m
+                ) / translation_norm
+            command_angle = rotation_angle(command_delta[:3, :3])
+            if command_angle <= self.limits.rotation_deadband_rad:
+                command_delta[:3, :3] = np.eye(3, dtype=np.float64)
+            else:
+                active_angle = command_angle - self.limits.rotation_deadband_rad
+                command_delta[:3, :3] = scale_rotation_angle(
+                    command_delta[:3, :3],
+                    active_angle / command_angle * self.limits.rotation_scale,
+                )
+            previous = self.filtered_deltas.get(name, np.eye(4, dtype=np.float64))
+            filtered = np.eye(4, dtype=np.float64)
+            filtered[:3, 3] = previous[:3, 3] + translation_alpha * (
+                command_delta[:3, 3] - previous[:3, 3]
+            )
+            filtered[:3, :3] = filter_rotation(
+                previous[:3, :3], command_delta[:3, :3], rotation_alpha
+            )
+            self.filtered_deltas[name] = filtered
+            command_delta = filtered
             clamp_reasons = []
-            translation_norm = float(np.linalg.norm(delta[:3, 3]))
-            angle = rotation_angle(delta[:3, :3])
+            translation_norm = float(np.linalg.norm(command_delta[:3, 3]))
+            angle = rotation_angle(command_delta[:3, :3])
             if translation_norm > self.limits.max_translation_m:
                 command_delta[:3, 3] *= self.limits.max_translation_m / translation_norm
                 clamp_reasons.append(
@@ -454,7 +567,7 @@ class TeleopStateMachine:
                 )
             if angle > self.limits.max_rotation_rad:
                 command_delta[:3, :3] = limit_rotation_angle(
-                    delta[:3, :3], self.limits.max_rotation_rad
+                    command_delta[:3, :3], self.limits.max_rotation_rad
                 )
                 clamp_reasons.append(
                     f"rotation {math.degrees(angle):.1f}deg"

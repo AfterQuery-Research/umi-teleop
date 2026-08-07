@@ -1,8 +1,8 @@
-"""Small, fail-closed UDP telemetry protocol for UMI-to-YAM teleoperation.
+"""Small, fail-closed fused telemetry protocol for UMI-to-YAM teleoperation.
 
-The Windows SteamVR sender emits raw tracker packets to the UMI Pi.  The Pi owns the two
-gripper cameras and GPIO buttons, so it is the only machine that can assemble a complete
-operator command.  This module keeps that assembly independent of ROS and of the recorder.
+On native Linux, aq-yam fuses local libsurvive poses with Raspberry Pi gripper and GPIO telemetry
+before sending this controller packet over loopback. This module keeps that assembly independent
+of ROS and of the recorder.
 
 Button counters are repeated in every datagram.  A dropped UDP packet therefore cannot lose a
 zero, cancel, or quit request; the YAM controller observes the next counter value instead.
@@ -424,6 +424,9 @@ class WidthWorker:
         self.errors = 0
         self._latest_width: float | None = None
         self._latest_at: float | None = None
+        self._latest_frame_at: float | None = None
+        self._tags_visible = False
+        self._last_error: str | None = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -439,35 +442,78 @@ class WidthWorker:
     def _run(self) -> None:
         next_detection = 0.0
         while not self._stop.is_set():
-            frames = self.camera.read()
+            try:
+                frames = self.camera.read()
+            except Exception as exc:  # noqa: BLE001 - report failure without losing telemetry
+                with self._lock:
+                    self.errors += 1
+                    self._last_error = str(exc)
+                    self._tags_visible = False
+                time.sleep(0.01)
+                continue
             if not frames:
                 time.sleep(0.003)
                 continue
-            self.frames_seen += len(frames)
             now = time.monotonic()
+            with self._lock:
+                self.frames_seen += len(frames)
+                self._latest_frame_at = now
             if now < next_detection:
                 continue
             next_detection = now + self.detect_period_s
             try:
                 width = self.detector.width_mm(frames[-1].image)
-            except Exception:  # noqa: BLE001 - camera processing must not kill telemetry
-                self.errors += 1
+            except Exception as exc:  # noqa: BLE001 - camera processing must not kill telemetry
+                with self._lock:
+                    self.errors += 1
+                    self._last_error = str(exc)
+                    self._tags_visible = False
                 continue
             if width is None or not math.isfinite(float(width)):
-                self.misses += 1
+                with self._lock:
+                    self.misses += 1
+                    self._tags_visible = False
                 continue
             with self._lock:
                 self._latest_width = float(width)
                 self._latest_at = time.monotonic()
                 self.detections += 1
+                self._tags_visible = True
+                self._last_error = None
 
-    def snapshot(self, now: float | None = None) -> dict[str, Any]:
+    def snapshot(
+        self,
+        now: float | None = None,
+        *,
+        camera_timeout_s: float = 0.5,
+    ) -> dict[str, Any]:
         now = time.monotonic() if now is None else now
         with self._lock:
             width, stamp = self._latest_width, self._latest_at
-        if width is None or stamp is None:
-            return {"width_mm": None, "age_s": None}
-        return {"width_mm": width, "age_s": max(0.0, now - stamp)}
+            frame_stamp = self._latest_frame_at
+            status = {
+                "tags_visible": self._tags_visible,
+                "frames_seen": self.frames_seen,
+                "detections": self.detections,
+                "misses": self.misses,
+                "errors": self.errors,
+                "last_error": self._last_error,
+            }
+        frame_age = None if frame_stamp is None else max(0.0, now - frame_stamp)
+        status.update(
+            {
+                "camera_ok": (
+                    self._thread is not None
+                    and self._thread.is_alive()
+                    and frame_age is not None
+                    and frame_age <= camera_timeout_s
+                ),
+                "frame_age_s": frame_age,
+                "width_mm": width,
+                "age_s": None if stamp is None else max(0.0, now - stamp),
+            }
+        )
+        return status
 
     def stop(self) -> None:
         self._stop.set()

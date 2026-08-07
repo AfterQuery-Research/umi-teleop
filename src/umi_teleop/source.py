@@ -1,15 +1,16 @@
-"""Aggregate Vive poses, optional ArUco widths, and controls for the YAM controller.
+"""Fuse local Vive poses with Pi ArUco/GPIO telemetry for the YAM controller.
 
-In the all-local Linux setup it receives native Vive UDP on loopback, reads keyboard controls, and
-emits validated telemetry to ``umi-yam`` on the same host. The legacy Pi setup may also enable its
-two USB cameras and GPIO buttons. This process never opens CAN or commands a robot.
+This internal aq-yam process receives native libsurvive UDP and versioned Pi sensor packets, then
+emits validated controller telemetry over loopback. It never opens CAN or commands a robot.
 """
 
 from __future__ import annotations
 
 import logging
 import socket
+import sys
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -17,6 +18,7 @@ from typing import Any, Literal
 import tyro
 
 from umi_teleop.buttons import GpioButtons, KeyboardButtons
+from umi_teleop.pi_protocol import EVENT_NAMES, PiPacketReceiver
 from umi_teleop.protocol import (
     ARM_NAMES,
     ButtonState,
@@ -41,7 +43,11 @@ class Config:
     """YAM controller UDP port."""
     vive_bind: str = "0.0.0.0"
     vive_port: int = 9001
-    """Windows sender destination port."""
+    """Native libsurvive sender destination port."""
+    pi_bind: str = "0.0.0.0"
+    pi_port: int = 9139
+    pi_expected_host: str | None = "right-umi-vive-teleop.local"
+    pi_heartbeat_timeout_s: float = 0.5
     # Physical convention: UMI1 is the operator's right-side leader; UMI2 is left.
     left_serial: str = "LHR-BBAF093A"
     right_serial: str = "LHR-C891E882"
@@ -65,7 +71,7 @@ class Config:
     button_hold_s: float = 1.0
     zero_settle_s: float = 0.4
     zero_timeout_s: float = 4.0
-    buttons: Literal["gpio", "keyboard"] = "gpio"
+    buttons: Literal["pi", "gpio", "keyboard"] = "pi"
     record_pin: int = 17
     quit_pin: int = 27
     quit_burst_s: float = 0.75
@@ -73,6 +79,40 @@ class Config:
     """Skip gripper cameras and require only fresh Vive poses for ZERO and enable."""
     quiet: bool = False
     """Show only controls, state changes, warnings, and errors."""
+    preflight_only: bool = False
+    preflight_timeout_s: float = 20.0
+
+
+class _PiEventConsumer:
+    """Convert repeated Pi counters into local events without replaying old history."""
+
+    def __init__(self) -> None:
+        self.session_id: str | None = None
+        self.counters = {name: 0 for name in EVENT_NAMES}
+
+    def update(self, packet: dict[str, Any]) -> tuple[bool, list[Event]]:
+        session_changed = packet["session_id"] != self.session_id
+        if session_changed:
+            self.session_id = packet["session_id"]
+            self.counters = dict(packet["events"])
+            return True, []
+
+        changed = {
+            name: max(0, packet["events"][name] - self.counters[name]) for name in EVENT_NAMES
+        }
+        self.counters = {
+            name: max(self.counters[name], packet["events"][name]) for name in EVENT_NAMES
+        }
+        if changed["quit"]:
+            return False, [Event.QUIT]
+        if changed["cancel"]:
+            return False, [Event.CANCEL]
+        if changed["zero"]:
+            return False, [Event.ZERO]
+        if changed["toggle"] > 1:
+            # The exact ordering was lost during a network gap. Disarm instead of guessing.
+            return False, [Event.CANCEL]
+        return False, [Event.TOGGLE] * changed["toggle"]
 
 
 def _calib(path: str) -> Path:
@@ -106,6 +146,8 @@ def run(cfg: Config) -> None:
         or cfg.button_hold_s <= 0
         or cfg.zero_settle_s < 0
         or cfg.zero_timeout_s <= cfg.zero_settle_s
+        or cfg.pi_heartbeat_timeout_s <= 0
+        or cfg.preflight_timeout_s <= 0
     ):
         raise ValueError("rates, age limits, button hold, and enable timing must be positive")
     logging.basicConfig(
@@ -119,8 +161,18 @@ def run(cfg: Config) -> None:
         host=cfg.vive_bind,
         port=cfg.vive_port,
     )
+    pi_receiver = (
+        PiPacketReceiver(
+            cfg.pi_bind,
+            cfg.pi_port,
+            expected_host=cfg.pi_expected_host,
+        )
+        if cfg.buttons == "pi"
+        else None
+    )
+    pi_events = _PiEventConsumer()
     workers: dict[str, WidthWorker] = {}
-    if not cfg.arm_only:
+    if not cfg.arm_only and cfg.buttons != "pi":
         from umi_teleop.camera import LocalGstCamera
         from umi_teleop.gripper import GripperConfig, GripperGeometry, detector_from_config
 
@@ -155,15 +207,15 @@ def run(cfg: Config) -> None:
             )
             for name, camera in cameras.items()
         }
-    buttons = (
-        GpioButtons(
+    buttons = None
+    if cfg.buttons == "gpio":
+        buttons = GpioButtons(
             record_pin=cfg.record_pin,
             quit_pin=cfg.quit_pin,
             hold_s=cfg.button_hold_s,
         )
-        if cfg.buttons == "gpio"
-        else KeyboardButtons()
-    )
+    elif cfg.buttons == "keyboard":
+        buttons = KeyboardButtons()
     state = ButtonState()
     enable_guard = EnableRequestGuard(
         delay_s=cfg.enable_confirm_s,
@@ -179,6 +231,8 @@ def run(cfg: Config) -> None:
     seq = 0
     quit_until: float | None = None
     last_status = 0.0
+    startup_deadline = time.monotonic() + cfg.preflight_timeout_s
+    inputs_ready_once = False
 
     log.info(
         "source session=%s; Vive UDP :%d -> YAM %s:%d; left=%s right=%s arm_only=%s",
@@ -192,9 +246,16 @@ def run(cfg: Config) -> None:
     )
     if cfg.buttons == "keyboard":
         log.info("controls: type Z=ZERO, E=start, S=stop, Q=quit, then Enter")
-    else:
+    elif cfg.buttons == "gpio":
         log.info(
             "controls: record tap=enable/disable, record hold=cancel, quit tap=ZERO, hold=quit"
+        )
+    else:
+        log.info(
+            "controls arrive from Pi %s:%d; record tap=start/stop, record hold=cancel, "
+            "zero tap=ZERO, zero hold=quit",
+            cfg.pi_expected_host or "any host",
+            cfg.pi_port,
         )
 
     try:
@@ -204,7 +265,31 @@ def run(cfg: Config) -> None:
         next_send = time.monotonic()
         while True:
             now = time.monotonic()
-            while not state.quitting and (event := buttons.poll()) is not None:
+            pending_events: list[Event] = []
+            pi_packet = None
+            pi_age = None
+            if pi_receiver is not None:
+                pi_packet, pi_age = pi_receiver.poll()
+                if pi_packet is not None:
+                    session_changed, pending_events = pi_events.update(pi_packet)
+                    if session_changed and inputs_ready_once:
+                        state = ButtonState(session_id=uuid.uuid4().hex)
+                        enable_guard = EnableRequestGuard(
+                            delay_s=cfg.enable_confirm_s,
+                            cooldown_s=cfg.enable_cooldown_s,
+                        )
+                        zero_guard = ZeroRequestGuard(
+                            settle_s=cfg.zero_settle_s,
+                            timeout_s=cfg.zero_timeout_s,
+                        )
+                        log.warning("Pi source restarted; teleoperation zero was invalidated")
+            elif buttons is not None:
+                while (event := buttons.poll()) is not None:
+                    pending_events.append(event)
+
+            for event in pending_events:
+                if state.quitting:
+                    break
                 if event is Event.ZERO:
                     enable_guard.force_block(now)
                     action = zero_guard.request(state, now)
@@ -250,14 +335,32 @@ def run(cfg: Config) -> None:
                         {"left": cfg.left_serial, "right": cfg.right_serial},
                     ),
                 )
-            widths = {
-                name: (
-                    workers[name].snapshot(now)
-                    if name in workers
-                    else {"width_mm": None, "age_s": None}
-                )
-                for name in ARM_NAMES
-            }
+            if pi_receiver is not None:
+                widths = {}
+                for name in ARM_NAMES:
+                    arm = {} if pi_packet is None else pi_packet["arms"][name]
+                    usable = bool(
+                        pi_packet is not None
+                        and pi_age is not None
+                        and pi_age <= cfg.pi_heartbeat_timeout_s
+                        and arm.get("camera_ok")
+                        and arm.get("tags_visible")
+                        and arm.get("width_mm") is not None
+                        and arm.get("width_age_s") is not None
+                    )
+                    widths[name] = {
+                        "width_mm": arm.get("width_mm") if usable else None,
+                        "age_s": (float(arm["width_age_s"]) + float(pi_age) if usable else None),
+                    }
+            else:
+                widths = {
+                    name: (
+                        workers[name].snapshot(now)
+                        if name in workers
+                        else {"width_mm": None, "age_s": None}
+                    )
+                    for name in ARM_NAMES
+                }
             if (zero_action := zero_guard.update(state, now, poses_fresh=poses_fresh)) is not None:
                 if cfg.quiet:
                     print(zero_action, flush=True)
@@ -274,6 +377,16 @@ def run(cfg: Config) -> None:
                 for name in ARM_NAMES
             )
             inputs_fresh = poses_fresh and widths_fresh
+            pi_fresh = pi_receiver is None or (
+                pi_packet is not None
+                and pi_age is not None
+                and pi_age <= cfg.pi_heartbeat_timeout_s
+            )
+            inputs_fresh = inputs_fresh and pi_fresh
+            if state.requested_enabled and not inputs_fresh:
+                state.safety_disarm()
+                enable_guard.force_block(now)
+                log.warning("sensor input stale while enabled; source disarmed")
             if (
                 enable_action := enable_guard.update(
                     state,
@@ -297,6 +410,28 @@ def run(cfg: Config) -> None:
             packet = state.packet(seq, poses, widths)
             sock.sendto(encode_teleop_packet(packet), target)
             seq += 1
+
+            if inputs_fresh:
+                if not inputs_ready_once:
+                    inputs_ready_once = True
+                    print(
+                        "SOURCE PREFLIGHT OK: Vive poses and Pi gripper telemetry are fresh",
+                        flush=True,
+                    )
+                if cfg.preflight_only:
+                    return
+            elif not inputs_ready_once and now >= startup_deadline:
+                missing = []
+                if not poses_fresh:
+                    missing.append("both configured Vive tracker poses")
+                if not pi_fresh:
+                    missing.append("Pi heartbeat")
+                elif not widths_fresh:
+                    missing.append("both Pi cameras and ArUco tag pairs")
+                raise RuntimeError(
+                    f"source preflight timed out after {cfg.preflight_timeout_s:g}s waiting for "
+                    + ", ".join(missing)
+                )
 
             if not cfg.quiet and now - last_status >= 1.0:
                 log.info(
@@ -326,6 +461,8 @@ def run(cfg: Config) -> None:
         close = getattr(buttons, "close", None)
         if callable(close):
             close()
+        if pi_receiver is not None:
+            pi_receiver.close()
         sock.close()
 
 
@@ -334,6 +471,9 @@ def main() -> None:
         run(tyro.cli(Config))
     except KeyboardInterrupt:
         pass
+    except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
+        print(f"SOURCE ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
 
 
 if __name__ == "__main__":

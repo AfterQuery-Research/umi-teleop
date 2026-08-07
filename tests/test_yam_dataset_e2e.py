@@ -186,6 +186,7 @@ def test_production_yam_loop_records_final_dispatched_simulated_actions(
         top_camera_serial="top",
         left_camera_serial="left",
         right_camera_serial="right",
+        post_episode_action="neutral",
         min_episode_frames=2,
         min_free_disk_gb=0.001,
     )

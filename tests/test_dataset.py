@@ -147,6 +147,7 @@ def recorder_fixture(
     config: DatasetConfig | None = None,
     dataset: FakeDataset | None = None,
     camera_mutator: Callable[[dict[str, FakeCamera]], None] | None = None,
+    control_hz: float = 30.0,
 ):
     dataset = dataset or FakeDataset()
     cameras = {name: FakeCamera(index) for index, name in enumerate(CAMERA_NAMES)}
@@ -154,12 +155,23 @@ def recorder_fixture(
         camera_mutator(cameras)
     recorder = create_dataset_recorder(
         config or recording_config(tmp_path),
-        30.0,
+        control_hz,
         dataset_factory=lambda _config, _features: dataset,
         camera_factory=lambda _config: cameras,
     )
     assert recorder is not None
     return recorder, dataset, cameras
+
+
+def test_dataset_sampling_decimates_100_hz_control_to_30_hz(tmp_path) -> None:
+    recorder, _dataset, _cameras = recorder_fixture(tmp_path, control_hz=100.0)
+    recorder.start_episode()
+    decisions = [recorder.should_sample() for _ in range(100)]
+    recorder.finish_episode(commit=False, reason="test")
+    recorder.close()
+
+    assert sum(decisions) == 30
+    assert decisions[0]
 
 
 def add_frame(recorder, measured_offset: float = 0.0, command_offset: float = 0.5) -> None:

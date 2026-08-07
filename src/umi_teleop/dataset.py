@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from queue import Full, Queue
 from threading import Lock, Thread
+from types import SimpleNamespace
 from typing import Any, Literal, Protocol
 
 import numpy as np
@@ -44,6 +45,8 @@ YAM_SCALAR_NAMES = (
 class DatasetConfig:
     """Opt-in LeRobot dataset settings for ``umi-yam``."""
 
+    record: bool = False
+    """Enable dataset recording; a repo ID is still required."""
     repo_id: str | None = None
     root: Path | None = None
     task: str | None = None
@@ -56,6 +59,8 @@ class DatasetConfig:
     resume: bool = False
     push_to_hub: bool = False
     private: bool = True
+    recording_fps: int = DATASET_FPS
+    post_episode_action: Literal["hold", "neutral"] = "hold"
     min_episode_frames: int = 15
     queue_size: int = 300
     camera_max_age_ms: int = 250
@@ -73,7 +78,7 @@ class DatasetConfig:
 
     @property
     def enabled(self) -> bool:
-        return self.repo_id is not None
+        return self.record or self.repo_id is not None
 
     @property
     def camera_serials(self) -> dict[str, str]:
@@ -105,10 +110,16 @@ class DatasetConfig:
             raise DatasetRecordingError("dataset task must be nonempty")
         if sys.version_info < (3, 12):
             raise DatasetRecordingError("dataset recording requires Python 3.12")
-        if not math.isclose(control_hz, DATASET_FPS, rel_tol=0.0, abs_tol=1e-9):
+        if self.recording_fps != DATASET_FPS:
             raise DatasetRecordingError(
-                f"dataset recording requires a {DATASET_FPS} Hz YAM control loop"
+                f"dataset recording frequency must be {DATASET_FPS} Hz for MolmoAct2"
             )
+        if control_hz < self.recording_fps:
+            raise DatasetRecordingError(
+                "YAM control frequency must be at least the dataset recording frequency"
+            )
+        if self.post_episode_action not in ("hold", "neutral"):
+            raise DatasetRecordingError("post-episode action must be hold or neutral")
         if self.side_camera_kind not in ("realsense", "ultrawide"):
             raise DatasetRecordingError(
                 "dataset side camera kind must be realsense or ultrawide, "
@@ -768,6 +779,57 @@ def _default_camera_factory(config: DatasetConfig) -> dict[str, Camera]:
     return cameras
 
 
+def _validate_huggingface_auth() -> None:
+    try:
+        from huggingface_hub import HfApi
+    except ImportError as exc:
+        raise DatasetRecordingError(
+            "Hugging Face upload requires huggingface_hub from the dataset dependencies"
+        ) from exc
+    try:
+        identity = HfApi().whoami()
+    except Exception as exc:
+        raise DatasetRecordingError(
+            "Hugging Face authentication failed; run `hf auth login` or set HF_TOKEN"
+        ) from exc
+    if not isinstance(identity, dict) or not identity.get("name"):
+        raise DatasetRecordingError("Hugging Face authentication returned no user identity")
+
+
+def preflight_dataset(
+    config: DatasetConfig,
+    control_hz: float,
+    *,
+    camera_factory: CameraFactory = _default_camera_factory,
+    auth_validator: Callable[[], None] = _validate_huggingface_auth,
+) -> None:
+    """Validate dataset storage, observation cameras, and optional Hub authentication."""
+    config.validate(control_hz)
+    if not config.enabled:
+        return
+    _check_free_disk(config, SimpleNamespace(root=config.root))
+    cameras: dict[str, Camera] = {}
+    try:
+        cameras = camera_factory(config)
+        if set(cameras) != set(CAMERA_NAMES):
+            raise DatasetRecordingError("camera factory must return top, left, and right")
+        for name, camera in cameras.items():
+            image = camera.read_latest(max_age_ms=config.camera_max_age_ms)
+            _validated_camera_image(name, image, config.camera_shapes[name])
+        if config.push_to_hub:
+            auth_validator()
+    except DatasetRecordingError:
+        raise
+    except Exception as exc:
+        raise DatasetRecordingError(f"dataset preflight failed: {exc}") from exc
+    finally:
+        for camera in reversed(tuple(cameras.values())):
+            try:
+                camera.disconnect()
+            except Exception:
+                pass
+
+
 @dataclass(frozen=True)
 class _FrameOperation:
     frame: dict[str, Any]
@@ -792,6 +854,7 @@ class DatasetRecorder:
         dataset: Dataset,
         cameras: dict[str, Camera],
         upload_validator: Callable[[DatasetConfig, Dataset], None] | None = None,
+        control_hz: float = DATASET_FPS,
     ) -> None:
         self.config = config
         self.dataset = dataset
@@ -803,6 +866,9 @@ class DatasetRecorder:
         self._client_error: BaseException | None = None
         self._active = False
         self._episode_frames = 0
+        self._control_hz = float(control_hz)
+        self._sample_accumulator = 0.0
+        self._sample_started = False
         self._saved_episodes = 0
         self._closed = False
         self._thread = Thread(target=self._write_loop, name="umi-dataset-writer", daemon=True)
@@ -908,7 +974,24 @@ class DatasetRecorder:
         _check_free_disk(self.config, self.dataset)
         self._active = True
         self._episode_frames = 0
+        self._sample_accumulator = 0.0
+        self._sample_started = False
         print(f"DATASET episode started task={self.config.task!r}", flush=True)
+
+    def should_sample(self, now_s: float | None = None) -> bool:
+        """Return true at the fixed dataset rate while the control loop may run faster."""
+        self._check_healthy()
+        if not self._active:
+            return False
+        del now_s
+        if not self._sample_started:
+            self._sample_started = True
+            return True
+        self._sample_accumulator += self.config.recording_fps
+        if self._sample_accumulator + 1e-9 < self._control_hz:
+            return False
+        self._sample_accumulator %= self._control_hz
+        return True
 
     def record_frame(
         self,
@@ -987,6 +1070,8 @@ class DatasetRecorder:
         self._put_nowait(_FinishOperation(commit, frame_count, reason))
         self._active = False
         self._episode_frames = 0
+        self._sample_accumulator = 0.0
+        self._sample_started = False
         disposition = "save queued" if commit else "discard queued"
         print(
             f"DATASET episode {disposition} frames={frame_count} reason={reason}",
@@ -1103,6 +1188,12 @@ class DatasetRecorder:
             try:
                 self.dataset.push_to_hub(private=self.config.private)
             except BaseException as exc:
+                print(
+                    "DATASET upload failed; the finalized local dataset was preserved. "
+                    f"Retry with: umi-dataset-upload --repo-id {self.config.repo_id} "
+                    f"--root {getattr(self.dataset, 'root', self.config.root)}",
+                    flush=True,
+                )
                 close_errors.append(exc)
         elif upload and self.config.push_to_hub and not close_errors:
             print("DATASET upload skipped because no new episodes were saved", flush=True)
@@ -1162,7 +1253,7 @@ def create_dataset_recorder(
         upload_validator = (
             _default_upload_validator if dataset_factory is _default_dataset_factory else None
         )
-        return DatasetRecorder(config, dataset, cameras, upload_validator)
+        return DatasetRecorder(config, dataset, cameras, upload_validator, control_hz)
     except Exception as exc:
         for camera in reversed(tuple(cameras.values())):
             try:
@@ -1192,7 +1283,7 @@ def prepare_dataset_step(
     """Capture a pre-command observation for one motor-loop result."""
     if not was_armed and is_armed and not recorder.active:
         recorder.start_episode()
-    if is_armed and recorder.active:
+    if is_armed and recorder.active and recorder.should_sample():
         if invalid_frame_reason is not None:
             raise DatasetFrameError(invalid_frame_reason)
         else:

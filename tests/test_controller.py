@@ -276,6 +276,44 @@ def test_arm_only_mode_arms_without_widths_and_leaves_grippers_uncommanded():
     assert result.grippers == {"left": None, "right": None}
 
 
+def test_stale_pi_gripper_telemetry_disarms_both_arms() -> None:
+    m = machine(max_width_age_s=0.2)
+    step(m, packet())
+    step(m, packet(seq=1, zero=1))
+    assert step(m, packet(seq=2, enabled=True, zero=1, toggle=1)).armed
+
+    stale = packet(seq=3, enabled=True, zero=1, toggle=1)
+    for arm in stale["arms"].values():
+        arm["width_age_s"] = 0.5
+    result = step(m, stale)
+
+    assert not result.armed
+    assert "Pi camera or ArUco width stale" in result.reason
+
+
+def test_translation_deadband_and_low_pass_filter_are_applied() -> None:
+    m = machine(translation_deadband_m=0.01, translation_filter_hz=2.0)
+    m.step(packet(), 0.01, ROBOT_POSES, now_s=0.0)
+    m.step(packet(seq=1, zero=1), 0.01, ROBOT_POSES, now_s=0.01)
+    tiny = [0.005, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    result = m.step(
+        packet(seq=2, enabled=True, zero=1, toggle=1, left_pose=tiny, right_pose=tiny),
+        0.01,
+        ROBOT_POSES,
+        now_s=0.02,
+    )
+    np.testing.assert_allclose(result.targets["left"][:3, 3], np.zeros(3), atol=1e-9)
+
+    moved = [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    result = m.step(
+        packet(seq=3, enabled=True, zero=1, toggle=1, left_pose=moved, right_pose=moved),
+        0.01,
+        ROBOT_POSES,
+        now_s=0.03,
+    )
+    assert 0.0 < result.targets["left"][0, 3] < 0.09
+
+
 def test_external_robot_reset_invalidates_zero_and_requires_a_fresh_one():
     m = machine()
     step(m, packet())

@@ -148,6 +148,35 @@ def test_button_state_zero_disarms_and_counters_survive_packets():
     assert packet["arms"]["left"]["pose"] is None
 
 
+def test_pi_event_consumer_baselines_history_and_preserves_new_safety_events():
+    consumer = source_module._PiEventConsumer()
+    packet = {
+        "session_id": "pi-a",
+        "events": {
+            "zero": 4,
+            "toggle": 3,
+            "start": 2,
+            "stop": 1,
+            "cancel": 0,
+            "quit": 0,
+        },
+    }
+    changed, events = consumer.update(packet)
+    assert changed and events == []
+
+    packet["events"] = dict(packet["events"], toggle=4, stop=2)
+    changed, events = consumer.update(packet)
+    assert not changed and events == [Event.TOGGLE]
+
+    packet["events"] = dict(packet["events"], toggle=5, start=3, cancel=1)
+    _changed, events = consumer.update(packet)
+    assert events == [Event.CANCEL]
+
+    packet["events"] = dict(packet["events"], toggle=7, start=4, stop=3)
+    _changed, events = consumer.update(packet)
+    assert events == [Event.CANCEL]
+
+
 def test_enable_guard_requires_a_quiet_period_and_fresh_inputs():
     state = ButtonState(session_id="guard")
     guard = EnableRequestGuard(delay_s=3.0, cooldown_s=5.0)

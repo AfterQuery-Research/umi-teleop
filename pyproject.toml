@@ -29,6 +29,8 @@ dataset = [
 
 [project.scripts]
 umi-teleop = "umi_teleop.local:main"
+umi-pi-source = "umi_teleop.pi_source:main"
+umi-vive-sim = "umi_teleop.vive_sim:main"
 umi-vive-sender = "umi_teleop.windows:main"
 umi-source = "umi_teleop.source:main"
 umi-setup-can = "umi_teleop.setup_can:main"

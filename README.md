@@ -1,69 +1,112 @@
 # UMI Teleop
 
-Native Linux Vive teleoperation for two UMI trackers and two YAM arms. The complete test runs on
-`aq-yam`; Windows and the UMI Pi are not used.
+Native Linux Vive teleoperation, GPIO control, ArUco gripper tracking, and optional LeRobot
+dataset recording for two YAM arms. Windows, SteamVR, ROS, systemd, and SSH are not part of the
+runtime data path.
 
-> **Physical safety:** `umi-teleop --confirm-clear` energizes both arms and holds their current
-> positions. Clear the complete workspace first. Support both arms before quitting because stopping
-> the controller releases active holding. Never connect or disconnect powered hardware.
+> **Physical safety:** `umi-teleop --confirm-clear` opens both CAN-controlled robots and actively
+> holds them. Clear the complete workspace, start with small tracker motions, and support both arms
+> before quitting. Never connect or disconnect powered robot hardware.
 
-## How It Runs
+## Architecture
 
 ```mermaid
 flowchart LR
-    V["Vive trackers + base stations"]
-    T["Native libsurvive tracking"]
-    S["Local controls + pose validation"]
-    Y["Zero + IK + safety + i2rt"]
-    L["Left YAM"]
-    R["Right YAM"]
-    V --> T --> S --> Y
-    Y --> L
-    Y --> R
+    subgraph PI["right-umi-vive-teleop Raspberry Pi"]
+        C["Two gripper cameras"] --> A["ArUco width detection"]
+        G["Two GPIO buttons"] --> P["umi-pi-source"]
+        A --> P
+    end
+    subgraph YAM["aq-yam Linux controller"]
+        V["libsurvive + two Vive trackers"] --> F["Local sensor fusion"]
+        P -->|"versioned UDP :9139"| F
+        F -->|"loopback UDP :9140"| R["Safety + IK + i2rt"]
+        R --> L["Left YAM"]
+        R --> RR["Right YAM"]
+        R --> D["30 Hz LeRobot recorder"]
+        D --> H["Hugging Face Hub"]
+    end
 ```
 
-One `umi-teleop` command supervises all three local processes. Tracker packets use loopback UDP
-`127.0.0.1:9001`; validated controls use loopback UDP `127.0.0.1:9140`. No SSH or external network
-traffic is involved in the live control path.
+The Pi packet repeats monotonic event counters, gripper widths, tag visibility, camera health,
+sequence numbers, and a heartbeat. A dropped UDP packet cannot silently lose a button event.
+Vive tracking, fusion, IK, and the 100 Hz robot loop remain local to `aq-yam`.
 
-This test mode:
+There are two operator-started programs:
 
-- controls arm position and orientation only;
-- holds each gripper at its measured startup position;
-- does not open UMI cameras or use ArUco tags;
-- does not record, save, or upload a dataset;
-- does not use systemd, Steam, SteamVR, Windows, or the UMI Pi.
+- `umi-pi-source` runs on the Raspberry Pi and can remain running across sessions.
+- `umi-teleop` runs on `aq-yam` for each teleoperation or recording session.
 
-## Fixed Hardware
+Both programs use Tyro dataclasses. Run either command with `--help` for every typed option. There
+are no configuration files and no background services.
 
-| Role | Identity |
-|---|---|
-| Host | `aq-yam@aq-yam.local` |
-| Left UMI tracker | `LHR-BBAF093A` |
-| Right UMI tracker | `LHR-C891E882` |
-| Left YAM CAN adapter | `209D378045465008` |
-| Right YAM CAN adapter | `206237A845465006` |
+## Install The Raspberry Pi
 
-CAN adapters are resolved by USB serial, so the setup remains correct if Linux changes their
-`can0`/`can1` names.
+```bash
+sudo apt update
+sudo apt install -y git curl v4l-utils python3-gi gir1.2-gstreamer-1.0 \
+  gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
-## Install Once
+git clone https://github.com/AfterQuery-Research/umi-teleop.git /home/aq/umi-teleop
+cd /home/aq/umi-teleop
+uv venv --python /usr/bin/python3 --system-site-packages
+uv sync --locked --extra source --no-dev
+```
 
-Run on `aq-yam`:
+The `aq` user must have access to the two V4L2 cameras and Raspberry Pi GPIO. On this rig it is a
+member of `video` and `dialout`; `gpiozero` uses the `lgpio` backend automatically.
+
+## Start The Raspberry Pi
+
+Make both gripper tag pairs visible, then run in a Pi terminal:
+
+```bash
+cd /home/aq/umi-teleop
+.venv/bin/umi-pi-source \
+  --network.target-host aq-yam.local \
+  --network.target-port 9139 \
+  --left.device /dev/v4l/by-path/platform-xhci-hcd.1-usb-0:2:1.0-video-index0 \
+  --left.calibration /home/aq/umi-teleop/src/umi_teleop/data/umi2_calib.npz \
+  --left.tag-ids 2 3 \
+  --right.device /dev/v4l/by-path/platform-xhci-hcd.0-usb-0:1:1.0-video-index0 \
+  --right.calibration /home/aq/umi-teleop/src/umi_teleop/data/umi1_calib.npz \
+  --right.tag-ids 0 1
+```
+
+Those values are the defaults for the current rig, so the equivalent short command is:
+
+```bash
+cd /home/aq/umi-teleop
+.venv/bin/umi-pi-source
+```
+
+The process validates both camera devices, calibration files, GPIO pins, and both configured tag
+pairs. It exits with a specific error if they do not become healthy within 20 seconds. Keep this
+terminal open. Press `Ctrl+C` to stop only the Pi publisher.
+
+Run a one-time camera/GPIO check without leaving the publisher online:
+
+```bash
+.venv/bin/umi-pi-source --preflight-only
+```
+
+Pass `--no-quiet` for once-per-second camera, detection, and packet diagnostics.
+
+## Install aq-yam
 
 ```bash
 sudo apt update
 sudo apt install -y git curl build-essential cmake pkg-config can-utils \
   libusb-1.0-0-dev liblapacke-dev libopenblas-dev freeglut3-dev libx11-dev
 sudo usermod -aG plugdev aq-yam
-
 curl -LsSf https://astral.sh/uv/install.sh | sh
+
 mkdir -p /home/aq-yam/Documents/Repos
 git clone https://github.com/AfterQuery-Research/umi-teleop.git \
   /home/aq-yam/Documents/Repos/umi-teleop
 cd /home/aq-yam/Documents/Repos/umi-teleop
-
-uv sync --locked --extra yam --no-dev
+uv sync --locked --extra yam --extra dataset --no-dev
 ./scripts/build-linux-vive.sh
 
 sudo install -m 0644 config/udev/81-vive-watchman.rules \
@@ -72,130 +115,174 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger
 ```
 
-Log out and back in after the `plugdev` group change, then replug the Watchman receivers. The udev
-rule only grants device access; it does not start anything.
+The udev rule grants access to Valve Watchman receivers. It does not start a process. Log out and
+back in after changing groups, then reconnect the two Watchman dongles.
 
-The `yam` extra pins the same tested AfterQuery `i2rt` commit used by the LeRobot dual-YAM setup,
-including its multi-turn gripper encoder-wrap fix.
+## Calibrate Vive Tracking
 
-## Calibrate Tracking Once
-
-Plug in and power both base stations. Press the center button on each Vive tracker and wait for a
-green light. Put the trackers on a stationary surface visible to both base stations, then run:
+Plug in both base stations. Wake each Vive tracker with its center button and wait for a green
+light. Place both trackers where both base stations can see them, then run:
 
 ```bash
 cd /home/aq-yam/Documents/Repos/umi-teleop
 .venv/bin/umi-vive-linux --calibrate
 ```
 
-Wait until libsurvive decodes both base stations, solves the global scene, and reports all tracker
-serials. Press Ctrl+C. The result is stored under `~/.config/umi-teleop`. Recalibrate only after a
-base station moves.
+Wait for both base stations and tracker serials, then press `Ctrl+C`. Calibration is stored under
+`~/.config/umi-teleop`. Recalibrate after moving a base station.
 
 ## Check CAN
 
-List the adapters without opening CAN or sending frames:
-
 ```bash
 cd /home/aq-yam/Documents/Repos/umi-teleop
-.venv/bin/umi-setup-can
-```
-
-For this rig the output must map the left serial to one interface and the right serial to the other.
-Both must be UP, Classic CAN, at `1000000` bit/s. If they are not ready after a reboot or replug:
-
-```bash
 .venv/bin/umi-setup-can \
   --left-adapter-serial 209D378045465008 \
   --right-adapter-serial 206237A845465006
 ```
 
-This command only configures and verifies SocketCAN. It does not import `i2rt`, send motor frames,
-or move an arm.
+Both interfaces must be UP, ERROR-ACTIVE, Classic CAN, and configured at `1000000` bit/s. This
+command does not open a robot or send a motor command.
+
+## Non-Moving Preflight
+
+Leave the normal `umi-pi-source` process running, make the Vive trackers and all four ArUco tags
+visible, then run on `aq-yam`:
+
+```bash
+cd /home/aq-yam/Documents/Repos/umi-teleop
+.venv/bin/umi-teleop --preflight-only
+```
+
+Preflight checks exact Vive IDs, Pi source identity and heartbeat, camera/tag freshness, protocol
+compatibility, both CAN adapters, competing controller processes, IK dependencies, dataset cameras,
+disk space, and Hugging Face authentication when upload is enabled. It never constructs a robot.
 
 ## Run Teleoperation
 
-Wake the two control trackers and clear the complete arm workspace. Run one command:
+With the Pi publisher already running:
 
 ```bash
 cd /home/aq-yam/Documents/Repos/umi-teleop
 .venv/bin/umi-teleop --confirm-clear
 ```
 
-The test launcher defaults to a low-latency profile: `2.0x` translation sensitivity, a `1.0 rad/s`
-per-joint speed limit, `120 Hz` tracking/source loops, a `100 Hz` controller loop, and synchronous
-normal-path IK. Override values at startup when a slower profile is needed:
+The current hardware defaults are:
+
+| Role | Runtime identity |
+|---|---|
+| Pi source | `right-umi-vive-teleop.local` |
+| Left Vive tracker | `LHR-BBAF093A` |
+| Right Vive tracker | `LHR-C891E882` |
+| Left CAN adapter | `209D378045465008` |
+| Right CAN adapter | `206237A845465006` |
+
+Every identity can be supplied at runtime:
 
 ```bash
-.venv/bin/umi-teleop --confirm-clear \
-  --position-scale 1.5 --max-joint-speed 0.45 \
-  --tracking-hz 60 --source-hz 60 --controller-hz 50 --no-synchronous-ik
+.venv/bin/umi-teleop \
+  --pi.source-host right-umi-vive-teleop.local \
+  --tracking.left-id LHR-BBAF093A \
+  --tracking.right-id LHR-C891E882 \
+  --robot.left-can-serial 209D378045465008 \
+  --robot.right-can-serial 206237A845465006 \
+  --confirm-clear
 ```
 
-Wait for fresh left and right pose ages and:
+## GPIO User Interface
 
-```text
-robots holding current pose; request ZERO before enable
-```
+The Raspberry Pi buttons are the primary interface:
 
-Type each key in this same terminal and press Enter:
-
-| Key | Action |
+| Gesture | Result |
 |---|---|
-| `Z` | Stop and capture the current UMI and robot positions as zero |
-| `E` | Start teleoperation after a short fresh-tracking confirmation |
-| `S` | Stop teleoperation immediately and keep holding the arms |
-| `Q` | Quit all local processes |
-| `C` | Emergency cancel; equivalent to an immediate safety disarm |
+| Tap ZERO | Disarm, wait for fresh poses, and capture the tracker/robot reference |
+| Tap RECORD after ZERO | Confirm fresh sensors, start teleoperation, and start an episode |
+| Tap RECORD while active | Disarm immediately and save the episode |
+| Hold RECORD | Disarm immediately and discard the active episode |
+| Hold ZERO/QUIT | Disarm, finalize local data, optionally upload, and shut down aq-yam control |
 
-The normal sequence is:
+Normal sequence:
 
-1. Hold both UMIs at the desired neutral pose.
-2. Type `Z`, press Enter, and wait for `zero captured`.
-3. Type `E`, press Enter, and wait for `enabled`.
-4. Teleoperate with small motions first.
-5. Type `S` and press Enter to stop teleoperating.
-6. Support both arms, then type `Q` and press Enter to release holding and quit.
+1. Start `umi-pi-source` and then `umi-teleop`.
+2. Hold both UMI handles at the desired neutral pose.
+3. Tap ZERO and wait for `zero captured`.
+4. Tap RECORD and wait for `enabled` and `DATASET episode started` when recording.
+5. Teleoperate with small motions first.
+6. Tap RECORD again to stop and save.
+7. Hold ZERO/QUIT when finished, then support both arms before the controller releases them.
 
-There is no recording in this test launcher. `S` only stops robot teleoperation.
+Starting before ZERO is rejected. Tracking or Pi recovery never re-arms automatically.
+
+## Record And Upload A Dataset
+
+Authenticate once on `aq-yam` without putting a token in shell history:
+
+```bash
+hf auth login
+```
+
+The current rig uses one top RealSense and two side global-shutter cameras. The `.env` file on
+`aq-yam` contains their stable identities. A complete command is:
+
+```bash
+cd /home/aq-yam/Documents/Repos/umi-teleop
+source .env
+.venv/bin/umi-teleop \
+  --dataset.record \
+  --dataset.repo-id AfterQuery-Research/REPLACE_ME \
+  --dataset.root /home/aq-yam/datasets/REPLACE_ME \
+  --dataset.task "Describe the manipulation task" \
+  --dataset.top-camera-serial "$TOP_CAMERA" \
+  --dataset.side-camera-kind ultrawide \
+  --dataset.left-camera-path "$LEFT_CAMERA" \
+  --dataset.right-camera-path "$RIGHT_CAMERA" \
+  --dataset.push-to-hub \
+  --dataset.private \
+  --confirm-clear
+```
+
+The robot loop remains at 100 Hz. The recorder samples synchronized observations and dispatched
+actions at the MolmoAct2-compatible 30 Hz rate and performs resizing, encoding, and disk writes on
+bounded background workers. Stopping holds the current pose by default. Use
+`--dataset.post-episode-action neutral` only when an automatic return is intentionally desired.
+
+Uploads happen after robot control closes. If upload fails, the finalized local dataset remains
+unchanged and the terminal prints an `umi-dataset-upload` recovery command.
+
+## Control Tuning
+
+```bash
+.venv/bin/umi-teleop \
+  --control.position-scale 2.0 \
+  --control.rotation-scale 1.0 \
+  --control.max-joint-speed 1.0 \
+  --control.max-joint-acceleration 8.0 \
+  --control.translation-filter-hz 18 \
+  --control.rotation-filter-hz 15 \
+  --control.translation-deadband-m 0.001 \
+  --control.rotation-deadband-deg 0.25 \
+  --confirm-clear
+```
+
+Higher filter cutoffs respond faster but pass more tracking noise. Lower cutoffs are smoother but
+add lag. Position and rotation scales change tracker sensitivity. Joint speed and acceleration
+bound the robot response independently of tracker motion. Workspace limits remain enforced after
+scaling and filtering.
 
 ## Safety Behavior
 
-- A new run always requires a new `Z` before `E` can arm.
-- `Z`, `S`, `C`, stale tracking, stale packets, or a restarted source disarms immediately.
-- Neither stale data nor tracking recovery can re-arm the robot automatically.
-- Raw UMI translation is limited to `0.50 m` and rotation to `90 deg` from zero.
-- Joint limits, command slew limits, CAN state, IK result age, and competing controllers are checked.
-- Exact IK failure holds the last safe target and retries; it never sends an unvalidated target.
-- Automatic startup motion is disabled. The launcher does not pass `--move-to-ready` or
-  `--move-to-base`.
+- Missing or duplicate hardware identities fail before robot construction.
+- A new source or controller session always requires a new ZERO.
+- Stale Vive poses, Pi heartbeat, camera frames, ArUco widths, control packets, or IK results disarm.
+- Camera or tag loss while active disarms both arms, not only the gripper command.
+- GPIO cancel, quit, and stop are immediate; enabling requires a quiet fresh-sensor interval.
+- Joint limits, workspace limits, command speed, command acceleration, CAN state, and competing
+  robot controllers are checked fail-closed.
+- Dataset camera or writer failure disarms and discards the affected episode.
+- No child process is automatically restarted during physical control. Any child exit shuts down
+  the launcher and its remaining children.
 
-The launcher reads `LEFT_CAN` and `RIGHT_CAN` environment variables when present; otherwise it uses
-the fixed serials above. It refuses physical startup unless `--confirm-clear` is supplied.
-
-## Diagnostics
-
-Measure native tracking without starting the source or controller:
-
-```bash
-.venv/bin/umi-vive-linux &
-VIVE_PID=$!
-./scripts/check-linux-vive-stream.py \
-  --expect-serial LHR-BBAF093A \
-  --expect-serial LHR-C891E882
-kill -INT "$VIVE_PID"
-wait "$VIVE_PID"
-```
-
-Exercise the complete launcher with simulated YAMs and no CAN access:
-
-```bash
-.venv/bin/umi-teleop --simulate
-```
-
-If a tracker becomes stale, stop with `S`, restore visibility to both base stations, then use a new
-`Z` followed by `E`. If CAN is missing, down, in CAN FD mode, or at the wrong bitrate, stop all robot
-controllers and rerun `umi-setup-can` with the two fixed serials.
+Use `--no-quiet` for detailed timing and packet diagnostics. Normal logging reports startup,
+state transitions, warnings, episode results, and errors only.
 
 ## Development
 
@@ -207,6 +294,7 @@ uv run pytest
 uv build
 ```
 
-The tests cover native and legacy tracker packets, explicit tracking loss, sensor age, deterministic
-controls, one-command launch configuration, arm-only zero/enable/stop behavior, loopback transport,
-CAN identity and readiness, Cartesian and joint safety, IK fallback, and I2RT compatibility.
+The test suite covers Tyro parsing, packet validation, event-counter recovery, GPIO state changes,
+camera health, stale inputs, filtering, safety envelopes, CAN identity, IK behavior, 100-to-30 Hz
+recording decimation, dataset lifecycle, upload recovery, and a Linux two-process localhost
+preflight using simulated Pi sensors, Vive trackers, and YAMs.

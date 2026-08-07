@@ -45,6 +45,7 @@ from umi_teleop.dataset import (
     DatasetRecordingError,
     commit_dataset_step,
     create_dataset_recorder,
+    preflight_dataset,
     prepare_dataset_step,
 )
 from umi_teleop.ik_policy import (
@@ -103,7 +104,13 @@ class Config:
     max_translation: float = 0.50
     max_rotation_deg: float = 90.0
     position_scale: float = 1.50
+    rotation_scale: float = 1.0
+    translation_filter_hz: float = 0.0
+    rotation_filter_hz: float = 0.0
+    translation_deadband_m: float = 0.0
+    rotation_deadband_deg: float = 0.0
     max_joint_speed: float = 0.45
+    max_joint_acceleration: float = 8.0
     max_gripper_speed: float = 1.50
     arm_only: bool = False
     """Hold both grippers at startup readback and require only fresh Vive poses to arm."""
@@ -126,6 +133,8 @@ class Config:
     """Solve IK in the control cycle instead of accepting it one cycle later."""
     stream_timeout: float = 20.0
     monitor_only: bool = False
+    preflight_only: bool = False
+    """Validate all configured inputs without opening either robot."""
     simulate: bool = False
     sim_initial_joints: tuple[float, float, float, float, float, float] = DEFAULT_SIM_INITIAL_JOINTS
     confirm_clear: bool = False
@@ -757,17 +766,32 @@ def monitor_only(receiver: UdpTeleopReceiver) -> None:
 
 
 def run(args: Config) -> None:
+    for name, value in (
+        ("control frequency", args.hz),
+        ("maximum joint speed", args.max_joint_speed),
+        ("maximum joint acceleration", args.max_joint_acceleration),
+        ("maximum gripper speed", args.max_gripper_speed),
+    ):
+        if not math.isfinite(value) or value <= 0.0:
+            raise SafetyStop(f"{name} must be finite and positive")
     if args.move_to_ready and args.move_to_base:
         raise SafetyStop("move-to-ready and move-to-base are mutually exclusive")
     if args.monitor_only and args.dataset.enabled:
         raise SafetyStop("dataset recording cannot be combined with monitor-only mode")
+    if args.monitor_only and args.preflight_only:
+        raise SafetyStop("monitor-only and preflight-only are mutually exclusive")
     if args.ik_fallback_attempts_per_cycle < 1:
         raise SafetyStop("--ik-fallback-attempts-per-cycle must be at least one")
     if args.ik_hold_disarm_s < 0.0:
         raise SafetyStop("--ik-hold-disarm-s must be nonnegative")
     if args.ik_result_max_age_s <= 0.0:
         raise SafetyStop("--ik-result-max-age-s must be positive")
-    if not args.monitor_only and not args.simulate and not args.confirm_clear:
+    if (
+        not args.monitor_only
+        and not args.preflight_only
+        and not args.simulate
+        and not args.confirm_clear
+    ):
         raise SafetyStop(
             "this command can move physical arms; clear the workspace and pass --confirm-clear"
         )
@@ -795,6 +819,11 @@ def run(args: Config) -> None:
         max_translation_m=args.max_translation,
         max_rotation_rad=math.radians(args.max_rotation_deg),
         position_scale=args.position_scale,
+        rotation_scale=args.rotation_scale,
+        translation_filter_hz=args.translation_filter_hz,
+        rotation_filter_hz=args.rotation_filter_hz,
+        translation_deadband_m=args.translation_deadband_m,
+        rotation_deadband_rad=math.radians(args.rotation_deadband_deg),
         require_width_to_arm=not args.arm_only,
     )
     state = TeleopStateMachine(
@@ -821,15 +850,6 @@ def run(args: Config) -> None:
             flush=True,
         )
 
-    # Mink/MuJoCo allocation can hold the GIL; do it before any motor command thread exists.
-    fk_models = {
-        name: IkModel(args.ik_max_iters, args.ik_pos_threshold, args.ik_ori_threshold)
-        for name in ARM_NAMES
-    }
-    solve_models = {
-        name: IkModel(args.ik_max_iters, args.ik_pos_threshold, args.ik_ori_threshold)
-        for name in ARM_NAMES
-    }
     initial_packet = wait_for_stream(
         receiver,
         args.stream_timeout,
@@ -838,6 +858,25 @@ def run(args: Config) -> None:
         args.max_width_age,
         require_width=not args.arm_only,
     )
+    if args.preflight_only:
+        try:
+            preflight_dataset(args.dataset, args.hz)
+        except DatasetRecordingError as exc:
+            raise SafetyStop(str(exc)) from exc
+        channels_by_side = resolve_arm_channels(args)
+        if not args.simulate:
+            # Load the exact runtime IK dependency without opening CAN or constructing robots.
+            IkModel(args.ik_max_iters, args.ik_pos_threshold, args.ik_ori_threshold)
+            check_no_other_control_processes()
+            for channel in channels_by_side.values():
+                check_can_interface(channel)
+        print(
+            "YAM PREFLIGHT OK: telemetry, Vive, Pi cameras/tags, CAN, IK, dataset, "
+            "and authentication checks passed",
+            flush=True,
+        )
+        receiver.close()
+        return
     if (args.move_to_ready or args.move_to_base) and initial_packet["requested_enabled"]:
         raise SafetyStop(
             "UMI source must be disabled before an automatic startup motion; hold CANCEL"
@@ -849,6 +888,15 @@ def run(args: Config) -> None:
     async_ik: dict[str, AsyncFallbackIkSolver] = {}
     synchronous_ik: dict[str, FallbackIkSolver] = {}
     recorder = None
+    # Mink/MuJoCo allocation can hold the GIL; do it before any motor command thread exists.
+    fk_models = {
+        name: IkModel(args.ik_max_iters, args.ik_pos_threshold, args.ik_ori_threshold)
+        for name in ARM_NAMES
+    }
+    solve_models = {
+        name: IkModel(args.ik_max_iters, args.ik_pos_threshold, args.ik_ori_threshold)
+        for name in ARM_NAMES
+    }
     try:
         try:
             recorder = create_dataset_recorder(args.dataset, args.hz)
@@ -954,7 +1002,7 @@ def run(args: Config) -> None:
             )
 
         period = 1.0 / args.hz
-        max_joint_step = args.max_joint_speed / args.hz
+        max_joint_velocity_step = args.max_joint_acceleration / args.hz
         max_gripper_step = args.max_gripper_speed / args.hz
         for name in ARM_NAMES:
             limits = np.asarray(robots[name].get_robot_info()["joint_limits"], dtype=np.float64)
@@ -972,6 +1020,7 @@ def run(args: Config) -> None:
             else:
                 async_ik[name] = AsyncFallbackIkSolver(solver, name=name)
         joint_goals = {name: joints[name].copy() for name in ARM_NAMES}
+        joint_velocities = {name: np.zeros_like(joints[name]) for name in ARM_NAMES}
         # The state machine only consumes live robot FK when ZERO is captured.  Keep the latest
         # pose that produced a valid IK result for fallback search instead of recomputing FK for
         # both arms on every control tick.  Per-frame FK contends with the background MuJoCo IK
@@ -995,9 +1044,11 @@ def run(args: Config) -> None:
         }
 
         def invalidate_ik() -> None:
-            nonlocal ik_generation, joint_goals, latest_ik_results, ik_holding_since
+            nonlocal ik_generation, joint_goals, joint_velocities
+            nonlocal latest_ik_results, ik_holding_since
             ik_generation += 1
             joint_goals = {name: joints[name].copy() for name in ARM_NAMES}
+            joint_velocities = {name: np.zeros_like(joints[name]) for name in ARM_NAMES}
             latest_ik_results.clear()
             ik_holding_since = {name: None for name in ARM_NAMES}
             for solver in synchronous_ik.values():
@@ -1184,9 +1235,22 @@ def run(args: Config) -> None:
                         ik_holding_since[name] = None
 
                 for name in ARM_NAMES:
-                    delta = np.clip(
-                        joint_goals[name] - joints[name], -max_joint_step, max_joint_step
+                    remaining = joint_goals[name] - joints[name]
+                    desired_velocity = np.clip(
+                        remaining * args.hz,
+                        -args.max_joint_speed,
+                        args.max_joint_speed,
                     )
+                    velocity_delta = np.clip(
+                        desired_velocity - joint_velocities[name],
+                        -max_joint_velocity_step,
+                        max_joint_velocity_step,
+                    )
+                    joint_velocities[name] += velocity_delta
+                    delta = joint_velocities[name] / args.hz
+                    reached = np.abs(delta) >= np.abs(remaining)
+                    delta = np.where(reached, remaining, delta)
+                    joint_velocities[name] = np.where(reached, 0.0, joint_velocities[name])
                     joints[name] += delta
 
                     desired_grip = result.grippers[name]
@@ -1232,6 +1296,7 @@ def run(args: Config) -> None:
                         state.reason += "; " + result.reason
             elif not result.armed:
                 joint_goals = {name: joints[name].copy() for name in ARM_NAMES}
+                joint_velocities = {name: np.zeros_like(joints[name]) for name in ARM_NAMES}
                 latest_ik_results.clear()
                 ik_holding_since = {name: None for name in ARM_NAMES}
             if was_armed and not state.armed:
@@ -1285,7 +1350,12 @@ def run(args: Config) -> None:
                 and not state.armed
                 and state.reason == "enable toggled off"
             )
-            if episode_stopped:
+            if episode_stopped and args.dataset.post_episode_action == "hold":
+                print(
+                    "recording ended; both YAMs are holding their current pose",
+                    flush=True,
+                )
+            if episode_stopped and args.dataset.post_episode_action == "neutral":
                 print(
                     "recording ended; returning both YAMs to unrecorded base pose",
                     flush=True,
