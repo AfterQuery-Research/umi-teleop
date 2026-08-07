@@ -18,15 +18,15 @@ class Buttons(ABC):
 
 
 class KeyboardButtons(Buttons):
-    """Mock buttons for dev: type a key then Enter.
+    """Deterministic local controls: type a key then Enter.
 
-    e = toggle enable/disable, s = explicit start, c = cancel, z = zero pose, q = quit.
-    POSIX-only (select() on stdin) — fine on Mac and the Pi.
+    z = zero, e = start, s = stop, c = emergency cancel, q = quit.
+    POSIX-only because it uses ``select()`` on stdin.
     """
 
     KEYMAP = {
-        "s": Event.START,
-        "e": Event.TOGGLE,
+        "e": Event.START,
+        "s": Event.STOP,
         "c": Event.CANCEL,
         "z": Event.ZERO,
         "q": Event.QUIT,

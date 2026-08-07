@@ -177,7 +177,7 @@ def run(cfg: Config) -> None:
         cfg.arm_only,
     )
     if cfg.buttons == "keyboard":
-        log.info("controls: type E=enable/disable, Z=ZERO, C=cancel, Q=quit, then Enter")
+        log.info("controls: type Z=ZERO, E=start, S=stop, Q=quit, then Enter")
     else:
         log.info(
             "controls: record tap=enable/disable, record hold=cancel, quit tap=ZERO, hold=quit"

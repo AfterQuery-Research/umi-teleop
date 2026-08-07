@@ -83,8 +83,9 @@ def test_default_side_mapping_keeps_each_physical_umi_paired():
     assert not cfg.arm_only
 
 
-def test_keyboard_e_toggles_enable():
-    assert KeyboardButtons.KEYMAP["e"] is Event.TOGGLE
+def test_keyboard_has_deterministic_start_and_stop_keys():
+    assert KeyboardButtons.KEYMAP["e"] is Event.START
+    assert KeyboardButtons.KEYMAP["s"] is Event.STOP
 
 
 def test_packet_round_trip_and_rejects_nonfinite_or_bad_quaternion():

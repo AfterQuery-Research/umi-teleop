@@ -219,6 +219,8 @@ class EnableRequestGuard:
 
     def handle(self, state: ButtonState, event: Event, now: float) -> str:
         """Apply a raw button event, returning a short diagnostic action."""
+        if event is Event.START and state.requested_enabled:
+            return "already enabled"
         wants_enable = event is Event.START or (
             event is Event.TOGGLE and not state.requested_enabled
         )
