@@ -12,6 +12,7 @@ from umi_teleop.controller import (
     TeleopLimits,
     TeleopStateMachine,
     decode_packet,
+    filter_rotation,
     limit_rotation_angle,
     pose_matrix,
     rotation_angle,
@@ -531,6 +532,17 @@ def test_limit_rotation_angle_handles_half_turn():
     limited = limit_rotation_angle(half_turn_x, math.pi / 2.0)
     assert rotation_angle(limited) == pytest.approx(math.pi / 2.0)
     np.testing.assert_allclose(limited @ limited.T, np.eye(3), atol=1e-9)
+
+
+def test_rotation_filter_treats_roundoff_only_angle_as_identity():
+    target = np.eye(3, dtype=np.float64)
+    target[0, 0] = np.nextafter(1.0, 0.0)
+    filtered = np.eye(3, dtype=np.float64)
+
+    for _ in range(1000):
+        filtered = filter_rotation(filtered, target, 0.2)
+
+    np.testing.assert_array_equal(filtered, np.eye(3))
 
 
 def test_pose_matrix_rotates_tip_offset():

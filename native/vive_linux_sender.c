@@ -44,7 +44,10 @@ typedef struct {
     bool configured;
     bool reacquiring;
     bool has_candidate;
+    bool has_published_validity;
+    bool last_published_valid;
     uint64_t last_valid_monotonic_ns;
+    uint64_t invalid_since_monotonic_ns;
     uint64_t continuity_id;
     uint64_t rejected_pose_count;
     PoseRejectionReason last_rejection_reason;
@@ -86,6 +89,18 @@ static uint64_t clock_ns(clockid_t clock_id) {
         return 0;
     }
     return (uint64_t)value.tv_sec * 1000000000ULL + (uint64_t)value.tv_nsec;
+}
+
+static double monotonic_age_s(uint64_t now_ns, uint64_t sample_ns) {
+    if (sample_ns == 0) {
+        return INFINITY;
+    }
+    // The sender samples its clock before taking state_mutex. A pose callback may publish a
+    // newer sample before the sender gets the lock; that ordering means age zero, not infinity.
+    if (sample_ns > now_ns) {
+        return 0.0;
+    }
+    return (double)(now_ns - sample_ns) / 1000000000.0;
 }
 
 static void handle_signal(int signal_number) {
@@ -339,17 +354,46 @@ static size_t build_packet(char *buffer, size_t capacity, uint64_t now_monotonic
             !stable_tracker_serial(state->object)) {
             continue;
         }
-        double pose_age_s = INFINITY;
-        if (state->last_valid_monotonic_ns > 0 &&
-            now_monotonic_ns >= state->last_valid_monotonic_ns) {
-            pose_age_s = (double)(now_monotonic_ns - state->last_valid_monotonic_ns) /
-                         1000000000.0;
-        }
+        double pose_age_s = monotonic_age_s(now_monotonic_ns, state->last_valid_monotonic_ns);
         bool valid = state->connected && !state->reacquiring && isfinite(pose_age_s) &&
                      pose_age_s <= options.max_pose_age_s;
         double quaternion_norm = 0.0;
         valid = valid && finite_pose(&state->pose, &quaternion_norm) &&
                 quaternion_norm >= 0.99 && quaternion_norm <= 1.01;
+
+        if (!state->has_published_validity) {
+            state->has_published_validity = true;
+            state->last_published_valid = valid;
+            state->invalid_since_monotonic_ns = valid ? 0 : now_monotonic_ns;
+        } else if (valid != state->last_published_valid) {
+            if (valid) {
+                double outage_s =
+                    state->invalid_since_monotonic_ns > 0 &&
+                            now_monotonic_ns >= state->invalid_since_monotonic_ns
+                        ? (double)(now_monotonic_ns - state->invalid_since_monotonic_ns) /
+                              1000000000.0
+                        : 0.0;
+                fprintf(stderr,
+                        "Vive tracker %s valid after %.3fs outage "
+                        "(continuity=%llu rejected=%llu)\n",
+                        state->object->serial_number, outage_s,
+                        (unsigned long long)state->continuity_id,
+                        (unsigned long long)state->rejected_pose_count);
+                state->invalid_since_monotonic_ns = 0;
+            } else {
+                state->invalid_since_monotonic_ns = now_monotonic_ns;
+                fprintf(stderr,
+                        "Vive tracker %s invalid "
+                        "(connected=%s reacquiring=%s pose_age=%.3fs continuity=%llu "
+                        "rejected=%llu last_rejection=%s)\n",
+                        state->object->serial_number, state->connected ? "true" : "false",
+                        state->reacquiring ? "true" : "false", pose_age_s,
+                        (unsigned long long)state->continuity_id,
+                        (unsigned long long)state->rejected_pose_count,
+                        pose_rejection_name(state->last_rejection_reason));
+            }
+            state->last_published_valid = valid;
+        }
 
         if (!first && !append_format(&cursor, &remaining, ",")) {
             pthread_mutex_unlock(&state_mutex);
@@ -825,6 +869,9 @@ static int run_self_tests(void) {
         }                                                                                      \
     } while (0)
     CHECK(pose_is_valid(&pose, now, now - 480000, 48000000, 1.0));
+    CHECK(isinf(monotonic_age_s(100, 0)));
+    CHECK(monotonic_age_s(100, 101) == 0.0);
+    CHECK(fabs(monotonic_age_s(2000000100ULL, 2000000000ULL) - 0.0000001) < 1e-12);
     CHECK(pose_is_valid(&pose, now, now + 480000, 48000000, 1.0));
     CHECK(!pose_is_valid(&pose, now, 0, 48000000, 1.0));
     CHECK(!pose_is_valid(&pose, now, now - 24000000, 48000000, 1.0));

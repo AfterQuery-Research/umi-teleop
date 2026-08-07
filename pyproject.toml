@@ -36,6 +36,7 @@ umi-source = "umi_teleop.source:main"
 umi-setup-can = "umi_teleop.setup_can:main"
 umi-yam = "umi_teleop.yam:main"
 umi-dataset-upload = "umi_teleop.dataset_cli:main"
+umi-teleop-control = "umi_teleop.debug_control:main"
 
 [build-system]
 requires = ["uv_build>=0.11.14,<0.13.0"]

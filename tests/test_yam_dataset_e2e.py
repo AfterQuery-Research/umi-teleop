@@ -253,7 +253,7 @@ def stream_one_ik_failure(port: int, done: threading.Event) -> None:
         state.handle(Event.ZERO)
         send(4)
         state.handle(Event.START)
-        send(8)
+        send(12)
         state.handle(Event.QUIT)
         send(3)
     finally:
@@ -262,8 +262,11 @@ def stream_one_ik_failure(port: int, done: threading.Event) -> None:
 
 
 @pytest.mark.integration
-def test_complete_ik_failure_disarms_both_arms_without_automatic_retry(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("synchronous_ik", [False, True], ids=["async-ik", "sync-ik"])
+def test_complete_ik_failure_disarms_after_bounded_search_without_automatic_rearm(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    synchronous_ik: bool,
 ) -> None:
     port = free_udp_port()
     robots: list[E2ERobot] = []
@@ -292,7 +295,7 @@ def test_complete_ik_failure_disarms_both_arms_without_automatic_retry(
             move_to_base=True,
             base_joint_speed=100.0,
             simulate=True,
-            synchronous_ik=True,
+            synchronous_ik=synchronous_ik,
             stream_timeout=2.0,
             quiet=True,
         )
@@ -302,7 +305,12 @@ def test_complete_ik_failure_disarms_both_arms_without_automatic_retry(
     output = capsys.readouterr().out
     assert sender_done.is_set()
     assert "SAFETY DISARM: complete IK fallback failure" in output
-    assert [model.solve_calls for model in FailingE2EIk.instances] == [0, 0, 3, 3]
+    assert "IK FAILURE DETAIL:" in output
+    assert "search_exhausted=True" in output
+    solve_calls = [model.solve_calls for model in FailingE2EIk.instances]
+    assert solve_calls[:2] == [0, 0]
+    assert solve_calls[2] == solve_calls[3]
+    assert 29 <= solve_calls[2] <= 32
     assert len(robots) == 2 and all(robot.closed for robot in robots)
     assert all(np.allclose(robot.joints, yam.DEFAULT_BASE_JOINTS) for robot in robots)
 

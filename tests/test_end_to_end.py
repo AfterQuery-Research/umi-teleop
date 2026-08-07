@@ -133,6 +133,7 @@ def test_native_linux_to_arm_only_yam_state_machine_over_loopback() -> None:
     no_widths: dict[str, dict] = {}
 
     def send_vive(left_x: float) -> dict:
+        expected_count = vive_receiver.packet_count + 1
         payload = {
             "frame": "libsurvive_tracking",
             "trackers": [
@@ -153,7 +154,7 @@ def test_native_linux_to_arm_only_yam_state_machine_over_loopback() -> None:
             ],
         }
         vive_socket.sendto(json.dumps(payload).encode(), ("127.0.0.1", vive_receiver.port))
-        return wait_for_vive(vive_receiver, vive_receiver.packet_count + 1)
+        return wait_for_vive(vive_receiver, expected_count)
 
     vive_receiver.start()
     try:

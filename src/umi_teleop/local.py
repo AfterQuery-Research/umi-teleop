@@ -59,7 +59,7 @@ class TrackingArgs:
     """Continuous plausible tracking required after a rejected sample."""
 
     poser: str = "KalmanOnly"
-    """libsurvive pose solver: stable KalmanOnly default or expert MPFIT override."""
+    """libsurvive pose solver: stable KalmanOnly default or diagnostic-only MPFIT."""
 
     startup_timeout_s: float = 8.0
     """Per-attempt timeout for both trackers to become continuously valid."""
@@ -177,6 +177,17 @@ class ControlArgs:
 
 
 @dataclass(frozen=True)
+class DebugArgs:
+    """Explicitly opt-in controls for unattended diagnostic runs."""
+
+    enable: bool = False
+    """Allow loopback umi-teleop-control commands alongside physical Pi GPIO."""
+
+    control_port: int = 9141
+    """Loopback UDP port used only by the debug control utility."""
+
+
+@dataclass(frozen=True)
 class Args:
     """Run Pi-assisted native Vive teleoperation and optional LeRobot recording."""
 
@@ -184,6 +195,7 @@ class Args:
     pi: PiInputArgs = field(default_factory=PiInputArgs)
     robot: RobotArgs = field(default_factory=RobotArgs)
     control: ControlArgs = field(default_factory=ControlArgs)
+    debug: DebugArgs = field(default_factory=DebugArgs)
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     confirm_clear: bool = False
     """Confirm that the complete physical arm workspace is clear."""
@@ -244,6 +256,15 @@ def validate_args(args: Args) -> None:
         errors.append("tracking startup attempts must be between 1 and 5")
     if args.tracking.poser not in {"KalmanOnly", "MPFIT"}:
         errors.append("tracking poser must be KalmanOnly or MPFIT")
+    if args.tracking.poser == "MPFIT" and not (args.preflight_only or args.simulate):
+        errors.append(
+            "MPFIT is diagnostic-only and cannot be used for physical control; "
+            "use KalmanOnly or --preflight-only"
+        )
+    if args.tracking.simulate and not args.simulate:
+        errors.append(
+            "synthetic Vive tracking requires --simulate and cannot control physical arms"
+        )
     if not 0 <= args.control.rotation_deadband_deg <= 10:
         errors.append("rotation deadband must be between 0 and 10 degrees")
     if not 0 < args.control.max_translation_m <= 1.0:
@@ -260,6 +281,8 @@ def validate_args(args: Args) -> None:
         )
     if args.pi.heartbeat_timeout_s <= 0 or args.pi.width_timeout_s <= 0:
         errors.append("Pi heartbeat and width timeouts must be positive")
+    if not 1 <= args.debug.control_port <= 65_535:
+        errors.append("debug-control port must be between 1 and 65535")
     if not args.simulate:
         if not args.robot.left_can_serial.strip() or not args.robot.right_can_serial.strip():
             errors.append("left and right CAN adapter serials must not be empty")
@@ -414,6 +437,8 @@ def build_commands(args: Args, bin_dir: Path | None = None) -> dict[str, list[st
     if args.quiet:
         commands["source"].append("--quiet")
         commands["controller"].append("--quiet")
+    if args.debug.enable:
+        commands["source"].extend(["--debug-control-port", str(args.debug.control_port)])
     if args.tracking.simulate:
         commands["tracking"].extend(
             ["--left-id", args.tracking.left_id, "--right-id", args.tracking.right_id]
@@ -653,6 +678,12 @@ def run(args: Args, *, popen: Callable[..., Any] = subprocess.Popen) -> int:
         f"{'on' if args.dataset.enabled else 'off'}",
         flush=True,
     )
+    if args.debug.enable:
+        print(
+            f"DEBUG CONTROL: umi-teleop-control --port {args.debug.control_port} "
+            "zero|start|stop|cancel|quit|status",
+            flush=True,
+        )
     processes: list[tuple[str, Any]] = []
     try:
         print("starting tracking...", flush=True)

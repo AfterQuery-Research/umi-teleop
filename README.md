@@ -229,6 +229,23 @@ Normal sequence:
 
 Starting before ZERO is rejected. Tracking or Pi recovery never re-arms automatically.
 
+For unattended bench diagnostics, opt in to a loopback-only software control channel by adding
+`--debug.enable` to `umi-teleop`. Physical Pi GPIO remains active, and another `aq-yam` shell can
+then issue deterministic commands:
+
+```bash
+umi-teleop-control status
+umi-teleop-control zero
+umi-teleop-control start
+umi-teleop-control stop
+umi-teleop-control cancel
+umi-teleop-control quit
+```
+
+This interface is disabled by default, binds only to `127.0.0.1`, and still passes through the same
+ZERO, quiet-period, sensor-freshness, IK, and disarm checks as GPIO. It is for supervised testing,
+not remote production control.
+
 ## Record And Upload A Dataset
 
 Authenticate once on `aq-yam` without putting a token in shell history:
@@ -309,7 +326,10 @@ scaling and filtering.
 Native tracking uses the pinned `collabora/libsurvive` build in `scripts/build-linux-vive.sh`.
 The launcher selects libsurvive's `KalmanOnly` poser by default because it produced stable,
 low-latency dual-tracker output on the aq-yam host; `MPFIT` remains available through
-`--tracking.poser MPFIT` for diagnostics. Unsupported poser names fail validation.
+`--tracking.poser MPFIT` for simulation or preflight diagnostics, but the physical launcher rejects
+it. Unsupported poser names fail validation. The native sender logs validity transitions with pose
+age, continuity, and rejection counters; startup acquisition is expected, while any later invalid
+transition is actionable tracking evidence.
 Before fusion, it rejects non-monotonic or physically impossible pose steps (defaults: `8 m/s`
 and `1440 deg/s`) and publishes that tracker as invalid until `250 ms` of plausible samples have
 arrived. These thresholds can be changed with `--tracking.max-linear-speed-m-s`,

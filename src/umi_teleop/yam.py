@@ -1211,6 +1211,9 @@ def run(args: Config) -> None:
                         break
             held_joints = {name: joints[name].copy() for name in ARM_NAMES}
             held_grips = dict(grips)
+            held_ik_reference_poses = {
+                name: pose.copy() for name, pose in ik_reference_poses.items()
+            }
             if result.armed and result.targets is not None:
                 cycle_now = time.monotonic()
                 if args.synchronous_ik:
@@ -1292,19 +1295,32 @@ def run(args: Config) -> None:
                     if outcome.mode == "degraded_ik"
                 ]
                 if holding:
-                    reason = (
-                        "complete IK fallback failure for "
-                        + ",".join(holding)
-                        + "; both arms disarmed; tap RECORD once to clear the source enable, "
-                        "then tap RECORD again to re-enable"
+                    diagnostics = "; ".join(
+                        fallback_diagnostic(name, latest_ik_results[name], result.targets[name])
+                        for name in holding
                     )
-                    state.disarm(reason)
                     joints = held_joints
                     grips = held_grips
-                    invalidate_ik()
-                    print(f"SAFETY DISARM: {reason}", flush=True)
+                    ik_reference_poses = held_ik_reference_poses
+                    joint_goals = {name: joints[name].copy() for name in ARM_NAMES}
+                    joint_velocities = {name: np.zeros_like(joints[name]) for name in ARM_NAMES}
+                    exhausted = [
+                        name for name in holding if latest_ik_results[name].search_exhausted
+                    ]
+                    if exhausted:
+                        reason = (
+                            "complete IK fallback failure for "
+                            + ",".join(exhausted)
+                            + "; both arms disarmed; tap RECORD once to clear the source enable, "
+                            "then tap RECORD again to re-enable"
+                        )
+                        state.disarm(reason)
+                        print(f"SAFETY DISARM: {reason}", flush=True)
+                        print(f"IK FAILURE DETAIL: {diagnostics}", flush=True)
                 if state.armed:
-                    if degraded:
+                    if holding:
+                        state.reason = "IK fallback search; both arms holding"
+                    elif degraded:
                         state.reason = "degraded_ik: " + ",".join(degraded) + " using fallback"
                     else:
                         state.reason = result.reason

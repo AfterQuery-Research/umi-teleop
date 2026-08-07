@@ -139,6 +139,7 @@ class IkFallbackResult:
     position_alpha: float
     orientation_relaxation: float
     attempts: int
+    search_exhausted: bool = False
     full_target_failure: str | None = None
     final_failure: str | None = None
 
@@ -251,10 +252,8 @@ class FallbackIkSolver:
     def _fallback_indices(self) -> list[int]:
         if self._preferred_index is None:
             start = self._search_index
-            return [
-                (start + offset) % len(self._candidates)
-                for offset in range(min(self.fallback_attempts_per_cycle, len(self._candidates)))
-            ]
+            stop = min(start + self.fallback_attempts_per_cycle, len(self._candidates))
+            return list(range(start, stop))
         preferred = self._preferred_index
         if self.fallback_attempts_per_cycle == 1:
             return [preferred]
@@ -291,6 +290,7 @@ class FallbackIkSolver:
                 attempts=attempts,
             )
 
+        had_preference = self._preferred_index is not None
         indices = self._fallback_indices()
         final_failure = exact_failure
         for index in indices:
@@ -319,7 +319,14 @@ class FallbackIkSolver:
                 )
 
         self._preferred_index = None
-        self._search_index = (indices[-1] + 1) % len(self._candidates)
+        if had_preference:
+            # A formerly reachable preference failed. Start a complete bounded sweep next cycle.
+            self._search_index = 0
+            search_exhausted = False
+        else:
+            next_index = indices[-1] + 1
+            search_exhausted = next_index >= len(self._candidates)
+            self._search_index = 0 if search_exhausted else next_index
         return IkFallbackResult(
             mode="holding_ik",
             joints=initial.copy(),
@@ -328,6 +335,7 @@ class FallbackIkSolver:
             position_alpha=0.0,
             orientation_relaxation=0.0,
             attempts=attempts,
+            search_exhausted=search_exhausted,
             full_target_failure=exact_failure,
             final_failure=final_failure,
         )
@@ -472,7 +480,8 @@ def fallback_diagnostic(side: str, result: IkFallbackResult, desired_pose: np.nd
         f"orientation_relax={result.orientation_relaxation:.2f} attempts={result.attempts} "
         f"desired_xyz_mm=[{desired_mm[0]:+.1f},{desired_mm[1]:+.1f},{desired_mm[2]:+.1f}] "
         f"last_good_xyz_mm=[{reference_mm[0]:+.1f},{reference_mm[1]:+.1f},"
-        f"{reference_mm[2]:+.1f}] desired_from_last_rot={desired_rotation:.1f}deg"
+        f"{reference_mm[2]:+.1f}] desired_from_last_rot={desired_rotation:.1f}deg "
+        f"search_exhausted={result.search_exhausted}"
     )
     if result.mode == "degraded_ik":
         return f"{prefix} full_failure={result.full_target_failure}"

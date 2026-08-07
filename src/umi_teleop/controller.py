@@ -115,6 +115,9 @@ def rotation_angle(rotation: np.ndarray) -> float:
     return float(np.arccos(cos_angle))
 
 
+ROTATION_IDENTITY_EPS_RAD = 1e-7
+
+
 def limit_rotation_angle(rotation: np.ndarray, max_angle_rad: float) -> np.ndarray:
     """Project a proper rotation onto a maximum angle from identity."""
     checked = checked_rotation_matrix(rotation)
@@ -123,7 +126,7 @@ def limit_rotation_angle(rotation: np.ndarray, max_angle_rad: float) -> np.ndarr
     angle = rotation_angle(checked)
     if angle <= max_angle_rad:
         return checked
-    if max_angle_rad == 0.0:
+    if max_angle_rad == 0.0 or angle < ROTATION_IDENTITY_EPS_RAD:
         return np.eye(3, dtype=np.float64)
 
     if math.isclose(angle, math.pi, abs_tol=1e-6):
@@ -157,7 +160,9 @@ def scale_rotation_angle(rotation: np.ndarray, scale: float) -> np.ndarray:
     if not math.isfinite(scale) or scale < 0.0:
         raise ValueError("rotation scale must be finite and non-negative")
     angle = rotation_angle(checked)
-    if angle < 1e-12 or scale == 1.0:
+    if angle < ROTATION_IDENTITY_EPS_RAD:
+        return np.eye(3, dtype=np.float64)
+    if scale == 1.0:
         return checked
     target_angle = min(math.pi, angle * scale)
     if scale <= 1.0:

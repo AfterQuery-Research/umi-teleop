@@ -141,10 +141,29 @@ def test_unreachable_target_holds_last_safe_command_and_continues_search():
     second = solver.solve_target(pose(1.0), pose(), initial)
 
     assert first.mode == second.mode == "holding_ik"
+    assert not first.search_exhausted
     np.testing.assert_array_equal(first.joints, initial)
     np.testing.assert_array_equal(first.target_pose, np.eye(4))
     # Exact is retried every cycle; the fallback cursor moves from alpha=1 to alpha=0.5.
     assert attempted_x == pytest.approx([1.0, 1.0, 1.0, 0.5])
+
+
+def test_unreachable_target_reports_only_after_complete_fallback_sweep():
+    solver = FallbackIkSolver(
+        lambda _target, initial: (False, initial),
+        lambda _joints: None,
+        line_search_alphas=(1.0, 0.5, 0.1),
+        orientation_relaxations=(1.0, 0.0),
+        fallback_attempts_per_cycle=2,
+    )
+
+    first = solver.solve_target(pose(1.0), pose(), np.zeros(6))
+    second = solver.solve_target(pose(1.0), pose(), np.zeros(6))
+    third = solver.solve_target(pose(1.0), pose(), np.zeros(6))
+
+    assert first.mode == second.mode == third.mode == "holding_ik"
+    assert not first.search_exhausted and not second.search_exhausted
+    assert third.search_exhausted
 
 
 def test_degraded_preference_is_reused_after_trying_one_better_candidate():

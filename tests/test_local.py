@@ -75,6 +75,21 @@ def test_physical_local_launcher_uses_pi_grippers_and_gpio(monkeypatch):
     assert not any(value.startswith("--dataset") for value in commands["controller"])
 
 
+def test_debug_control_is_opt_in_and_passed_only_to_source(monkeypatch):
+    monkeypatch.setattr(local.sys, "platform", "linux")
+    regular = local.build_commands(local.Config(confirm_clear=True), Path("/venv/bin"))
+    debug_config = replace(
+        local.Config(confirm_clear=True),
+        debug=replace(local.DebugArgs(), enable=True, control_port=9512),
+    )
+    debug = local.build_commands(debug_config, Path("/venv/bin"))
+
+    assert "--debug-control-port" not in regular["source"]
+    assert debug["source"][-2:] == ["--debug-control-port", "9512"]
+    assert "--debug-control-port" not in debug["tracking"]
+    assert "--debug-control-port" not in debug["controller"]
+
+
 def test_launcher_finds_sibling_virtual_environment_commands(monkeypatch):
     monkeypatch.setattr(local.sys, "platform", "linux")
     monkeypatch.setattr(local.sys, "executable", "/repo/.venv/bin/python")
@@ -130,6 +145,31 @@ def test_launcher_rejects_unsafe_performance_values(monkeypatch, group, field, v
     config = replace(config, **{group: replace(getattr(config, group), **{field: value})})
 
     with pytest.raises(ValueError, match=message):
+        local.build_commands(config, Path("/venv/bin"))
+
+
+def test_launcher_rejects_mpfit_for_physical_control(monkeypatch):
+    monkeypatch.setattr(local.sys, "platform", "linux")
+    config = replace(
+        local.Args(confirm_clear=True),
+        tracking=replace(local.TrackingArgs(), poser="MPFIT"),
+    )
+
+    with pytest.raises(ValueError, match="diagnostic-only"):
+        local.build_commands(config, Path("/venv/bin"))
+
+    preflight = replace(config, preflight_only=True, confirm_clear=False)
+    assert "MPFIT" in local.build_commands(preflight, Path("/venv/bin"))["tracking"]
+
+
+def test_synthetic_tracking_cannot_drive_physical_arms(monkeypatch):
+    monkeypatch.setattr(local.sys, "platform", "linux")
+    config = replace(
+        local.Args(confirm_clear=True),
+        tracking=replace(local.TrackingArgs(), simulate=True),
+    )
+
+    with pytest.raises(ValueError, match="cannot control physical arms"):
         local.build_commands(config, Path("/venv/bin"))
 
 

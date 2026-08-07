@@ -18,6 +18,7 @@ from typing import Any, Literal
 import tyro
 
 from umi_teleop.buttons import GpioButtons, KeyboardButtons
+from umi_teleop.debug_control import DebugControlReceiver, DebugControlRequest
 from umi_teleop.pi_protocol import EVENT_NAMES, PiPacketReceiver
 from umi_teleop.protocol import (
     ARM_NAMES,
@@ -81,6 +82,8 @@ class Config:
     """Show only controls, state changes, warnings, and errors."""
     preflight_only: bool = False
     preflight_timeout_s: float = 20.0
+    debug_control_port: int | None = None
+    """Opt-in loopback command port for diagnostic ZERO/start/stop/cancel/quit injection."""
 
 
 class _PiEventConsumer:
@@ -169,6 +172,8 @@ def run(cfg: Config) -> None:
         or cfg.preflight_timeout_s <= 0
     ):
         raise ValueError("rates, age limits, button hold, and enable timing must be positive")
+    if cfg.debug_control_port is not None and not 1 <= cfg.debug_control_port <= 65_535:
+        raise ValueError("debug-control port must be between 1 and 65535")
     logging.basicConfig(
         level=logging.WARNING if cfg.quiet else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -190,6 +195,9 @@ def run(cfg: Config) -> None:
         else None
     )
     pi_events = _PiEventConsumer()
+    debug_control = (
+        DebugControlReceiver(cfg.debug_control_port) if cfg.debug_control_port is not None else None
+    )
     vive_continuity = _ViveContinuityGuard()
     workers: dict[str, WidthWorker] = {}
     if not cfg.arm_only and cfg.buttons != "pi":
@@ -277,6 +285,12 @@ def run(cfg: Config) -> None:
             cfg.pi_expected_host or "any host",
             cfg.pi_port,
         )
+    if debug_control is not None:
+        print(
+            f"DEBUG CONTROL enabled on loopback UDP :{cfg.debug_control_port}; "
+            "use umi-teleop-control",
+            flush=True,
+        )
 
     try:
         vive.start()
@@ -285,13 +299,14 @@ def run(cfg: Config) -> None:
         next_send = time.monotonic()
         while True:
             now = time.monotonic()
-            pending_events: list[Event] = []
+            pending_events: list[tuple[Event, DebugControlRequest | None]] = []
             pi_packet = None
             pi_age = None
             if pi_receiver is not None:
                 pi_packet, pi_age = pi_receiver.poll()
                 if pi_packet is not None:
-                    session_changed, pending_events = pi_events.update(pi_packet)
+                    session_changed, pi_pending_events = pi_events.update(pi_packet)
+                    pending_events.extend((event, None) for event in pi_pending_events)
                     if session_changed and inputs_ready_once:
                         state = ButtonState(session_id=uuid.uuid4().hex)
                         enable_guard = EnableRequestGuard(
@@ -305,9 +320,24 @@ def run(cfg: Config) -> None:
                         log.warning("Pi source restarted; teleoperation zero was invalidated")
             elif buttons is not None:
                 while (event := buttons.poll()) is not None:
-                    pending_events.append(event)
+                    pending_events.append((event, None))
 
-            for event in pending_events:
+            if debug_control is not None:
+                for request in debug_control.poll():
+                    if request.event is None:
+                        debug_control.reply(
+                            request,
+                            action="status",
+                            requested_enabled=state.requested_enabled,
+                            zero_id=state.zero_id,
+                            toggle_id=state.toggle_id,
+                            cancel_id=state.cancel_id,
+                            quit_id=state.quit_id,
+                        )
+                    else:
+                        pending_events.append((request.event, request))
+
+            for event, debug_request in pending_events:
                 if state.quitting:
                     break
                 if event is Event.ZERO:
@@ -334,6 +364,17 @@ def run(cfg: Config) -> None:
                         state.toggle_id,
                         state.cancel_id,
                         state.quit_id,
+                    )
+                if debug_request is not None:
+                    assert debug_control is not None
+                    debug_control.reply(
+                        debug_request,
+                        action=action,
+                        requested_enabled=state.requested_enabled,
+                        zero_id=state.zero_id,
+                        toggle_id=state.toggle_id,
+                        cancel_id=state.cancel_id,
+                        quit_id=state.quit_id,
                     )
                 if state.quitting and quit_until is None:
                     quit_until = time.monotonic() + cfg.quit_burst_s
@@ -494,6 +535,8 @@ def run(cfg: Config) -> None:
             close()
         if pi_receiver is not None:
             pi_receiver.close()
+        if debug_control is not None:
+            debug_control.close()
         sock.close()
 
 
