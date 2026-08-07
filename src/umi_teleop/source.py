@@ -301,7 +301,10 @@ def run(cfg: Config) -> None:
 
 
 def main() -> None:
-    run(tyro.cli(Config))
+    try:
+        run(tyro.cli(Config))
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from umi_teleop import buttons as buttons_module
+from umi_teleop import source as source_module
 from umi_teleop.buttons import KeyboardButtons
 from umi_teleop.protocol import (
     ButtonState,
@@ -98,6 +99,17 @@ def test_keyboard_closed_stdin_quits_once(monkeypatch):
 
     assert buttons.poll() is Event.QUIT
     assert buttons.poll() is None
+
+
+def test_source_main_treats_launcher_interrupt_as_clean_shutdown(monkeypatch):
+    monkeypatch.setattr(source_module.tyro, "cli", lambda *_: Config())
+
+    def interrupt(_config):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(source_module, "run", interrupt)
+
+    assert source_module.main() is None
 
 
 def test_packet_round_trip_and_rejects_nonfinite_or_bad_quaternion():
