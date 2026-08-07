@@ -122,6 +122,15 @@ cd /home/aq-yam/Documents/Repos/umi-teleop
 .venv/bin/umi-teleop --confirm-clear
 ```
 
+The test launcher defaults to a responsive profile: `2.0x` translation sensitivity, a `0.60 rad/s`
+per-joint speed limit, and a `60 Hz` controller loop. Override any value at startup when a slower
+profile is needed:
+
+```bash
+.venv/bin/umi-teleop --confirm-clear \
+  --position-scale 1.5 --max-joint-speed 0.45 --controller-hz 50
+```
+
 Wait for fresh left and right pose ages and:
 
 ```text

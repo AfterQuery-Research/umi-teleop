@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import signal
 import subprocess
@@ -26,6 +27,12 @@ class Config:
     right_adapter_serial: str = os.environ.get("RIGHT_CAN", DEFAULT_RIGHT_CAN)
     left_tracker_serial: str = "LHR-BBAF093A"
     right_tracker_serial: str = "LHR-C891E882"
+    position_scale: float = 2.0
+    """Robot translation requested per meter of tracker translation."""
+    max_joint_speed: float = 0.60
+    """Maximum commanded speed for each joint in radians per second."""
+    controller_hz: float = 60.0
+    """Dual-arm controller update rate."""
     confirm_clear: bool = False
     """Confirm that the complete physical arm workspace is clear."""
     simulate: bool = False
@@ -41,6 +48,12 @@ def build_commands(config: Config, bin_dir: Path | None = None) -> dict[str, lis
         raise ValueError("left and right tracker serials must not be empty")
     if config.left_tracker_serial.casefold() == config.right_tracker_serial.casefold():
         raise ValueError("left and right tracker serials must be different")
+    if not math.isfinite(config.position_scale) or not 0.0 < config.position_scale <= 3.0:
+        raise ValueError("position scale must be greater than zero and at most 3.0")
+    if not math.isfinite(config.max_joint_speed) or not 0.0 < config.max_joint_speed <= 1.0:
+        raise ValueError("max joint speed must be greater than zero and at most 1.0 rad/s")
+    if not math.isfinite(config.controller_hz) or not 10.0 <= config.controller_hz <= 100.0:
+        raise ValueError("controller rate must be between 10 and 100 Hz")
     if not config.simulate:
         if not config.left_adapter_serial.strip() or not config.right_adapter_serial.strip():
             raise ValueError("left and right CAN adapter serials must not be empty")
@@ -73,7 +86,11 @@ def build_commands(config: Config, bin_dir: Path | None = None) -> dict[str, lis
             str(binaries / "umi-yam"),
             "--arm-only",
             "--hz",
-            "50",
+            f"{config.controller_hz:g}",
+            "--position-scale",
+            f"{config.position_scale:g}",
+            "--max-joint-speed",
+            f"{config.max_joint_speed:g}",
             "--max-packet-age",
             "0.25",
             "--max-pose-age",
@@ -133,6 +150,11 @@ def run(
     print("UMI TELEOP TEST: no dataset recording and no gripper input", flush=True)
     print(
         "Controls: Z + Enter = zero, E + Enter = start, S + Enter = stop, Q + Enter = quit",
+        flush=True,
+    )
+    print(
+        f"Profile: translation={config.position_scale:g}x "
+        f"joint_speed={config.max_joint_speed:g}rad/s controller={config.controller_hz:g}Hz",
         flush=True,
     )
     processes: list[tuple[str, Any]] = []

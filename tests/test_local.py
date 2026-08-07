@@ -18,6 +18,9 @@ def test_physical_local_launcher_is_arm_only_and_has_no_dataset_flags(monkeypatc
     assert "--arm-only" in commands["controller"]
     assert "--quiet" in commands["source"]
     assert "--quiet" in commands["controller"]
+    assert commands["controller"][commands["controller"].index("--position-scale") + 1] == "2"
+    assert commands["controller"][commands["controller"].index("--max-joint-speed") + 1] == "0.6"
+    assert commands["controller"][commands["controller"].index("--hz") + 1] == "60"
     assert "--confirm-clear" in commands["controller"]
     assert local.DEFAULT_LEFT_CAN in commands["controller"]
     assert local.DEFAULT_RIGHT_CAN in commands["controller"]
@@ -48,3 +51,19 @@ def test_simulated_launcher_never_passes_can_or_clear_confirmation(monkeypatch):
     assert "--simulate" in controller
     assert "--confirm-clear" not in controller
     assert not any("adapter-serial" in value for value in controller)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("position_scale", 3.1, "position scale"),
+        ("max_joint_speed", 1.1, "max joint speed"),
+        ("controller_hz", 101.0, "controller rate"),
+    ],
+)
+def test_launcher_rejects_unsafe_performance_values(monkeypatch, field, value, message):
+    monkeypatch.setattr(local.sys, "platform", "linux")
+    config = local.Config(confirm_clear=True, **{field: value})
+
+    with pytest.raises(ValueError, match=message):
+        local.build_commands(config, Path("/venv/bin"))
