@@ -26,12 +26,26 @@ class TrackingArgs:
     """Native libsurvive tracker input on aq-yam."""
 
     left_id: str = "LHR-BBAF093A"
+    """Exact libsurvive serial assigned to the left UMI handle."""
+
     right_id: str = "LHR-C891E882"
+    """Exact libsurvive serial assigned to the right UMI handle."""
+
     rate_hz: float = 120.0
+    """Native Vive pose publication frequency."""
+
     fusion_hz: float = 120.0
+    """Fused Vive/Pi telemetry frequency sent to the YAM controller."""
+
     bind: str = "127.0.0.1"
+    """Loopback address used by the native Vive receiver."""
+
     port: int = 9001
+    """Local UDP port carrying native Vive poses into sensor fusion."""
+
     stale_timeout_s: float = 0.20
+    """Maximum Vive pose age allowed while arming or controlling."""
+
     simulate: bool = False
     """Use a deterministic synthetic Vive sender for non-moving tests."""
 
@@ -41,10 +55,19 @@ class PiInputArgs:
     """Raspberry Pi GPIO and ArUco telemetry received by aq-yam."""
 
     source_host: str = "right-umi-vive-teleop.local"
+    """Expected Pi hostname or IPv4 address; packets from other hosts are ignored."""
+
     bind: str = "0.0.0.0"
+    """aq-yam address on which to receive Pi UDP telemetry."""
+
     port: int = 9139
+    """aq-yam UDP port on which to receive Pi telemetry."""
+
     heartbeat_timeout_s: float = 0.50
+    """Maximum age of the newest Pi packet before both arms disarm."""
+
     width_timeout_s: float = 0.75
+    """Maximum end-to-end ArUco width age before both arms disarm."""
 
 
 @dataclass(frozen=True)
@@ -52,11 +75,22 @@ class RobotArgs:
     """Dual YAM hardware identity and gripper calibration."""
 
     left_can_serial: str = os.environ.get("LEFT_CAN", DEFAULT_LEFT_CAN)
+    """USB serial of the CAN adapter wired to the left YAM."""
+
     right_can_serial: str = os.environ.get("RIGHT_CAN", DEFAULT_RIGHT_CAN)
+    """USB serial of the CAN adapter wired to the right YAM."""
+
     left_gripper_limits: tuple[float, float] = (6.3704509, 1.2239643)
+    """Left gripper raw closed/open motor endpoints."""
+
     right_gripper_limits: tuple[float, float] = (6.3967727, 1.2010758)
+    """Right gripper raw closed/open motor endpoints."""
+
     left_input_width_mm: tuple[float, float] = (40.376321, 122.999636)
+    """Measured left UMI gripper widths mapped to closed/open robot commands."""
+
     right_input_width_mm: tuple[float, float] = (40.128507, 122.685643)
+    """Measured right UMI gripper widths mapped to closed/open robot commands."""
 
 
 @dataclass(frozen=True)
@@ -64,22 +98,55 @@ class ControlArgs:
     """Responsiveness, filtering, workspace, and IK behavior."""
 
     controller_hz: float = 100.0
+    """Dual-arm state-read, IK, safety, and command frequency."""
+
     telemetry_bind: str = "127.0.0.1"
+    """Loopback address used by fusion and the controller."""
+
     telemetry_port: int = 9140
+    """Loopback UDP port carrying fused telemetry to the controller."""
+
     position_scale: float = 2.0
+    """Multiplier applied to tracker translation relative to ZERO."""
+
     rotation_scale: float = 1.0
+    """Multiplier applied to tracker rotation relative to ZERO."""
+
     max_joint_speed: float = 1.0
+    """Per-joint velocity limit in radians per second."""
+
     max_joint_acceleration: float = 8.0
+    """Per-joint acceleration limit in radians per second squared."""
+
     translation_filter_hz: float = 18.0
+    """Translation low-pass cutoff in Hz; zero disables filtering."""
+
     rotation_filter_hz: float = 15.0
+    """Rotation low-pass cutoff in Hz; zero disables filtering."""
+
     translation_deadband_m: float = 0.001
+    """Tracker translation changes below this distance are ignored."""
+
     rotation_deadband_deg: float = 0.25
+    """Tracker rotation changes below this angle are ignored."""
+
     max_translation_m: float = 0.50
+    """Maximum Cartesian displacement from each arm's ZERO pose."""
+
     max_rotation_deg: float = 90.0
+    """Maximum orientation displacement from each arm's ZERO pose."""
+
     synchronous_ik: bool = True
+    """Solve IK in the current control cycle; disable for background one-cycle-late IK."""
+
     ik_max_iters: int = 40
+    """Maximum numerical IK iterations per solve attempt."""
+
     ik_fallback_attempts_per_cycle: int = 2
+    """Maximum fallback target attempts after a direct IK solve fails."""
+
     ik_hold_disarm_s: float = 0.0
+    """Disarm after this many seconds of IK hold; zero keeps holding indefinitely."""
 
 
 @dataclass(frozen=True)

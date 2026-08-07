@@ -51,11 +51,22 @@ class CameraArgs:
     """Two ArUco tag IDs attached to this gripper."""
 
     width: int = 800
+    """Requested capture width in pixels."""
+
     height: int = 600
+    """Requested capture height in pixels."""
+
     fps: int = 30
+    """Requested camera capture rate in frames per second."""
+
     exposure: int = 100
+    """Manual V4L2 exposure_time_absolute value."""
+
     detect_hz: float = 15.0
+    """Maximum ArUco detection frequency for this camera."""
+
     roi_top_frac: float = 0.0
+    """Fraction of the image height excluded above the detection region."""
 
 
 def _left_camera() -> CameraArgs:
@@ -77,8 +88,13 @@ class GpioArgs:
     """Tap to zero; hold to quit safely."""
 
     hold_s: float = 1.5
+    """Seconds a button must remain pressed to emit its hold action."""
+
     bounce_s: float = 0.05
+    """gpiozero hardware-contact debounce interval in seconds."""
+
     toggle_debounce_s: float = 0.4
+    """Minimum interval between accepted RECORD tap events."""
 
 
 @dataclass(frozen=True)
@@ -90,9 +106,16 @@ class Args:
     right: CameraArgs = field(default_factory=_right_camera)
     gpio: GpioArgs = field(default_factory=GpioArgs)
     camera_timeout_s: float = 0.75
+    """Maximum camera-frame age before camera_ok becomes false."""
+
     width_timeout_s: float = 0.75
+    """Maximum ArUco width-measurement age before telemetry becomes unhealthy."""
+
     preflight_timeout_s: float = 20.0
+    """Seconds allowed for both cameras and tag pairs to become healthy."""
+
     quit_burst_s: float = 0.75
+    """Seconds to repeat a QUIT counter before the Pi publisher exits."""
     preflight_only: bool = False
     """Validate both cameras, tag pairs, and GPIO without remaining online."""
 

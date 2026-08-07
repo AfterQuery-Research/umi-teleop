@@ -38,7 +38,8 @@ There are two operator-started programs:
 - `umi-teleop` runs on `aq-yam` for each teleoperation or recording session.
 
 Both programs use Tyro dataclasses. Run either command with `--help` for every typed option. There
-are no configuration files and no background services.
+is no required configuration file and there are no background services. The current rig uses an
+optional `.env` only as a shell shortcut for long hardware identities.
 
 ## Install The Raspberry Pi
 
@@ -117,6 +118,20 @@ sudo udevadm trigger
 
 The udev rule grants access to Valve Watchman receivers. It does not start a process. Log out and
 back in after changing groups, then reconnect the two Watchman dongles.
+
+The current aq-yam rig has these optional shell exports in its ignored `.env`:
+
+```bash
+export ROBOT_ID=afterquery-dual-yam-01
+export LEFT_CAN=209D378045465008
+export RIGHT_CAN=206237A845465006
+export TOP_CAMERA=262422074066
+export LEFT_CAMERA=/dev/v4l/by-path/pci-0000:00:14.0-usb-0:3.4.4.1:1.0-video-index0
+export RIGHT_CAMERA=/dev/v4l/by-path/pci-0000:00:14.0-usb-0:3.4.4.2:1.0-video-index0
+```
+
+These values can always be passed directly to `umi-teleop`; the file is not part of the runtime
+protocol or a prerequisite for the CLI.
 
 ## Calibrate Vive Tracking
 
@@ -240,6 +255,27 @@ source .env
   --confirm-clear
 ```
 
+Before a physical recording session, run the same configuration with `--preflight-only` and omit
+`--confirm-clear`. This opens and reads all three dataset cameras, validates storage and Hub login,
+and checks the sensor/CAN/IK path without constructing either robot:
+
+```bash
+cd /home/aq-yam/Documents/Repos/umi-teleop
+source .env
+.venv/bin/umi-teleop \
+  --preflight-only \
+  --dataset.record \
+  --dataset.repo-id AfterQuery-Research/REPLACE_ME \
+  --dataset.root /home/aq-yam/datasets/REPLACE_ME \
+  --dataset.task "Describe the manipulation task" \
+  --dataset.top-camera-serial "$TOP_CAMERA" \
+  --dataset.side-camera-kind ultrawide \
+  --dataset.left-camera-path "$LEFT_CAMERA" \
+  --dataset.right-camera-path "$RIGHT_CAMERA" \
+  --dataset.push-to-hub \
+  --dataset.private
+```
+
 The robot loop remains at 100 Hz. The recorder samples synchronized observations and dispatched
 actions at the MolmoAct2-compatible 30 Hz rate and performs resizing, encoding, and disk writes on
 bounded background workers. Stopping holds the current pose by default. Use
@@ -283,6 +319,21 @@ scaling and filtering.
 
 Use `--no-quiet` for detailed timing and packet diagnostics. Normal logging reports startup,
 state transitions, warnings, episode results, and errors only.
+
+## Troubleshooting
+
+| Message | Check |
+|---|---|
+| `Pi preflight timed out` | Both Pi camera paths, both calibration files, and tags `0 1 2 3` are visible |
+| `tracking stale` | Both Vive trackers are green, visible to the base stations, and use the configured serials |
+| `Pi heartbeat` or `unexpected source` | The Pi hostname resolves from aq-yam and UDP port `9139` is not blocked |
+| `camera preflight failed` | The top serial and both stable V4L2 paths are correct and unused by another process |
+| `CAN identity` or `CAN interface ... DOWN` | Run `umi-setup-can` and verify each USB serial is assigned to the intended arm |
+| `Hugging Face authentication failed` | Run `hf auth login`; never put a token on the `umi-teleop` command line |
+| `DATASET upload failed` | Keep the local dataset and run the printed `umi-dataset-upload` recovery command |
+
+After a child failure, `umi-teleop` stops only the children it launched. Fix the reported cause,
+confirm no controller remains, and rerun preflight before starting another physical session.
 
 ## Development
 

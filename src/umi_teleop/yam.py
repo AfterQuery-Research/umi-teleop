@@ -765,6 +765,50 @@ def monitor_only(receiver: UdpTeleopReceiver) -> None:
         time.sleep(0.01)
 
 
+def preflight_runtime(args: Config) -> None:
+    """Collect independent controller-side failures without constructing either robot."""
+    failures: list[str] = []
+    try:
+        preflight_dataset(args.dataset, args.hz)
+    except Exception as exc:
+        failures.append(f"dataset: {exc}")
+
+    channels_by_side: dict[str, str] = {}
+    try:
+        channels_by_side = resolve_arm_channels(args)
+    except Exception as exc:
+        failures.append(f"CAN identity: {exc}")
+
+    if not args.simulate:
+        try:
+            IkModel(args.ik_max_iters, args.ik_pos_threshold, args.ik_ori_threshold)
+        except Exception as exc:
+            failures.append(f"I2RT/IK dependency: {exc}")
+        try:
+            check_no_other_control_processes()
+        except Exception as exc:
+            failures.append(f"competing controller: {exc}")
+        for side, channel in channels_by_side.items():
+            try:
+                check_can_interface(channel)
+            except Exception as exc:
+                failures.append(f"{side} CAN interface {channel}: {exc}")
+
+    if failures:
+        raise SafetyStop("controller preflight failed:\n- " + "\n- ".join(failures))
+
+    hub_status = (
+        "Hugging Face authentication verified"
+        if args.dataset.enabled and args.dataset.push_to_hub
+        else "Hugging Face upload authentication not requested"
+    )
+    print(
+        "YAM PREFLIGHT OK: telemetry, Vive, Pi cameras/tags, CAN, IK, and dataset checks "
+        f"passed; {hub_status}",
+        flush=True,
+    )
+
+
 def run(args: Config) -> None:
     for name, value in (
         ("control frequency", args.hz),
@@ -860,22 +904,9 @@ def run(args: Config) -> None:
     )
     if args.preflight_only:
         try:
-            preflight_dataset(args.dataset, args.hz)
-        except DatasetRecordingError as exc:
-            raise SafetyStop(str(exc)) from exc
-        channels_by_side = resolve_arm_channels(args)
-        if not args.simulate:
-            # Load the exact runtime IK dependency without opening CAN or constructing robots.
-            IkModel(args.ik_max_iters, args.ik_pos_threshold, args.ik_ori_threshold)
-            check_no_other_control_processes()
-            for channel in channels_by_side.values():
-                check_can_interface(channel)
-        print(
-            "YAM PREFLIGHT OK: telemetry, Vive, Pi cameras/tags, CAN, IK, dataset, "
-            "and authentication checks passed",
-            flush=True,
-        )
-        receiver.close()
+            preflight_runtime(args)
+        finally:
+            receiver.close()
         return
     if (args.move_to_ready or args.move_to_base) and initial_packet["requested_enabled"]:
         raise SafetyStop(

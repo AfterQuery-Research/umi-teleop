@@ -117,6 +117,49 @@ def test_startup_camera_failure_prevents_arm_dispatch() -> None:
     assert all(robot.commands == [] for robot in robots.values())
 
 
+def test_controller_preflight_reports_independent_failures_together(monkeypatch) -> None:
+    args = yam.Config(
+        preflight_only=True,
+        left_adapter_serial="LEFT-SERIAL",
+        right_adapter_serial="RIGHT-SERIAL",
+    )
+    monkeypatch.setattr(
+        yam,
+        "preflight_dataset",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("top camera missing")),
+    )
+    monkeypatch.setattr(
+        yam,
+        "resolve_arm_channels",
+        lambda _args: {"left": "can0", "right": "can1"},
+    )
+    monkeypatch.setattr(
+        yam,
+        "IkModel",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("kinematics unavailable")),
+    )
+    monkeypatch.setattr(
+        yam,
+        "check_no_other_control_processes",
+        lambda: (_ for _ in ()).throw(RuntimeError("PID 123 is using the robot")),
+    )
+    monkeypatch.setattr(
+        yam,
+        "check_can_interface",
+        lambda channel: (_ for _ in ()).throw(RuntimeError(f"{channel} is DOWN")),
+    )
+
+    with pytest.raises(yam.SafetyStop) as caught:
+        yam.preflight_runtime(args)
+
+    message = str(caught.value)
+    assert "dataset: top camera missing" in message
+    assert "I2RT/IK dependency: kinematics unavailable" in message
+    assert "competing controller: PID 123 is using the robot" in message
+    assert "left CAN interface can0: can0 is DOWN" in message
+    assert "right CAN interface can1: can1 is DOWN" in message
+
+
 def free_udp_port() -> int:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("127.0.0.1", 0))

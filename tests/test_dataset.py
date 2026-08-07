@@ -158,6 +158,7 @@ def recorder_fixture(
         control_hz,
         dataset_factory=lambda _config, _features: dataset,
         camera_factory=lambda _config: cameras,
+        auth_validator=lambda: None,
     )
     assert recorder is not None
     return recorder, dataset, cameras
@@ -337,6 +338,51 @@ def test_disabled_recording_does_not_call_factories() -> None:
         is None
     )
     assert not called
+
+
+def test_upload_authentication_is_checked_before_camera_or_dataset_creation(tmp_path) -> None:
+    called: list[str] = []
+
+    def reject_auth() -> None:
+        called.append("auth")
+        raise DatasetRecordingError("run `hf auth login`")
+
+    def fail_factory(*_args):
+        called.append("factory")
+        raise AssertionError("factories must not run before authentication succeeds")
+
+    with pytest.raises(DatasetRecordingError, match="hf auth login"):
+        create_dataset_recorder(
+            recording_config(tmp_path, push_to_hub=True),
+            100.0,
+            dataset_factory=fail_factory,
+            camera_factory=fail_factory,
+            auth_validator=reject_auth,
+        )
+
+    assert called == ["auth"]
+
+
+def test_recording_reads_every_camera_before_creating_the_dataset(tmp_path) -> None:
+    cameras = {name: FakeCamera(index) for index, name in enumerate(CAMERA_NAMES)}
+    cameras["right"].image = np.zeros((1, 1, 3), dtype=np.uint8)
+    dataset_created = False
+
+    def make_dataset(*_args):
+        nonlocal dataset_created
+        dataset_created = True
+        return FakeDataset()
+
+    with pytest.raises(DatasetRecordingError, match="dataset camera preflight failed"):
+        create_dataset_recorder(
+            recording_config(tmp_path),
+            100.0,
+            dataset_factory=make_dataset,
+            camera_factory=lambda _config: cameras,
+        )
+
+    assert not dataset_created
+    assert all(camera.disconnected == 1 for camera in cameras.values())
 
 
 @pytest.mark.parametrize(
@@ -810,11 +856,9 @@ def test_upload_can_be_deferred_after_controller_cleanup_error(tmp_path) -> None
 
 
 def test_camera_failure_discards_active_episode_without_killing_writer(tmp_path) -> None:
-    def break_top(cameras: dict[str, FakeCamera]) -> None:
-        cameras["top"].image = np.zeros((1, 1, 3), dtype=np.uint8)
-
-    recorder, dataset, _cameras = recorder_fixture(tmp_path, camera_mutator=break_top)
+    recorder, dataset, cameras = recorder_fixture(tmp_path)
     recorder.start_episode()
+    cameras["top"].image = np.zeros((1, 1, 3), dtype=np.uint8)
 
     with pytest.raises(DatasetFrameError, match="top camera frame shape"):
         add_frame(recorder)
@@ -831,10 +875,8 @@ def test_disconnected_camera_is_reported_as_episode_frame_error(tmp_path) -> Non
         def read_latest(self, max_age_ms: int = 500) -> np.ndarray:
             raise ConnectionError("camera disconnected")
 
-    def disconnect_top(cameras: dict[str, FakeCamera]) -> None:
-        cameras["top"] = DisconnectedCamera()
-
-    recorder, _dataset, _cameras = recorder_fixture(tmp_path, camera_mutator=disconnect_top)
+    recorder, _dataset, _cameras = recorder_fixture(tmp_path)
+    recorder.cameras["top"] = DisconnectedCamera()
     recorder.start_episode()
 
     with pytest.raises(DatasetFrameError, match="camera disconnected"):

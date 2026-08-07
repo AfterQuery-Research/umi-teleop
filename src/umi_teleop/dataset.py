@@ -48,33 +48,88 @@ class DatasetConfig:
     record: bool = False
     """Enable dataset recording; a repo ID is still required."""
     repo_id: str | None = None
+    """Hugging Face dataset ID in OWNER/NAME form."""
+
     root: Path | None = None
+    """Local dataset directory; a new recording requires a nonexistent path."""
+
     task: str | None = None
+    """Natural-language task stored with every recorded frame."""
+
     top_camera_serial: str | None = None
+    """Intel RealSense serial for the top observation camera."""
+
     left_camera_serial: str | None = None
+    """Left RealSense serial when side-camera-kind is realsense."""
+
     right_camera_serial: str | None = None
+    """Right RealSense serial when side-camera-kind is realsense."""
+
     side_camera_kind: SideCameraKind = "realsense"
+    """Use RealSense serials or V4L2 ultrawide paths for the side cameras."""
+
     left_camera_path: Path | None = None
+    """Stable left V4L2 capture path when side-camera-kind is ultrawide."""
+
     right_camera_path: Path | None = None
+    """Stable right V4L2 capture path when side-camera-kind is ultrawide."""
+
     resume: bool = False
+    """Resume the compatible LeRobot dataset already present at root."""
+
     push_to_hub: bool = False
+    """Upload finalized local data after safe controller shutdown."""
+
     private: bool = True
+    """Create or update the Hugging Face dataset repository as private."""
+
     recording_fps: int = DATASET_FPS
+    """Dataset sampling frequency; MolmoAct2 requires 30 Hz."""
+
     post_episode_action: Literal["hold", "neutral"] = "hold"
+    """Hold the stopped pose, or explicitly return both arms to base after saving."""
+
     min_episode_frames: int = 15
+    """Discard an episode unless it contains at least this many frames."""
+
     queue_size: int = 300
+    """Maximum pending dataset operations before recording fails closed."""
+
     camera_max_age_ms: int = 250
+    """Maximum observation-frame age accepted during recording."""
+
     max_control_lag_s: float = 0.10
+    """Control-loop backlog that starts the dataset timing safety timer."""
+
     control_lag_grace_s: float = 0.50
+    """Time allowed for a control backlog to recover before disarming."""
+
     min_free_disk_gb: float = 5.0
+    """Minimum free local storage required before recording starts."""
+
     image_writer_threads_per_camera: int = 2
+    """PNG staging workers per camera when streaming encoding is disabled."""
+
     encoder_threads: int = 2
+    """Video encoder worker count used by LeRobot."""
+
     streaming_encoding: bool = False
+    """Encode each camera stream directly instead of staging PNG frames."""
+
     encoder_queue_size: int = 120
+    """Maximum frames pending in each streaming encoder queue."""
+
     encoder_gop_size: int = DATASET_FPS
+    """Encoded video keyframe interval in frames."""
+
     encoder_preset: str | None = None
+    """Optional FFmpeg encoder preset; streaming H.264 defaults to ultrafast."""
+
     video_codec: Literal["h264", "libsvtav1"] = "h264"
+    """Video codec used for LeRobot observation streams."""
+
     shutdown_timeout_s: float = 60.0
+    """Maximum time allowed for queued writes and encoder shutdown."""
 
     @property
     def enabled(self) -> bool:
@@ -1219,10 +1274,21 @@ def create_dataset_recorder(
     *,
     dataset_factory: DatasetFactory = _default_dataset_factory,
     camera_factory: CameraFactory = _default_camera_factory,
+    auth_validator: Callable[[], None] = _validate_huggingface_auth,
 ) -> DatasetRecorder | None:
     config.validate(control_hz)
     if not config.enabled:
         return None
+
+    if config.push_to_hub:
+        try:
+            auth_validator()
+        except DatasetRecordingError:
+            raise
+        except Exception as exc:
+            raise DatasetRecordingError(
+                f"Hugging Face authentication preflight failed: {exc}"
+            ) from exc
 
     try:
         cameras = camera_factory(config)
@@ -1237,6 +1303,17 @@ def create_dataset_recorder(
             except Exception:
                 pass
         raise DatasetRecordingError("camera factory must return top, left, and right")
+    try:
+        for name, camera in cameras.items():
+            image = camera.read_latest(max_age_ms=config.camera_max_age_ms)
+            _validated_camera_image(name, image, config.camera_shapes[name])
+    except Exception as exc:
+        for camera in reversed(tuple(cameras.values())):
+            try:
+                camera.disconnect()
+            except Exception:
+                pass
+        raise DatasetRecordingError(f"dataset camera preflight failed: {exc}") from exc
     try:
         dataset = dataset_factory(config, dataset_features(config.side_camera_kind))
     except Exception as exc:
