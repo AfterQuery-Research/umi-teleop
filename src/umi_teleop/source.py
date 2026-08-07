@@ -1,8 +1,8 @@
-"""Aggregate two Vive poses, ArUco widths, and Pi buttons for the YAM controller.
+"""Aggregate Vive poses, optional ArUco widths, and controls for the YAM controller.
 
-This process replaces ``umi-vive-receiver`` and ``umi-pi-recorder`` while teleoperating because
-it owns UDP :9001, both USB cameras, and GPIO 17/27.  It never commands a robot; it only emits
-validated telemetry to the YAM controller Pi.
+In the all-local Linux setup it receives native Vive UDP on loopback, reads keyboard controls, and
+emits validated telemetry to ``umi-yam`` on the same host. The legacy Pi setup may also enable its
+two USB cameras and GPIO buttons. This process never opens CAN or commands a robot.
 """
 
 from __future__ import annotations
@@ -17,8 +17,6 @@ from typing import Literal
 import tyro
 
 from umi_teleop.buttons import GpioButtons, KeyboardButtons
-from umi_teleop.camera import LocalGstCamera
-from umi_teleop.gripper import GripperConfig, GripperGeometry, detector_from_config
 from umi_teleop.protocol import (
     ARM_NAMES,
     ButtonState,
@@ -37,8 +35,8 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 
 @dataclass
 class Config:
-    target_host: str = "10.103.3.85"
-    """YAM controller Pi address."""
+    target_host: str = "127.0.0.1"
+    """YAM controller address; loopback is the all-local Linux default."""
     target_port: int = 9140
     """YAM controller UDP port."""
     vive_bind: str = "0.0.0.0"
@@ -71,6 +69,8 @@ class Config:
     record_pin: int = 17
     quit_pin: int = 27
     quit_burst_s: float = 0.75
+    arm_only: bool = False
+    """Skip gripper cameras and require only fresh Vive poses for ZERO and enable."""
 
 
 def _calib(path: str) -> Path:
@@ -105,37 +105,42 @@ def run(cfg: Config) -> None:
         host=cfg.vive_bind,
         port=cfg.vive_port,
     )
-    cameras = {
-        "left": LocalGstCamera(
-            cfg.left_device, cfg.width, cfg.height, cfg.camera_fps, cfg.exposure
-        ),
-        "right": LocalGstCamera(
-            cfg.right_device, cfg.width, cfg.height, cfg.camera_fps, cfg.exposure
-        ),
-    }
-    gripper_cfgs = {
-        "left": GripperConfig(
-            geom=GripperGeometry(),
-            roi_top_frac=cfg.roi_top_frac,
-            calib_path=_calib(cfg.left_calib),
-        ),
-        "right": GripperConfig(
-            geom=GripperGeometry(),
-            roi_top_frac=cfg.roi_top_frac,
-            calib_path=_calib(cfg.right_calib),
-        ),
-    }
-    tag_ids = {"left": cfg.left_tag_ids, "right": cfg.right_tag_ids}
-    workers = {
-        name: WidthWorker(
-            camera,
-            detector_from_config(
-                gripper_cfgs[name], cfg.width, cfg.height, target_ids=tag_ids[name]
+    workers: dict[str, WidthWorker] = {}
+    if not cfg.arm_only:
+        from umi_teleop.camera import LocalGstCamera
+        from umi_teleop.gripper import GripperConfig, GripperGeometry, detector_from_config
+
+        cameras = {
+            "left": LocalGstCamera(
+                cfg.left_device, cfg.width, cfg.height, cfg.camera_fps, cfg.exposure
             ),
-            detect_hz=cfg.detect_hz,
-        )
-        for name, camera in cameras.items()
-    }
+            "right": LocalGstCamera(
+                cfg.right_device, cfg.width, cfg.height, cfg.camera_fps, cfg.exposure
+            ),
+        }
+        gripper_cfgs = {
+            "left": GripperConfig(
+                geom=GripperGeometry(),
+                roi_top_frac=cfg.roi_top_frac,
+                calib_path=_calib(cfg.left_calib),
+            ),
+            "right": GripperConfig(
+                geom=GripperGeometry(),
+                roi_top_frac=cfg.roi_top_frac,
+                calib_path=_calib(cfg.right_calib),
+            ),
+        }
+        tag_ids = {"left": cfg.left_tag_ids, "right": cfg.right_tag_ids}
+        workers = {
+            name: WidthWorker(
+                camera,
+                detector_from_config(
+                    gripper_cfgs[name], cfg.width, cfg.height, target_ids=tag_ids[name]
+                ),
+                detect_hz=cfg.detect_hz,
+            )
+            for name, camera in cameras.items()
+        }
     buttons = (
         GpioButtons(
             record_pin=cfg.record_pin,
@@ -162,15 +167,21 @@ def run(cfg: Config) -> None:
     last_status = 0.0
 
     log.info(
-        "source session=%s; SteamVR UDP :%d -> YAM %s:%d; left=%s right=%s",
+        "source session=%s; Vive UDP :%d -> YAM %s:%d; left=%s right=%s arm_only=%s",
         state.session_id,
         cfg.vive_port,
         cfg.target_host,
         cfg.target_port,
         cfg.left_serial,
         cfg.right_serial,
+        cfg.arm_only,
     )
-    log.info("controls: record tap=enable/disable, record hold=cancel, quit tap=ZERO, hold=quit")
+    if cfg.buttons == "keyboard":
+        log.info("controls: type E=enable/disable, Z=ZERO, C=cancel, Q=quit, then Enter")
+    else:
+        log.info(
+            "controls: record tap=enable/disable, record hold=cancel, quit tap=ZERO, hold=quit"
+        )
 
     try:
         vive.start()
@@ -216,7 +227,14 @@ def run(cfg: Config) -> None:
                 state.safety_disarm()
                 enable_guard.force_block(now)
                 log.warning("tracking stale while enabled; source disarmed")
-            widths = {name: workers[name].snapshot(now) for name in ARM_NAMES}
+            widths = {
+                name: (
+                    workers[name].snapshot(now)
+                    if name in workers
+                    else {"width_mm": None, "age_s": None}
+                )
+                for name in ARM_NAMES
+            }
             if (zero_action := zero_guard.update(state, now, poses_fresh=poses_fresh)) is not None:
                 log.info(
                     "%s enabled=%s zero_id=%d",
@@ -224,15 +242,21 @@ def run(cfg: Config) -> None:
                     state.requested_enabled,
                     state.zero_id,
                 )
-            inputs_fresh = all(
-                name in poses
-                and poses[name]["age_s"] <= cfg.max_pose_age_s
-                and widths[name]["width_mm"] is not None
+            widths_fresh = cfg.arm_only or all(
+                widths[name]["width_mm"] is not None
                 and widths[name]["age_s"] <= cfg.max_width_age_s
                 for name in ARM_NAMES
             )
+            inputs_fresh = poses_fresh and widths_fresh
             if (
-                enable_action := enable_guard.update(state, now, inputs_fresh=inputs_fresh)
+                enable_action := enable_guard.update(
+                    state,
+                    now,
+                    inputs_fresh=inputs_fresh,
+                    stale_description=(
+                        "pose telemetry" if cfg.arm_only else "pose or width telemetry"
+                    ),
+                )
             ) is not None:
                 log.info(
                     "%s enabled=%s toggle_id=%d cancel_id=%d",

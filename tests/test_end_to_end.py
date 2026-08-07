@@ -117,3 +117,67 @@ def test_windows_to_source_to_yam_state_machine_over_udp() -> None:
         yam_receiver.close()
         windows_socket.close()
         source_socket.close()
+
+
+def test_native_linux_to_arm_only_yam_state_machine_over_loopback() -> None:
+    vive_receiver = VivePacketReceiver({"LEFT": "left", "RIGHT": "right"}, host="127.0.0.1", port=0)
+    yam_receiver = UdpTeleopReceiver("127.0.0.1", 0)
+    vive_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    source_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    state = ButtonState(session_id="linux-arm-only")
+    machine = TeleopStateMachine(
+        {"left": GripperMap(40.0, 120.0), "right": GripperMap(40.0, 120.0)},
+        TeleopLimits(max_translation_m=0.4, position_scale=1.5, require_width_to_arm=False),
+    )
+    robot_poses = {"left": np.eye(4), "right": np.eye(4)}
+    no_widths: dict[str, dict] = {}
+
+    def send_vive(left_x: float) -> dict:
+        payload = {
+            "frame": "libsurvive_tracking",
+            "trackers": [
+                {
+                    "serial": "LEFT",
+                    "valid": True,
+                    "pose_age_s": 0.005,
+                    "pos": [0.0, 0.0, -left_x],
+                    "quat": [1.0, 0.0, 0.0, 0.0],
+                },
+                {
+                    "serial": "RIGHT",
+                    "valid": True,
+                    "pose_age_s": 0.005,
+                    "pos": [0.0, 0.0, 0.0],
+                    "quat": [1.0, 0.0, 0.0, 0.0],
+                },
+            ],
+        }
+        vive_socket.sendto(json.dumps(payload).encode(), ("127.0.0.1", vive_receiver.port))
+        return wait_for_vive(vive_receiver, vive_receiver.packet_count + 1)
+
+    vive_receiver.start()
+    try:
+        poses = send_vive(0.0)
+        received, age = send_teleop(source_socket, yam_receiver, state.packet(0, poses, no_widths))
+        assert "tap ZERO" in machine.step(received, age, robot_poses).reason
+
+        state.handle(Event.ZERO)
+        received, age = send_teleop(source_socket, yam_receiver, state.packet(1, poses, no_widths))
+        assert machine.step(received, age, robot_poses).zeroed
+
+        state.handle(Event.TOGGLE)
+        received, age = send_teleop(source_socket, yam_receiver, state.packet(2, poses, no_widths))
+        assert machine.step(received, age, robot_poses).armed
+
+        moved = send_vive(0.1)
+        received, age = send_teleop(source_socket, yam_receiver, state.packet(3, moved, no_widths))
+        result = machine.step(received, age, robot_poses)
+
+        assert result.armed
+        np.testing.assert_allclose(result.targets["left"][:3, 3], [0.15, 0.0, 0.0])
+        assert result.grippers == {"left": None, "right": None}
+    finally:
+        vive_receiver.stop()
+        yam_receiver.close()
+        vive_socket.close()
+        source_socket.close()

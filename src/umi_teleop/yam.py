@@ -105,6 +105,8 @@ class Config:
     position_scale: float = 1.50
     max_joint_speed: float = 0.45
     max_gripper_speed: float = 1.50
+    arm_only: bool = False
+    """Hold both grippers at startup readback and require only fresh Vive poses to arm."""
     joint_limit_margin: float = 0.03
     move_to_ready: bool = False
     move_to_base: bool = False
@@ -454,23 +456,28 @@ def wait_for_stream(
     max_packet_age_s: float,
     max_pose_age_s: float,
     max_width_age_s: float,
+    *,
+    require_width: bool = True,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         packet, age = receiver.poll()
         if packet is not None and age is not None and age <= max_packet_age_s:
-            if all(
+            poses_fresh = all(
                 packet["arms"][name]["pose"] is not None
                 and packet["arms"][name]["pose_age_s"] <= max_pose_age_s
-                and packet["arms"][name]["width_mm"] is not None
+                for name in ARM_NAMES
+            )
+            widths_fresh = not require_width or all(
+                packet["arms"][name]["width_mm"] is not None
                 and packet["arms"][name]["width_age_s"] <= max_width_age_s
                 for name in ARM_NAMES
-            ):
+            )
+            if poses_fresh and widths_fresh:
                 return packet
         time.sleep(0.02)
-    raise SafetyStop(
-        "timed out waiting for two fresh Vive trackers and ArUco widths; no motors were connected"
-    )
+    required = "two fresh Vive trackers" + (" and ArUco widths" if require_width else "")
+    raise SafetyStop(f"timed out waiting for {required}; no motors were connected")
 
 
 def check_joint_target(robot: Any, target: np.ndarray, margin: float) -> bool:
@@ -784,7 +791,7 @@ def run(args: Config) -> None:
         max_translation_m=args.max_translation,
         max_rotation_rad=math.radians(args.max_rotation_deg),
         position_scale=args.position_scale,
-        require_width_to_arm=True,
+        require_width_to_arm=not args.arm_only,
     )
     state = TeleopStateMachine(
         {
@@ -824,6 +831,7 @@ def run(args: Config) -> None:
         args.max_packet_age,
         args.max_pose_age,
         args.max_width_age,
+        require_width=not args.arm_only,
     )
     if (args.move_to_ready or args.move_to_base) and initial_packet["requested_enabled"]:
         raise SafetyStop(
@@ -874,6 +882,11 @@ def run(args: Config) -> None:
                 flush=True,
             )
         joints, grips = read_pair_state(robots)
+        if args.arm_only:
+            print(
+                "ARM-ONLY mode: both grippers will hold their measured startup positions",
+                flush=True,
+            )
         base_pose_verified = False
         startup_recorder = recorder if args.move_to_ready else None
         if startup_recorder is not None:

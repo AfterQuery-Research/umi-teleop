@@ -264,6 +264,18 @@ def test_new_session_requires_a_new_zero_then_separate_enable():
     assert enabled.armed and enabled.targets is not None
 
 
+def test_arm_only_mode_arms_without_widths_and_leaves_grippers_uncommanded():
+    m = machine(require_width_to_arm=False)
+    step(m, packet(width=None))
+    assert step(m, packet(seq=1, zero=1, width=None)).zeroed
+
+    result = step(m, packet(seq=2, enabled=True, zero=1, toggle=1, width=None))
+
+    assert result.armed
+    assert result.targets is not None
+    assert result.grippers == {"left": None, "right": None}
+
+
 def test_external_robot_reset_invalidates_zero_and_requires_a_fresh_one():
     m = machine()
     step(m, packet())

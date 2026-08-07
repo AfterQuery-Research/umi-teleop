@@ -1,6 +1,6 @@
 # UMI Teleop
 
-Standalone Vive teleoperation for two camera-equipped UMIs and two YAM robot arms.
+Standalone native-Linux Vive teleoperation for two UMIs and two YAM robot arms.
 
 > **Physical safety:** `umi-yam --confirm-clear` energizes both arms and holds their current joint
 > positions. Automatic startup motion is opt-in through `--move-to-ready` or `--move-to-base`.
@@ -11,138 +11,125 @@ Standalone Vive teleoperation for two camera-equipped UMIs and two YAM robot arm
 
 ```mermaid
 flowchart LR
-    W["Windows 10.103.3.44<br/>SteamVR + umi-vive-sender"]
-    S["UMI Pi 10.103.3.43<br/>trackers + cameras + buttons"]
-    Y["YAM Pi 10.103.3.85<br/>safety + IK + motor control"]
+    V["Vive trackers + Lighthouse base stations"]
+    N["aq-yam native libsurvive sender"]
+    S["aq-yam arm-only source + keyboard"]
+    Y["aq-yam safety + zero + IK + i2rt"]
     C["Top RealSense + selectable side cameras<br/>optional dataset recording"]
     H["Hugging Face dataset<br/>optional private upload"]
     L["Left YAM<br/>USB serial to current canN"]
     R["Right YAM<br/>USB serial to current canN"]
-    W -->|"broadcast tracker JSON/UDP :9001"| S
-    S -->|"poses + widths + controls JSON/UDP :9140"| Y
+    V -->|"Watchman USB"| N
+    N -->|"poses on loopback UDP :9001"| S
+    S -->|"validated controls on loopback UDP :9140"| Y
     C -->|"top + left + right RGB"| Y
     Y -.->|"finalized LeRobot v3 dataset"| H
     Y --> L
     Y --> R
 ```
 
-The Windows sender broadcasts raw SteamVR poses to UDP port `9001`, so the UMI Pi and monitoring
-computers on the same local network can receive the stream simultaneously. The UMI Pi converts
-poses to `+X` forward, `+Y` left, `+Z` up; measures both grippers from calibrated ArUco tags; reads
-the E/Z buttons; and sends one validated packet at 30 Hz. The YAM Pi owns zeroing, workspace limits,
-inverse kinematics, joint limits, slew limits, CAN access, and motor commands. The two UMI
-ArUco-camera images never leave the UMI Pi. Optional policy-dataset images come from a top
-RealSense plus either two RealSense or two ultrawide side cameras connected to the YAM Pi, and
+The complete live path runs on `aq-yam`. `umi-vive-linux` reads the Watchman receivers directly
+through libsurvive, with no Steam or SteamVR installation. `umi-source --arm-only` validates and
+maps the two tracker serials, carries sensor age and explicit tracking loss forward, and reads
+keyboard controls. `umi-yam --arm-only` owns zeroing, workspace limits, inverse kinematics, joint
+limits, slew limits, CAN access, and motor commands. Its grippers hold their measured startup
+positions; tracker motion never commands them. No UMI Pi, Windows machine, ArUco camera, GPIO, SSH,
+or network switch is part of the teleoperation runtime path.
+
+The two UDP hops use `127.0.0.1`. They retain the existing independently testable packet boundaries
+without adding network latency. Optional policy-dataset cameras connect directly to `aq-yam` and
 leave it only when explicit Hub upload is enabled.
 
-One root `pyproject.toml` and lockfile keep the protocol and safety code on one version. Install only
-the relevant hardware extra on each device: `windows`, `source`, or `yam`. Every CLI uses Tyro;
-run any command with `--help` to override its typed defaults.
+One root `pyproject.toml` and lockfile keep the tracker, protocol, safety, and tested AfterQuery
+`i2rt` revision together. Every Python CLI uses Tyro; run a command with `--help` to inspect or
+override its typed defaults.
 
 ## Fixed Setup
 
-| Role | Address / mapping |
+| Role | Mapping |
 |---|---|
-| Windows SteamVR host | `aq@10.103.3.44`, broadcasts raw poses on UDP `9001` |
-| UMI source Pi | `aq@10.103.3.43`, receives UDP `9001`, sends to `10.103.3.85:9140` |
-| YAM controller Pi | `yam@10.103.3.85`, receives UDP `9140` |
-| Left leader | UMI2, tracker `LHR-BBAF093A`, camera tags `2/3` |
-| Right leader | UMI1, tracker `LHR-C891E882`, camera tags `0/1` |
-| Left follower | CAN adapter USB serial selected at startup |
-| Right follower | CAN adapter USB serial selected at startup |
+| Teleoperation host | `aq-yam@aq-yam.local` |
+| Native tracker input | Watchman USB receivers, local UDP `127.0.0.1:9001` |
+| Local controller input | local UDP `127.0.0.1:9140` |
+| Left leader | tracker `LHR-BBAF093A` |
+| Right leader | tracker `LHR-C891E882` |
+| Left follower | CAN adapter serial `209D378045465008` |
+| Right follower | CAN adapter serial `206237A845465006` |
 
-The calibrated camera files and the safe I2RT gripper encoder-wrap correction are included in this
-repository. No `robot-umi`, `vive-tracking`, `gello`, or patched I2RT checkout is required.
+The native Lighthouse calibration is local machine data under `~/.config/umi-teleop`. The tested
+AfterQuery `i2rt` commit containing the multi-turn gripper encoder-wrap fix is pinned in `uv.lock`.
+No separate `robot-umi`, SteamVR, UMI Pi, or patched I2RT checkout is required.
 
 ## Install
 
-All three devices must clone the same commit from the private repository:
-
-```text
-https://github.com/AfterQuery-Research/umi-teleop.git
-```
-
-### Windows SteamVR host
-
-In PowerShell, install [uv](https://docs.astral.sh/uv/getting-started/installation/), then:
-
-```powershell
-git clone https://github.com/AfterQuery-Research/umi-teleop.git C:\umi-teleop
-cd C:\umi-teleop
-uv sync --locked --extra windows --no-dev
-```
-
-Before starting the sender:
-
-1. Plug in and power on both Vive base stations.
-2. Press the center button on each Vive tracker.
-3. Wait for each tracker light to turn green. Green means the tracker is paired and connected.
-4. Confirm that both trackers appear in SteamVR on Windows.
-
-### UMI source Pi
-
-The source uses system GStreamer/PyGObject for both USB cameras and its own uv environment for the
-rest:
+Run the following on `aq-yam`:
 
 ```bash
 sudo apt update
-sudo apt install -y git curl v4l-utils python3-gi gir1.2-gstreamer-1.0 \
-  gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good
-sudo usermod -aG video,dialout aq
+sudo apt install -y git curl build-essential cmake pkg-config can-utils \
+  libusb-1.0-0-dev liblapacke-dev libopenblas-dev freeglut3-dev libx11-dev
+sudo usermod -aG plugdev aq-yam
 curl -LsSf https://astral.sh/uv/install.sh | sh
-git clone https://github.com/AfterQuery-Research/umi-teleop.git /home/aq/umi-teleop
-cd /home/aq/umi-teleop
-uv venv --python /usr/bin/python3 --system-site-packages
-uv sync --locked --extra source --no-dev
-```
-
-Reconnect to the Pi once after changing group membership.
-
-Do not run the old recorder, Vive receiver, or button programs at the same time. They share UDP
-port `9001`, GPIO `17/27`, and both cameras with `umi-source`.
-
-### YAM controller Pi
-
-```bash
-sudo apt update
-sudo apt install -y git curl build-essential cmake ninja-build can-utils
-curl -LsSf https://astral.sh/uv/install.sh | sh
-mkdir -p /home/yam/Documents/Repos
+mkdir -p /home/aq-yam/Documents/Repos
 git clone https://github.com/AfterQuery-Research/umi-teleop.git \
-  /home/yam/Documents/Repos/umi-teleop
-cd /home/yam/Documents/Repos/umi-teleop
+  /home/aq-yam/Documents/Repos/umi-teleop
+cd /home/aq-yam/Documents/Repos/umi-teleop
 uv sync --locked --extra yam --no-dev
+./scripts/build-linux-vive.sh
+sudo install -m 0644 config/udev/81-vive-watchman.rules \
+  /etc/udev/rules.d/81-vive-watchman.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger
 ```
 
-To record MolmoAct2-compatible LeRobot datasets on this computer, install the optional Python
-3.12 recording stack as well:
+Log out and back in once after the `plugdev` group change, then replug the three Watchman receivers.
+The udev rule grants device access only; it does not start a service or process. This repository
+does not require systemd.
+
+To record MolmoAct2-compatible LeRobot datasets on the same computer, install the optional Python
+3.12 recording stack:
 
 ```bash
 uv sync --locked --extra yam --extra dataset --no-dev
 ```
 
-This adds LeRobot's dataset writer and RealSense support only on the YAM computer. It is not
-needed on Windows or the UMI source Pi.
+This adds LeRobot's dataset writer and RealSense support. It is not needed for arm-only
+teleoperation.
+
+### Calibrate native tracking once
+
+Plug in and power both base stations. Press the center button on every Vive tracker and wait for a
+green status light. Put all trackers on a stationary surface visible to both base stations, then
+run:
+
+```bash
+cd /home/aq-yam/Documents/Repos/umi-teleop
+.venv/bin/umi-vive-linux --calibrate
+```
+
+Leave the trackers still until libsurvive has decoded both base stations, solved the global scene,
+and reports valid poses for all trackers. Press Ctrl+C. Later tracking runs reuse the calibration
+under `~/.config/umi-teleop`; repeat calibration only after moving a base station.
 
 #### Discover and configure CAN
 
-Stop robot-control processes, then list the adapters without opening a CAN bus or sending frames:
+Stop robot-control processes, then list the adapters without opening CAN or sending frames:
 
 ```bash
-cd /home/yam/Documents/Repos/umi-teleop
+cd /home/aq-yam/Documents/Repos/umi-teleop
 .venv/bin/umi-setup-can
 ```
 
 The USB serial identifies an adapter even if Linux changes its `canN` name. Determine which cable
 goes to each arm and label it. Never connect or disconnect powered CAN hardware. If an adapter must
-be connected by itself to establish the mapping, first shut down the Pi and remove YAM power.
+be connected by itself to establish the mapping, first shut down `aq-yam` and remove YAM power.
 
 Set the installation's left and right serials in the YAM shell. Replace the two example names with
 the serials reported above:
 
 ```bash
-export LEFT_CAN=LEFT_ADAPTER_USB_SERIAL
-export RIGHT_CAN=RIGHT_ADAPTER_USB_SERIAL
+export LEFT_CAN=209D378045465008
+export RIGHT_CAN=206237A845465006
 ```
 
 Configure both adapters after every reboot or replug:
@@ -157,62 +144,66 @@ ip -details -statistics link show type can
 
 This performs only `ip link` setup and verification. It does not import i2rt, open a CAN bus, send
 motor frames, or move the robot. Both links must report `UP`, Classic CAN at `1000000` bit/s, and
-`ERROR-ACTIVE`. You do not need to repeat setup before each run unless the Pi rebooted or an adapter
-was replugged.
+`ERROR-ACTIVE`. You do not need to repeat setup before each run unless `aq-yam` rebooted or an
+adapter was replugged.
 
 ## Bring Up
 
-1. Power the Pis and YAMs. Start SteamVR and wake both trackers.
-2. On Windows, start tracker streaming:
-
-   ```powershell
-   cd C:\umi-teleop
-   .\.venv\Scripts\umi-vive-sender.exe
-   ```
-
-   The default destination is the local broadcast address `255.255.255.255`, allowing any receiver
-   bound to UDP `9001` on the same broadcast network to consume the packets. Use `--target-host`
-   only when a specific unicast destination is required. The UDP stream is unauthenticated and
-   unencrypted, so broadcast it only on a trusted local network.
-
-3. In a dedicated terminal, start the UMI source and inspect its live health:
+1. Power the YAMs and base stations. Wake the left and right trackers and wait for green lights.
+2. In terminal 1 on `aq-yam`, start native tracking:
 
    ```bash
-   ssh -t aq@10.103.3.43 \
-     'cd /home/aq/umi-teleop && GPIOZERO_PIN_FACTORY=lgpio .venv/bin/umi-source'
+   cd /home/aq-yam/Documents/Repos/umi-teleop
+   .venv/bin/umi-vive-linux
    ```
 
-   Keep this terminal open. Continue only when its logs show `enabled=False`, left/right
-   `pose_age` and `width_age` below `0.5`, nonempty left/right `width_mm`, and `bad_vive=0`.
-
-4. Put both arms in the intended base pose and clear the full arm workspace. In a dedicated
-   terminal, connect to the YAM Pi, set the same two adapter serials used during CAN setup, and
-   start the controller:
+   To inspect the stream before continuing, run the following in another terminal while
+   `umi-source` is stopped:
 
    ```bash
-   ssh -t yam@10.103.3.85
-   cd /home/yam/Documents/Repos/umi-teleop
-   export LEFT_CAN=LEFT_ADAPTER_USB_SERIAL
-   export RIGHT_CAN=RIGHT_ADAPTER_USB_SERIAL
+   ./scripts/check-linux-vive-stream.py \
+     --expect-serial LHR-BBAF093A \
+     --expect-serial LHR-C891E882
+   ```
+
+3. In terminal 2, start the arm-only source and keep this terminal focused for controls:
+
+   ```bash
+   cd /home/aq-yam/Documents/Repos/umi-teleop
+   .venv/bin/umi-source --arm-only --buttons keyboard --send-hz 60
+   ```
+
+   Continue only when it reports `enabled=False`, fresh left/right pose ages, and `bad_vive=0`.
+
+4. Clear the full workspace around both arms. In terminal 3, start the local YAM controller:
+
+   ```bash
+   cd /home/aq-yam/Documents/Repos/umi-teleop
+   export LEFT_CAN=209D378045465008
+   export RIGHT_CAN=206237A845465006
    .venv/bin/umi-yam \
+     --arm-only \
      --left-adapter-serial "$LEFT_CAN" \
      --right-adapter-serial "$RIGHT_CAN" \
+     --hz 50 \
+     --max-packet-age 0.25 \
+     --max-pose-age 0.20 \
      --confirm-clear
    ```
 
-   It resolves each USB serial to its current `canN` name, refuses competing controllers, validates
-   both CAN buses, waits for fresh telemetry, energizes the arms, and holds their current positions.
-   It does not command a startup trajectory unless `--move-to-ready` or `--move-to-base` is passed
-   explicitly. Wait for:
+   It resolves each USB serial to its current `canN`, refuses competing controllers, validates both
+   buses, waits for fresh local telemetry, energizes the arms, and holds their current joints and
+   grippers. It does not command a startup trajectory unless `--move-to-ready` or `--move-to-base`
+   is passed explicitly. Wait for:
 
    ```text
-   robots holding current pose; tap the Pi ZERO button before enable
+   robots holding current pose; tap ZERO before enable
    ```
 
-5. Hold both UMIs in the intended neutral pose, especially the right UMI, then:
-   - Tap **Z** once.
+5. Hold both UMIs in the intended neutral pose, especially the right UMI, then use terminal 2:
+   - Type **Z**, then Enter.
    - Wait at least **5 seconds** for the post-zero enable cooldown.
-   - Tap **E** once and keep the UMIs steady during the 3-second enable confirmation.
+   - Type **E**, then Enter, and keep the UMIs steady during the 3-second enable confirmation.
    - Begin with small motions.
 
 The right UMI orientation at Z defines the shared command axes. Each arm otherwise follows its own
@@ -223,13 +214,15 @@ robot translation while preventing a larger raw motion from producing an unbound
 
 ## Controls
 
-| Control | Action |
+Type each key in the `umi-source` terminal and press Enter.
+
+| Key | Action |
 |---|---|
-| E tap while disabled | Request enable; commits after 3 quiet seconds with fresh poses and widths |
-| E tap while enabled | Disable immediately; a recording run saves, then returns both arms to base |
-| E hold for 1 second | Cancel/disarm immediately |
-| Z tap | Disable, wait 0.4 seconds for fresh poses, then capture a new zero |
-| Z hold for 1 second | Ask the source and YAM controller to quit |
+| E while disabled | Request enable; commits after 3 quiet seconds with fresh poses |
+| E while enabled | Disable immediately |
+| Z | Disable, wait for fresh poses, then capture a new zero |
+| C | Cancel and disarm immediately |
+| Q | Ask the source and YAM controller to quit |
 
 A new source process always creates a new session ID, so the YAM controller requires a new Z before
 it can enable. Z can be used again during a session; it disarms first and captures the current UMI
@@ -239,13 +232,13 @@ and robot poses as the next references.
 
 Recording is optional and runs inside `umi-yam`, which remains the only process allowed to own the
 YAM CAN buses. Do not run `lerobot-record`, policy inference, or another `umi-yam` at the same time.
-The UMI source Pi keeps owning its two ArUco cameras; the YAM computer separately owns three
-RealSense policy cameras.
+The source remains in arm-only mode. Three policy-dataset cameras connect directly to `aq-yam`;
+they are independent of Vive tracking.
 
 First discover and identify the RealSense cameras from the LeRobot checkout:
 
 ```bash
-cd /home/yam/Documents/Repos/lerobot
+cd /home/aq-yam/Documents/Repos/lerobot
 uv run lerobot-find-cameras realsense
 ```
 
@@ -266,7 +259,7 @@ once before requesting upload; the token stays in Hugging Face's normal credenti
 never passed to `umi-yam`:
 
 ```bash
-cd /home/yam/Documents/Repos/umi-teleop
+cd /home/aq-yam/Documents/Repos/umi-teleop
 .venv/bin/hf auth login
 ```
 
@@ -275,10 +268,11 @@ then run:
 
 ```bash
 .venv/bin/umi-yam \
+  --arm-only \
   --left-adapter-serial "$LEFT_CAN" \
   --right-adapter-serial "$RIGHT_CAN" \
   --dataset.repo-id AfterQuery-Research/YOUR_DATASET_NAME \
-  --dataset.root /home/yam/Datasets/YOUR_DATASET_NAME \
+  --dataset.root /home/aq-yam/Datasets/YOUR_DATASET_NAME \
   --dataset.task "Pick up the oranges and put them in the bowl" \
   --dataset.top-camera-serial "$TOP_CAMERA" \
   --dataset.left-camera-serial "$LEFT_CAMERA" \
@@ -299,10 +293,11 @@ export LEFT_WIDE=/dev/v4l/by-path/platform-xhci-hcd.1-usb-0:1.4.4.4:1.0-video-in
 export RIGHT_WIDE=/dev/v4l/by-path/platform-xhci-hcd.1-usb-0:1.4.4.3:1.0-video-index0
 
 .venv/bin/umi-yam \
+  --arm-only \
   --left-adapter-serial "$LEFT_CAN" \
   --right-adapter-serial "$RIGHT_CAN" \
   --dataset.repo-id AfterQuery-Research/YOUR_ULTRAWIDE_DATASET_NAME \
-  --dataset.root /home/yam/Datasets/YOUR_ULTRAWIDE_DATASET_NAME \
+  --dataset.root /home/aq-yam/Datasets/YOUR_ULTRAWIDE_DATASET_NAME \
   --dataset.task "Pick up the oranges and put them in the bowl" \
   --dataset.top-camera-serial "$TOP_CAMERA" \
   --dataset.side-camera-kind ultrawide \
@@ -335,7 +330,7 @@ locally, and uploads privately. The local dataset is retained if login or upload
 
 To append during a later run, use the same repo ID and root and add `--dataset.resume`. Omit
 `--dataset.push-to-hub` to collect and validate locally without uploading. H.264/yuv420p is the
-Raspberry Pi default. Streaming H.264 uses a 30-frame GOP and the `ultrafast` x264 preset so the
+default. Streaming H.264 uses a 30-frame GOP and the `ultrafast` x264 preset so the
 three camera encoders can keep up with capture without starving arm control. RGB statistics are
 computed from the completed videos after an episode ends instead of competing with live encoding,
 so saving an episode can take a little longer. If the
@@ -360,23 +355,22 @@ If upload fails after the robots have closed, retry it without opening cameras o
 ```bash
 .venv/bin/umi-dataset-upload \
   --repo-id AfterQuery-Research/YOUR_DATASET_NAME \
-  --root /home/yam/Datasets/YOUR_DATASET_NAME
+  --root /home/aq-yam/Datasets/YOUR_DATASET_NAME
 ```
 
 ## Stop
 
-1. Tap **E** once if the source is enabled; verify `enabled=False` in the source log.
+1. Type **E**, then Enter, if the source is enabled; verify `enabled=False` in its log.
 2. Support both YAM arms, then press Ctrl+C in the `umi-yam` terminal. Torque holding is released.
-3. Press Ctrl+C in the UMI source terminal.
-
-4. Press Ctrl+C in the Windows sender, then power down hardware.
+3. Press Ctrl+C in the `umi-source` terminal.
+4. Press Ctrl+C in the `umi-vive-linux` terminal, then power down hardware.
 
 ## Recovery
 
 - **Startup says the source is enabled:** tap E once to disable it, verify `enabled=False`, and rerun
   `umi-yam --confirm-clear`.
-- **Vive or width telemetry is stale:** make both trackers visible and both ArUco tag pairs visible;
-  do not enable until both ages recover.
+- **Vive telemetry is stale:** make both trackers visible to the base stations; do not enable until
+  both pose ages recover.
 - **YAM controller disarms while the source still says enabled:** tap E once to synchronize the
   source back to disabled. To continue from the current robot pose after a safety disarm, hold the
   UMIs neutral, tap Z, wait 5 seconds, then tap E. An intentional recording stop returns to the
@@ -396,7 +390,7 @@ If upload fails after the robots have closed, retry it without opening cameras o
   command. It never automatically rearms after these safety events.
 - **CAN is missing, down, in CAN FD mode, or at the wrong bitrate:** stop robot controllers and rerun
   `umi-setup-can` with the two adapter serials. Never use `can0`/`can1` order to infer arm side.
-- **Inspect packets without motors:** run `.venv/bin/umi-yam --monitor-only` on the YAM Pi.
+- **Inspect packets without motors:** run `.venv/bin/umi-yam --monitor-only` on `aq-yam`.
 
 ## Development Verification
 
@@ -408,9 +402,9 @@ uv run pytest
 uv build
 ```
 
-The test suite covers SteamVR packet construction, OpenVR coordinate conversion, strict protocol
-validation, GPIO state guards, camera buffering, calibrated ArUco geometry, serial-based CAN
-discovery/setup, zero/enable/session behavior, Cartesian limits, gripper mapping, the I2RT
-encoder-wrap correction, dataset episode and schema behavior, and UDP integration across the
-Windows, source, YAM, and recorder layers. With the `dataset` extra installed, it also writes,
+The test suite covers native libsurvive and legacy OpenVR packets, sensor-age and tracking-loss
+propagation, strict protocol validation, arm-only and camera-backed source modes, serial-based CAN
+discovery/setup, zero/enable/session behavior, Cartesian limits, gripper holding, the I2RT
+encoder-wrap correction, dataset episode and schema behavior, and loopback UDP integration across
+the tracker, source, YAM, and recorder layers. With the `dataset` extra installed, it also writes,
 finalizes, reopens, and decodes a real local LeRobot v3 video dataset.

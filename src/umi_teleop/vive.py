@@ -1,14 +1,13 @@
-"""Pure-numpy Vive helpers shared by the Pi receiver and the Mac multi-UMI monitor.
+"""Pure-numpy Vive helpers shared by the source receiver and multi-UMI monitor.
 
-The Windows ``vive-tracking`` sender emits one UDP packet holding ALL visible trackers
+The Windows OpenVR and native Linux libsurvive senders emit one UDP packet holding all trackers
 (``{"t": epoch, "trackers": [{"serial", "valid", "pos", "quat"}, ...]}``) in one global
 lighthouse frame. This module owns:
 
-- the OpenVR->ROS conversion (moved here from ``scripts/run_vive_receiver.py`` so both the
-  Pi bridge and the Mac monitor import the *same* math), and
+- the tracking-frame to ROS conversion used by the source and monitor, and
 - :func:`parse_trackers` / :class:`MultiViveZeroer` for the multi-tracker Mac monitor.
 
-Everything here is numpy-only (no ROS, no sockets) so it runs unchanged on the Mac and is
+Everything here is numpy-only (no ROS, no sockets) so it runs unchanged on every host and is
 unit-testable. Quaternions are ``[x, y, z, w]`` unless a name says ``wxyz``.
 """
 
@@ -46,6 +45,14 @@ class VivePose:
     serial: str
     position: np.ndarray
     orientation_xyzw: np.ndarray
+
+
+@dataclass(frozen=True)
+class TrackerUpdate:
+    """One wire update plus its age on the tracker host."""
+
+    pose: TrackerPose | None
+    sample_age_s: float = 0.0
 
 
 def normalize(q: np.ndarray) -> np.ndarray:
@@ -118,6 +125,18 @@ def openvr_pose_to_ros(pos: Any, quat_wxyz: Any) -> TrackerPose:
     return p_ros, matrix_to_quat_xyzw(r_ros)
 
 
+def libsurvive_pose_to_ros(pos: Any, quat_wxyz: Any) -> TrackerPose:
+    """Convert libsurvive's object-to-tracking pose into the established control basis.
+
+    Both backends expose object-to-world transforms with ``wxyz`` quaternions. Libsurvive's
+    calibrated world orientation is arbitrary, but the normal YAM setup captures the right UMI's
+    orientation at ZERO and therefore removes that constant world basis. Applying the established
+    basis and tracker body correction here preserves the downstream packet contract and handle-axis
+    behavior while keeping Windows packets backward compatible.
+    """
+    return openvr_pose_to_ros(pos, quat_wxyz)
+
+
 def _trackers(packet: Any) -> list[Any]:
     if not isinstance(packet, dict):
         raise ValueError("packet must be a JSON object")
@@ -125,6 +144,13 @@ def _trackers(packet: Any) -> list[Any]:
     if not isinstance(trackers, list):
         raise ValueError("packet['trackers'] must be a list")
     return trackers
+
+
+def _packet_frame(packet: dict[str, Any]) -> str:
+    frame = packet.get("frame", "openvr")
+    if frame not in ("openvr", "libsurvive_tracking"):
+        raise ValueError(f"unsupported Vive packet frame {frame!r}")
+    return str(frame)
 
 
 def _tracker_pose_fields(tracker: Any) -> tuple[str, Any, Any] | None:
@@ -145,24 +171,17 @@ def _tracker_pose_fields(tracker: Any) -> tuple[str, Any, Any] | None:
 
 
 def valid_tracker_serials(packet: Any) -> list[str]:
-    serials = []
-    for tracker in _trackers(packet):
-        fields = _tracker_pose_fields(tracker)
-        if fields is not None:
-            serials.append(fields[0])
-    return serials
+    return [serial for serial, update in tracker_updates(packet).items() if update.pose is not None]
 
 
 def pose_from_packet(packet: Any, tracker_serial: str | None = None) -> VivePose | None:
     """First valid tracker (or the one matching ``tracker_serial``) as a ROS-frame VivePose."""
-    for tracker in _trackers(packet):
-        fields = _tracker_pose_fields(tracker)
-        if fields is None:
+    for serial, update in tracker_updates(packet).items():
+        if update.pose is None:
             continue
-        serial, pos, quat = fields
         if tracker_serial is not None and serial != tracker_serial:
             continue
-        position, orientation = openvr_pose_to_ros(pos, quat)
+        position, orientation = update.pose
         return VivePose(serial=serial, position=position, orientation_xyzw=orientation)
     return None
 
@@ -173,14 +192,44 @@ def parse_trackers(packet: Any) -> dict[str, TrackerPose]:
     Valid-but-malformed trackers (missing pos/quat/serial) are skipped, not fatal, so one bad
     entry never drops the rest of the packet.
     """
-    poses: dict[str, TrackerPose] = {}
-    for tracker in _trackers(packet):
+    return {
+        serial: update.pose
+        for serial, update in tracker_updates(packet).items()
+        if update.pose is not None
+    }
+
+
+def tracker_updates(packet: Any) -> dict[str, TrackerUpdate]:
+    """Parse valid poses and explicit invalidations from either supported Vive backend."""
+    trackers = _trackers(packet)
+    frame = _packet_frame(packet)
+    convert = openvr_pose_to_ros if frame == "openvr" else libsurvive_pose_to_ros
+    updates: dict[str, TrackerUpdate] = {}
+    for tracker in trackers:
+        if not isinstance(tracker, dict):
+            raise ValueError("tracker entry must be a JSON object")
+        serial_value = tracker.get("serial")
+        if serial_value is None:
+            continue
+        serial = str(serial_value)
+        if not tracker.get("valid"):
+            updates[serial] = TrackerUpdate(pose=None)
+            continue
         fields = _tracker_pose_fields(tracker)
         if fields is None:
             continue
         serial, pos, quat = fields
-        poses[serial] = openvr_pose_to_ros(pos, quat)
-    return poses
+        sample_age = tracker.get("pose_age_s", 0.0)
+        if isinstance(sample_age, bool) or not isinstance(sample_age, (int, float)):
+            raise ValueError("pose_age_s must be a non-negative finite number")
+        sample_age_s = float(sample_age)
+        if not np.isfinite(sample_age_s) or sample_age_s < 0.0:
+            raise ValueError("pose_age_s must be a non-negative finite number")
+        updates[serial] = TrackerUpdate(
+            pose=convert(pos, quat),
+            sample_age_s=sample_age_s,
+        )
+    return updates
 
 
 class MultiViveZeroer:

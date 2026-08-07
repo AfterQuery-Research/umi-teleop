@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from umi_teleop.types import Event
-from umi_teleop.vive import parse_trackers
+from umi_teleop.vive import tracker_updates
 
 PROTOCOL_VERSION = 1
 ARM_NAMES = ("left", "right")
@@ -237,7 +237,14 @@ class EnableRequestGuard:
             self._block(now)
         return "applied immediately"
 
-    def update(self, state: ButtonState, now: float, *, inputs_fresh: bool) -> str | None:
+    def update(
+        self,
+        state: ButtonState,
+        now: float,
+        *,
+        inputs_fresh: bool,
+        stale_description: str = "pose or width telemetry",
+    ) -> str | None:
         """Commit a pending enable after its quiet period, or reject it fail-closed."""
         if self._pending_until is None or now < self._pending_until:
             return None
@@ -245,7 +252,7 @@ class EnableRequestGuard:
         if not inputs_fresh:
             state.handle(Event.CANCEL)
             self._block(now)
-            return "enable rejected because pose or width telemetry is stale"
+            return f"enable rejected because {stale_description} is stale"
         state.handle(Event.START)
         return "enable confirmed after quiet period"
 
@@ -348,21 +355,32 @@ class VivePacketReceiver:
                 continue
             try:
                 raw = json.loads(data.decode("utf-8"))
-                poses = parse_trackers(raw)
+                updates = tracker_updates(raw)
             except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
                 self.bad_packet_count += 1
                 continue
             received_at = time.monotonic()
-            updates: dict[str, _StampedPose] = {}
-            for serial, (position, quat) in poses.items():
+            stamped: dict[str, _StampedPose] = {}
+            invalid_arms: set[str] = set()
+            for serial, update in updates.items():
                 arm = self.serial_to_arm.get(serial)
                 if arm is None:
                     continue
+                if update.pose is None:
+                    invalid_arms.add(arm)
+                    continue
+                position, quat = update.pose
                 pose = tuple(float(v) for v in (*position, *quat))
-                updates[arm] = _StampedPose(serial=serial, pose=pose, received_at=received_at)
+                stamped[arm] = _StampedPose(
+                    serial=serial,
+                    pose=pose,
+                    received_at=received_at - update.sample_age_s,
+                )
             with self._lock:
                 self.packet_count += 1
-                self._latest.update(updates)
+                for arm in invalid_arms:
+                    self._latest.pop(arm, None)
+                self._latest.update(stamped)
 
     def snapshot(self, now: float | None = None) -> dict[str, dict[str, Any]]:
         now = time.monotonic() if now is None else now

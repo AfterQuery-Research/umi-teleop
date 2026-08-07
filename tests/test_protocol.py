@@ -7,6 +7,7 @@ import time
 import numpy as np
 import pytest
 
+from umi_teleop.buttons import KeyboardButtons
 from umi_teleop.protocol import (
     ButtonState,
     EnableRequestGuard,
@@ -78,6 +79,12 @@ def test_default_side_mapping_keeps_each_physical_umi_paired():
         (2, 3),
     )
     assert cfg.zero_timeout_s == 4.0
+    assert cfg.target_host == "127.0.0.1"
+    assert not cfg.arm_only
+
+
+def test_keyboard_e_toggles_enable():
+    assert KeyboardButtons.KEYMAP["e"] is Event.TOGGLE
 
 
 def test_packet_round_trip_and_rejects_nonfinite_or_bad_quaternion():
@@ -200,6 +207,43 @@ def test_vive_receiver_maps_both_serials_and_ages():
         assert snap["left"]["serial"] == "A"
         assert snap["right"]["pose"][:3] == [0.0, -1.0, 0.0]
         assert snap["left"]["age_s"] >= 0.0
+    finally:
+        sender.close()
+        receiver.stop()
+
+
+def test_native_vive_receiver_propagates_sensor_age_and_clears_invalid_pose():
+    receiver = VivePacketReceiver({"A": "left", "B": "right"}, host="127.0.0.1", port=0)
+    receiver.start()
+    sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        valid = {
+            "frame": "libsurvive_tracking",
+            "trackers": [
+                {
+                    "serial": "A",
+                    "valid": True,
+                    "pose_age_s": 0.08,
+                    "pos": [0, 0, 0],
+                    "quat": [1, 0, 0, 0],
+                }
+            ],
+        }
+        sender.sendto(json.dumps(valid).encode(), ("127.0.0.1", receiver.port))
+        deadline = time.time() + 1.0
+        while receiver.packet_count < 1 and time.time() < deadline:
+            time.sleep(0.01)
+        assert receiver.snapshot()["left"]["age_s"] >= 0.075
+
+        invalid = {
+            "frame": "libsurvive_tracking",
+            "trackers": [{"serial": "A", "valid": False}],
+        }
+        sender.sendto(json.dumps(invalid).encode(), ("127.0.0.1", receiver.port))
+        deadline = time.time() + 1.0
+        while receiver.packet_count < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        assert "left" not in receiver.snapshot()
     finally:
         sender.close()
         receiver.stop()

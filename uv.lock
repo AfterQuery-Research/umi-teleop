@@ -761,7 +761,7 @@ wheels = [
 [[package]]
 name = "i2rt"
 version = "1.1.2"
-source = { url = "https://github.com/i2rt-robotics/i2rt/archive/refs/tags/v1.2.4.tar.gz" }
+source = { git = "https://github.com/AfterQuery-Research/i2rt.git?rev=e599e9db90d644db6efe0b16bb6fd7cb87c4272f#e599e9db90d644db6efe0b16bb6fd7cb87c4272f" }
 dependencies = [
     { name = "click" },
     { name = "crcmod-plus" },
@@ -783,35 +783,6 @@ dependencies = [
     { name = "tyro" },
     { name = "viser" },
 ]
-sdist = { hash = "sha256:5174200c0ab51cf2dcaff5fce8f06269c0c69cb41235bde123becf4c08c28072" }
-
-[package.metadata]
-requires-dist = [
-    { name = "click", specifier = "<8.2.0" },
-    { name = "crcmod-plus", specifier = ">=2.3.1" },
-    { name = "dm-env", specifier = "==1.6" },
-    { name = "mink", specifier = ">=0.0.13" },
-    { name = "mujoco", specifier = ">=3.3.5" },
-    { name = "numpy", specifier = "==2.2.6" },
-    { name = "portal", specifier = "==3.7.3" },
-    { name = "pydantic", specifier = ">=2.0" },
-    { name = "pygame", specifier = "==2.6.1" },
-    { name = "pyright", marker = "extra == 'dev'", specifier = ">=1.1.408" },
-    { name = "pyserial", specifier = ">=3.5" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.4.0" },
-    { name = "pytest-xdist", marker = "extra == 'dev'", specifier = ">=3.8.0" },
-    { name = "python-can", specifier = "==4.5.0" },
-    { name = "pyyaml", specifier = ">=6.0.0" },
-    { name = "qpsolvers", extras = ["quadprog"], specifier = "==4.7.1" },
-    { name = "rerun-sdk", specifier = ">=0.32.2" },
-    { name = "rpi-lgpio", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'armv6l' and sys_platform == 'linux') or (platform_machine == 'armv7l' and sys_platform == 'linux')", specifier = ">=0.6" },
-    { name = "ruckig", specifier = "==0.15.3" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15.6" },
-    { name = "threadpoolctl", specifier = "==3.6.0" },
-    { name = "tyro", specifier = ">=1.0.0" },
-    { name = "viser", specifier = ">=0.2.0" },
-]
-provides-extras = ["dev"]
 
 [[package]]
 name = "idna"
@@ -2694,7 +2665,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "gpiozero", marker = "sys_platform == 'linux' and extra == 'source'", specifier = ">=2.0" },
-    { name = "i2rt", marker = "extra == 'yam'", url = "https://github.com/i2rt-robotics/i2rt/archive/refs/tags/v1.2.4.tar.gz" },
+    { name = "i2rt", marker = "extra == 'yam'", git = "https://github.com/AfterQuery-Research/i2rt.git?rev=e599e9db90d644db6efe0b16bb6fd7cb87c4272f" },
     { name = "lerobot", extras = ["dataset", "intelrealsense"], marker = "python_full_version >= '3.12' and extra == 'dataset'", url = "https://github.com/AfterQuery-Research/lerobot/archive/2d6e22c776883d55414351c76b51f02bdf28c3f3.tar.gz" },
     { name = "lgpio", marker = "sys_platform == 'linux' and extra == 'source'", specifier = ">=0.2" },
     { name = "numpy", specifier = "==2.2.6" },

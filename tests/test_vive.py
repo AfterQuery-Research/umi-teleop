@@ -5,9 +5,11 @@ from umi_teleop.vive import (
     R_BODY,
     MultiViveZeroer,
     euler_deg,
+    libsurvive_pose_to_ros,
     openvr_pose_to_ros,
     parse_trackers,
     pose_from_packet,
+    tracker_updates,
     valid_tracker_serials,
 )
 
@@ -44,6 +46,36 @@ def test_openvr_pose_to_ros_known_pose():
     p, q = openvr_pose_to_ros([1.0, 2.0, 3.0], [1.0, 0.0, 0.0, 0.0])
     np.testing.assert_allclose(p, [-3.0, -1.0, 2.0], atol=1e-9)
     np.testing.assert_allclose(q, [1.0, 0.0, 0.0, 0.0], atol=1e-9)
+
+
+def test_libsurvive_packet_preserves_pose_age_and_explicit_invalidation():
+    packet = {
+        "frame": "libsurvive_tracking",
+        "trackers": [
+            {
+                "serial": "LEFT",
+                "valid": True,
+                "pose_age_s": 0.075,
+                "pos": [1, 2, 3],
+                "quat": [1, 0, 0, 0],
+            },
+            {"serial": "RIGHT", "valid": False},
+        ],
+    }
+
+    updates = tracker_updates(packet)
+
+    assert updates["LEFT"].sample_age_s == pytest.approx(0.075)
+    assert updates["RIGHT"].pose is None
+    assert updates["LEFT"].pose is not None
+    expected = libsurvive_pose_to_ros([1, 2, 3], [1, 0, 0, 0])
+    np.testing.assert_allclose(updates["LEFT"].pose[0], expected[0])
+    np.testing.assert_allclose(updates["LEFT"].pose[1], expected[1])
+
+
+def test_unknown_vive_packet_frame_is_rejected():
+    with pytest.raises(ValueError, match="unsupported Vive packet frame"):
+        tracker_updates({"frame": "mystery", "trackers": []})
 
 
 def test_parse_trackers_returns_all_valid_and_skips_invalid():
