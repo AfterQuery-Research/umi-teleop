@@ -937,7 +937,7 @@ def run(args: Config) -> None:
             startup_blocked = None
         command_pair(robots, joints, grips)
         if startup_blocked is None:
-            print("robots holding current pose; tap the Pi ZERO button before enable", flush=True)
+            print("robots holding current pose; request ZERO before enable", flush=True)
         else:
             print(
                 "STARTUP HOLD: reset motion did not fully verify, so teleop enable is locked out "

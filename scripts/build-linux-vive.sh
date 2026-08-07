@@ -26,10 +26,9 @@ cmake -S "$source_dir" -B "$libsurvive_build" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$libsurvive_build" --parallel "$(nproc)"
 cmake --install "$libsurvive_build" --prefix "$prefix"
 
-PKG_CONFIG_PATH="$prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
-  cmake -S "$root/native" -B "$build_dir" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DUMI_LIBSURVIVE_PREFIX="$prefix"
+cmake -S "$root/native" -B "$build_dir" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DUMI_LIBSURVIVE_PREFIX="$prefix"
 cmake --build "$build_dir" --parallel "$(nproc)"
 cmake --install "$build_dir" --prefix "$root/.venv"
 

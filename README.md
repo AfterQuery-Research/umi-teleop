@@ -197,7 +197,7 @@ adapter was replugged.
    is passed explicitly. Wait for:
 
    ```text
-   robots holding current pose; tap ZERO before enable
+   robots holding current pose; request ZERO before enable
    ```
 
 5. Hold both UMIs in the intended neutral pose, especially the right UMI, then use terminal 2:
