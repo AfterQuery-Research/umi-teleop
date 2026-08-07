@@ -12,7 +12,7 @@ import socket
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import tyro
 
@@ -85,6 +85,15 @@ def _calib(path: str) -> Path:
 def _status_value(value: dict, key: str) -> str:
     item = value.get(key)
     return "--" if item is None else f"{float(item):.3f}"
+
+
+def _tracking_status(poses: dict[str, dict[str, Any]], serials: dict[str, str]) -> str:
+    parts = []
+    for name in ARM_NAMES:
+        pose = poses.get(name)
+        age = "missing" if pose is None else f"age={float(pose['age_s']):.3f}s"
+        parts.append(f"{name}({serials[name]})={age}")
+    return " ".join(parts)
 
 
 def run(cfg: Config) -> None:
@@ -234,7 +243,13 @@ def run(cfg: Config) -> None:
             ):
                 state.safety_disarm()
                 enable_guard.force_block(now)
-                log.warning("tracking stale while enabled; source disarmed")
+                log.warning(
+                    "tracking stale while enabled; source disarmed; %s",
+                    _tracking_status(
+                        poses,
+                        {"left": cfg.left_serial, "right": cfg.right_serial},
+                    ),
+                )
             widths = {
                 name: (
                     workers[name].snapshot(now)

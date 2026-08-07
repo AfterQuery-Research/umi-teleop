@@ -112,6 +112,15 @@ def test_source_main_treats_launcher_interrupt_as_clean_shutdown(monkeypatch):
     assert source_module.main() is None
 
 
+def test_tracking_status_identifies_missing_side_and_serial():
+    status = source_module._tracking_status(
+        {"left": {"age_s": 0.012}},
+        {"left": "LHR-LEFT", "right": "LHR-RIGHT"},
+    )
+
+    assert status == "left(LHR-LEFT)=age=0.012s right(LHR-RIGHT)=missing"
+
+
 def test_packet_round_trip_and_rejects_nonfinite_or_bad_quaternion():
     assert decode_teleop_packet(encode_teleop_packet(_packet())) == _packet()
     bad = _packet()
