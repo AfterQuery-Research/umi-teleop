@@ -127,7 +127,6 @@ class Config:
     ik_pos_threshold: float = 1e-3
     ik_ori_threshold: float = 2e-3
     ik_fallback_attempts_per_cycle: int = 2
-    ik_hold_disarm_s: float = 0.0
     ik_result_max_age_s: float = 0.25
     synchronous_ik: bool = False
     """Solve IK in the control cycle instead of accepting it one cycle later."""
@@ -826,8 +825,6 @@ def run(args: Config) -> None:
         raise SafetyStop("monitor-only and preflight-only are mutually exclusive")
     if args.ik_fallback_attempts_per_cycle < 1:
         raise SafetyStop("--ik-fallback-attempts-per-cycle must be at least one")
-    if args.ik_hold_disarm_s < 0.0:
-        raise SafetyStop("--ik-hold-disarm-s must be nonnegative")
     if args.ik_result_max_age_s <= 0.0:
         raise SafetyStop("--ik-result-max-age-s must be positive")
     if (
@@ -1059,7 +1056,6 @@ def run(args: Config) -> None:
         ik_reference_poses = {name: fk_models[name].fk(joints[name]) for name in ARM_NAMES}
         ik_generation = 0
         latest_ik_results: dict[str, IkFallbackResult] = {}
-        ik_holding_since: dict[str, float | None] = {name: None for name in ARM_NAMES}
         lag_monitor = (
             ControlLagMonitor(
                 args.dataset.max_control_lag_s,
@@ -1076,12 +1072,11 @@ def run(args: Config) -> None:
 
         def invalidate_ik() -> None:
             nonlocal ik_generation, joint_goals, joint_velocities
-            nonlocal latest_ik_results, ik_holding_since
+            nonlocal latest_ik_results
             ik_generation += 1
             joint_goals = {name: joints[name].copy() for name in ARM_NAMES}
             joint_velocities = {name: np.zeros_like(joints[name]) for name in ARM_NAMES}
             latest_ik_results.clear()
-            ik_holding_since = {name: None for name in ARM_NAMES}
             for solver in synchronous_ik.values():
                 solver.reset()
 
@@ -1244,7 +1239,6 @@ def run(args: Config) -> None:
                         if cycle_now - completion.submitted_at > args.ik_result_max_age_s:
                             joint_goals[name] = joints[name].copy()
                             latest_ik_results.pop(name, None)
-                            ik_holding_since[name] = None
                             continue
                         outcome = completion.outcome
                         latest_ik_results[name] = outcome
@@ -1255,16 +1249,6 @@ def run(args: Config) -> None:
                         )
                         if outcome.mode != "holding_ik":
                             ik_reference_poses[name] = outcome.target_pose.copy()
-                for name in ARM_NAMES:
-                    outcome = latest_ik_results.get(name)
-                    if outcome is None:
-                        continue
-                    if outcome.mode == "holding_ik":
-                        if ik_holding_since[name] is None:
-                            ik_holding_since[name] = cycle_now
-                    else:
-                        ik_holding_since[name] = None
-
                 for name in ARM_NAMES:
                     remaining = joint_goals[name] - joints[name]
                     desired_velocity = np.clip(
@@ -1301,25 +1285,20 @@ def run(args: Config) -> None:
                     for name, outcome in latest_ik_results.items()
                     if outcome.mode == "degraded_ik"
                 ]
-                if args.ik_hold_disarm_s > 0.0:
-                    expired = [
-                        name
-                        for name in holding
-                        if ik_holding_since[name] is not None
-                        and cycle_now - ik_holding_since[name] >= args.ik_hold_disarm_s
-                    ]
-                    if expired:
-                        state.disarm(
-                            "safety_disarmed: persistent IK fallback failure for "
-                            + ",".join(expired)
-                            + f" ({args.ik_hold_disarm_s:.1f}s)"
-                        )
+                if holding:
+                    reason = (
+                        "complete IK fallback failure for "
+                        + ",".join(holding)
+                        + "; both arms disarmed; tap RECORD once to clear the source enable, "
+                        "then tap RECORD again to re-enable"
+                    )
+                    state.disarm(reason)
+                    joints = held_joints
+                    grips = held_grips
+                    invalidate_ik()
+                    print(f"SAFETY DISARM: {reason}", flush=True)
                 if state.armed:
-                    if holding:
-                        state.reason = (
-                            "holding_ik: " + ",".join(holding) + " holding last safe target"
-                        )
-                    elif degraded:
+                    if degraded:
                         state.reason = "degraded_ik: " + ",".join(degraded) + " using fallback"
                     else:
                         state.reason = result.reason
@@ -1329,7 +1308,6 @@ def run(args: Config) -> None:
                 joint_goals = {name: joints[name].copy() for name in ARM_NAMES}
                 joint_velocities = {name: np.zeros_like(joints[name]) for name in ARM_NAMES}
                 latest_ik_results.clear()
-                ik_holding_since = {name: None for name in ARM_NAMES}
             if was_armed and not state.armed:
                 invalidate_ik()
             control_done = time.monotonic()

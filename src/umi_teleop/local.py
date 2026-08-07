@@ -145,9 +145,6 @@ class ControlArgs:
     ik_fallback_attempts_per_cycle: int = 2
     """Maximum fallback target attempts after a direct IK solve fails."""
 
-    ik_hold_disarm_s: float = 0.0
-    """Disarm after this many seconds of IK hold; zero keeps holding indefinitely."""
-
 
 @dataclass(frozen=True)
 class Args:
@@ -361,8 +358,6 @@ def build_commands(args: Args, bin_dir: Path | None = None) -> dict[str, list[st
             str(args.control.ik_max_iters),
             "--ik-fallback-attempts-per-cycle",
             str(args.control.ik_fallback_attempts_per_cycle),
-            "--ik-hold-disarm-s",
-            f"{args.control.ik_hold_disarm_s:g}",
         ],
     }
     if args.quiet:

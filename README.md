@@ -313,6 +313,8 @@ scaling and filtering.
 - GPIO cancel, quit, and stop are immediate; enabling requires a quiet fresh-sensor interval.
 - Joint limits, workspace limits, command speed, command acceleration, CAN state, and competing
   robot controllers are checked fail-closed.
+- A direct IK miss uses bounded fallback targets; exhausting every fallback disarms both arms and
+  requires a fresh RECORD off/on sequence before motion can resume.
 - Dataset camera or writer failure disarms and discards the affected episode.
 - No child process is automatically restarted during physical control. Any child exit shuts down
   the launcher and its remaining children.

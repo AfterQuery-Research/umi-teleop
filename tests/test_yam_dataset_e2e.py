@@ -99,6 +99,23 @@ class E2EIk:
         return True, np.asarray(initial, dtype=np.float64) + 0.005
 
 
+class FailingE2EIk:
+    instances: list[FailingE2EIk] = []
+
+    def __init__(self, *_args: Any) -> None:
+        self.fk_calls = 0
+        self.solve_calls = 0
+        self.instances.append(self)
+
+    def fk(self, _joints: np.ndarray) -> np.ndarray:
+        self.fk_calls += 1
+        return np.eye(4)
+
+    def solve(self, _target: np.ndarray, initial: np.ndarray) -> tuple[bool, np.ndarray]:
+        self.solve_calls += 1
+        return False, np.asarray(initial, dtype=np.float64).copy()
+
+
 def test_startup_camera_failure_prevents_arm_dispatch() -> None:
     robots = {"left": E2ERobot(), "right": E2ERobot()}
     joints = {name: robot.joints.copy() for name, robot in robots.items()}
@@ -214,6 +231,80 @@ def stream_source(port: int, done: threading.Event) -> None:
     finally:
         done.set()
         sock.close()
+
+
+def stream_one_ik_failure(port: int, done: threading.Event) -> None:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    state = ButtonState(session_id="yam-ik-failure-e2e")
+    seq = 0
+
+    def send(count: int) -> None:
+        nonlocal seq
+        for _ in range(count):
+            sock.sendto(
+                encode_teleop_packet(source_packet(state, seq)),
+                ("127.0.0.1", port),
+            )
+            seq += 1
+            time.sleep(0.035)
+
+    try:
+        send(6)
+        state.handle(Event.ZERO)
+        send(4)
+        state.handle(Event.START)
+        send(8)
+        state.handle(Event.QUIT)
+        send(3)
+    finally:
+        done.set()
+        sock.close()
+
+
+@pytest.mark.integration
+def test_complete_ik_failure_disarms_both_arms_without_automatic_retry(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    port = free_udp_port()
+    robots: list[E2ERobot] = []
+
+    def make_robot(*_args: Any, **_kwargs: Any) -> E2ERobot:
+        robot = E2ERobot()
+        robots.append(robot)
+        return robot
+
+    monkeypatch.setattr(yam, "IkModel", FailingE2EIk)
+    monkeypatch.setattr(yam, "make_robot", make_robot)
+    monkeypatch.setattr(yam.signal, "signal", lambda *_args: None)
+    FailingE2EIk.instances.clear()
+
+    sender_done = threading.Event()
+    sender = threading.Thread(
+        target=stream_one_ik_failure,
+        args=(port, sender_done),
+        daemon=True,
+    )
+    sender.start()
+    yam.run(
+        yam.Config(
+            bind="127.0.0.1",
+            port=port,
+            move_to_base=True,
+            base_joint_speed=100.0,
+            simulate=True,
+            synchronous_ik=True,
+            stream_timeout=2.0,
+            quiet=True,
+        )
+    )
+    sender.join(timeout=2.0)
+
+    output = capsys.readouterr().out
+    assert sender_done.is_set()
+    assert "SAFETY DISARM: complete IK fallback failure" in output
+    assert [model.solve_calls for model in FailingE2EIk.instances] == [0, 0, 3, 3]
+    assert len(robots) == 2 and all(robot.closed for robot in robots)
+    assert all(np.allclose(robot.joints, yam.DEFAULT_BASE_JOINTS) for robot in robots)
 
 
 @pytest.mark.integration
