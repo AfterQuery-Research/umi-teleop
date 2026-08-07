@@ -435,6 +435,13 @@ class IkModel:
         return np.asarray(self.model.fk(joints, "grasp_site"), dtype=np.float64)
 
     def solve(self, target: np.ndarray, initial: np.ndarray) -> tuple[bool, np.ndarray]:
+        initial_pose = np.asarray(self.model.fk(initial, "grasp_site"), dtype=np.float64)
+        position_error = float(np.linalg.norm(initial_pose[:3, 3] - target[:3, 3]))
+        orientation_error = rotation_angle(initial_pose[:3, :3].T @ target[:3, :3])
+        if position_error <= self.pos_threshold and orientation_error <= self.ori_threshold:
+            # I2RT checks convergence only after taking one differential-IK step. Near a
+            # singular pose that step can move an already-valid seed outside tolerance.
+            return True, np.asarray(initial, dtype=np.float64).copy()
         success, joints = self.model.ik(
             target,
             "grasp_site",
@@ -976,12 +983,6 @@ def run(args: Config) -> None:
                 flush=True,
             )
         base_pose_verified = False
-        startup_recorder = recorder if args.move_to_ready else None
-        if startup_recorder is not None:
-            initial_poses = {name: fk_models[name].fk(joints[name]) for name in ARM_NAMES}
-            state.step(initial_packet, 0.0, initial_poses)
-            startup_recorder.start_episode()
-            print("DATASET recording includes teleop-ready startup motion", flush=True)
         if args.move_to_base:
             try:
                 joints = move_pair_to_base(
@@ -1008,19 +1009,12 @@ def run(args: Config) -> None:
                     args.hz,
                     args.joint_limit_margin,
                     args.startup_readback_tolerance,
-                    recorder=startup_recorder,
+                    recorder=None,
                 )
                 startup_blocked = None
             except StartupReadbackError as exc:
                 joints = exc.observed
                 startup_blocked = str(exc)
-                if startup_recorder is not None:
-                    startup_recorder.finish_episode(commit=False, reason=startup_blocked)
-            except DatasetFrameError as exc:
-                joints, _ = read_pair_state(robots)
-                startup_blocked = f"dataset episode invalid during startup: {exc}"
-                assert startup_recorder is not None
-                startup_recorder.finish_episode(commit=False, reason=startup_blocked)
         else:
             startup_blocked = None
         command_pair(robots, joints, grips)
@@ -1060,8 +1054,10 @@ def run(args: Config) -> None:
         # both arms on every control tick.  Per-frame FK contends with the background MuJoCo IK
         # workers and can make an otherwise short control cycle miss the dataset deadline.
         ik_reference_poses = {name: fk_models[name].fk(joints[name]) for name in ARM_NAMES}
+        ik_reference_joints = {name: joints[name].copy() for name in ARM_NAMES}
         ik_generation = 0
         latest_ik_results: dict[str, IkFallbackResult] = {}
+        latest_ik_desired_poses: dict[str, np.ndarray] = {}
         lag_monitor = (
             ControlLagMonitor(
                 args.dataset.max_control_lag_s,
@@ -1078,11 +1074,12 @@ def run(args: Config) -> None:
 
         def invalidate_ik() -> None:
             nonlocal ik_generation, joint_goals, joint_velocities
-            nonlocal latest_ik_results
+            nonlocal latest_ik_results, latest_ik_desired_poses
             ik_generation += 1
             joint_goals = {name: joints[name].copy() for name in ARM_NAMES}
             joint_velocities = {name: np.zeros_like(joints[name]) for name in ARM_NAMES}
             latest_ik_results.clear()
+            latest_ik_desired_poses.clear()
             for solver in synchronous_ik.values():
                 solver.reset()
 
@@ -1183,6 +1180,7 @@ def run(args: Config) -> None:
                     name: np.asarray(robot_poses[name], dtype=np.float64).copy()
                     for name in ARM_NAMES
                 }
+                ik_reference_joints = {name: current_joints[name].copy() for name in ARM_NAMES}
                 invalidate_ik()
                 at_verified_base = base_pose_verified and all(
                     float(
@@ -1214,6 +1212,9 @@ def run(args: Config) -> None:
             held_ik_reference_poses = {
                 name: pose.copy() for name, pose in ik_reference_poses.items()
             }
+            held_ik_reference_joints = {
+                name: values.copy() for name, values in ik_reference_joints.items()
+            }
             if result.armed and result.targets is not None:
                 cycle_now = time.monotonic()
                 if args.synchronous_ik:
@@ -1221,9 +1222,10 @@ def run(args: Config) -> None:
                         outcome = synchronous_ik[name].solve_target(
                             result.targets[name],
                             ik_reference_poses[name],
-                            current_joints[name],
+                            ik_reference_joints[name],
                         )
                         latest_ik_results[name] = outcome
+                        latest_ik_desired_poses[name] = result.targets[name].copy()
                         joint_goals[name] = (
                             joints[name].copy()
                             if outcome.mode == "holding_ik"
@@ -1231,13 +1233,14 @@ def run(args: Config) -> None:
                         )
                         if outcome.mode != "holding_ik":
                             ik_reference_poses[name] = outcome.target_pose.copy()
+                            ik_reference_joints[name] = outcome.joints.copy()
                 else:
                     request_time = time.monotonic()
                     for name in ARM_NAMES:
                         async_ik[name].submit(
                             result.targets[name],
                             ik_reference_poses[name],
-                            current_joints[name],
+                            ik_reference_joints[name],
                             generation=ik_generation,
                             submitted_at=request_time,
                         )
@@ -1248,9 +1251,11 @@ def run(args: Config) -> None:
                         if cycle_now - completion.submitted_at > args.ik_result_max_age_s:
                             joint_goals[name] = joints[name].copy()
                             latest_ik_results.pop(name, None)
+                            latest_ik_desired_poses.pop(name, None)
                             continue
                         outcome = completion.outcome
                         latest_ik_results[name] = outcome
+                        latest_ik_desired_poses[name] = completion.desired_pose.copy()
                         joint_goals[name] = (
                             joints[name].copy()
                             if outcome.mode == "holding_ik"
@@ -1258,6 +1263,7 @@ def run(args: Config) -> None:
                         )
                         if outcome.mode != "holding_ik":
                             ik_reference_poses[name] = outcome.target_pose.copy()
+                            ik_reference_joints[name] = outcome.joints.copy()
                 for name in ARM_NAMES:
                     remaining = joint_goals[name] - joints[name]
                     desired_velocity = np.clip(
@@ -1296,12 +1302,17 @@ def run(args: Config) -> None:
                 ]
                 if holding:
                     diagnostics = "; ".join(
-                        fallback_diagnostic(name, latest_ik_results[name], result.targets[name])
+                        fallback_diagnostic(
+                            name,
+                            latest_ik_results[name],
+                            latest_ik_desired_poses[name],
+                        )
                         for name in holding
                     )
                     joints = held_joints
                     grips = held_grips
                     ik_reference_poses = held_ik_reference_poses
+                    ik_reference_joints = held_ik_reference_joints
                     joint_goals = {name: joints[name].copy() for name in ARM_NAMES}
                     joint_velocities = {name: np.zeros_like(joints[name]) for name in ARM_NAMES}
                     exhausted = [
@@ -1330,6 +1341,7 @@ def run(args: Config) -> None:
                 joint_goals = {name: joints[name].copy() for name in ARM_NAMES}
                 joint_velocities = {name: np.zeros_like(joints[name]) for name in ARM_NAMES}
                 latest_ik_results.clear()
+                latest_ik_desired_poses.clear()
             if was_armed and not state.armed:
                 invalidate_ik()
             control_done = time.monotonic()
@@ -1409,6 +1421,7 @@ def run(args: Config) -> None:
                     ik_reference_poses = {
                         name: fk_models[name].fk(joints[name]) for name in ARM_NAMES
                     }
+                    ik_reference_joints = {name: joints[name].copy() for name in ARM_NAMES}
                     joint_goals = {name: joints[name].copy() for name in ARM_NAMES}
                     command_pair(robots, joints, grips)
                     print(
@@ -1511,7 +1524,11 @@ def run(args: Config) -> None:
                     ik_text = (
                         " ik["
                         + " | ".join(
-                            fallback_diagnostic(name, latest_ik_results[name], result.targets[name])
+                            fallback_diagnostic(
+                                name,
+                                latest_ik_results[name],
+                                latest_ik_desired_poses[name],
+                            )
                             for name in ARM_NAMES
                             if name in latest_ik_results
                         )

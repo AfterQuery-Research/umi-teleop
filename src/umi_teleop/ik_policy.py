@@ -156,6 +156,7 @@ class AsyncIkCompletion:
     generation: int
     submitted_at: float
     completed_at: float
+    desired_pose: np.ndarray
     outcome: IkFallbackResult
 
 
@@ -232,6 +233,8 @@ class FallbackIkSolver:
     def reset(self) -> None:
         self._preferred_index: int | None = None
         self._search_index = 0
+        self._search_target_pose: np.ndarray | None = None
+        self._search_reference_pose: np.ndarray | None = None
 
     def _attempt(
         self,
@@ -291,13 +294,19 @@ class FallbackIkSolver:
             )
 
         had_preference = self._preferred_index is not None
+        if had_preference or self._search_target_pose is None:
+            self._search_target_pose = desired.copy()
+            self._search_reference_pose = reference.copy()
+        assert self._search_reference_pose is not None
+        fallback_target = self._search_target_pose
+        fallback_reference = self._search_reference_pose
         indices = self._fallback_indices()
         final_failure = exact_failure
         for index in indices:
             position_alpha, orientation_relaxation = self._candidates[index]
             candidate_pose = interpolate_pose(
-                reference,
-                desired,
+                fallback_reference,
+                fallback_target,
                 position_alpha,
                 position_alpha * orientation_relaxation,
             )
@@ -307,11 +316,13 @@ class FallbackIkSolver:
             if candidate_joints is not None:
                 self._preferred_index = index
                 self._search_index = 0
+                self._search_target_pose = None
+                self._search_reference_pose = None
                 return IkFallbackResult(
                     mode="degraded_ik",
                     joints=candidate_joints,
                     target_pose=candidate_pose,
-                    reference_pose=reference,
+                    reference_pose=fallback_reference,
                     position_alpha=position_alpha,
                     orientation_relaxation=orientation_relaxation,
                     attempts=attempts,
@@ -322,11 +333,16 @@ class FallbackIkSolver:
         if had_preference:
             # A formerly reachable preference failed. Start a complete bounded sweep next cycle.
             self._search_index = 0
+            self._search_target_pose = None
+            self._search_reference_pose = None
             search_exhausted = False
         else:
             next_index = indices[-1] + 1
             search_exhausted = next_index >= len(self._candidates)
             self._search_index = 0 if search_exhausted else next_index
+            if search_exhausted:
+                self._search_target_pose = None
+                self._search_reference_pose = None
         return IkFallbackResult(
             mode="holding_ik",
             joints=initial.copy(),
@@ -455,6 +471,7 @@ class AsyncFallbackIkSolver:
                     generation=request.generation,
                     submitted_at=request.submitted_at,
                     completed_at=monotonic(),
+                    desired_pose=request.desired_pose.copy(),
                     outcome=outcome,
                 )
                 with self._condition:

@@ -34,7 +34,7 @@ class UploadConfig:
 
 def _load_dataset(repo_id: str, root: Path) -> UploadDataset:
     try:
-        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+        from lerobot.datasets import LeRobotDataset
     except ImportError as exc:
         raise DatasetRecordingError(
             "LeRobot upload dependencies are unavailable; install the dataset extra"

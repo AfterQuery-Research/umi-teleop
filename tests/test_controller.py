@@ -22,6 +22,7 @@ from umi_teleop.yam import (
     DEFAULT_BASE_JOINTS,
     DEFAULT_SIM_INITIAL_JOINTS,
     Config,
+    IkModel,
     SafetyStop,
     can_error_counter_error,
     find_control_processes,
@@ -89,6 +90,101 @@ def test_automatic_startup_motion_is_opt_in() -> None:
 
     assert not config.move_to_ready
     assert not config.move_to_base
+
+
+def test_ik_accepts_an_initial_configuration_already_inside_tolerance() -> None:
+    class FakeKinematics:
+        def __init__(self) -> None:
+            self.ik_called = False
+
+        def fk(self, _joints, _site):
+            return np.eye(4)
+
+        def ik(self, *_args, **_kwargs):
+            self.ik_called = True
+            raise AssertionError("already-converged IK must not take an integration step")
+
+    model = IkModel.__new__(IkModel)
+    model.model = FakeKinematics()
+    model.max_iters = 40
+    model.pos_threshold = 1e-3
+    model.ori_threshold = 2e-3
+    target = np.eye(4)
+    target[:3, 3] = [0.0003, 0.0007, 0.0002]
+    angle = 8.7e-4
+    target[:3, :3] = [
+        [math.cos(angle), -math.sin(angle), 0.0],
+        [math.sin(angle), math.cos(angle), 0.0],
+        [0.0, 0.0, 1.0],
+    ]
+    initial = np.arange(6, dtype=np.float64)
+
+    success, joints = model.solve(target, initial)
+
+    assert success
+    np.testing.assert_array_equal(joints, initial)
+    assert not model.model.ik_called
+
+
+def test_ik_delegates_when_initial_configuration_is_outside_tolerance() -> None:
+    class FakeKinematics:
+        def __init__(self) -> None:
+            self.ik_called = False
+
+        def fk(self, _joints, _site):
+            return np.eye(4)
+
+        def ik(self, _target, _site, **kwargs):
+            self.ik_called = True
+            return True, kwargs["init_q"] + 0.1
+
+    model = IkModel.__new__(IkModel)
+    model.model = FakeKinematics()
+    model.max_iters = 40
+    model.pos_threshold = 1e-3
+    model.ori_threshold = 2e-3
+    target = np.eye(4)
+    target[0, 3] = 0.002
+    initial = np.zeros(6)
+
+    success, joints = model.solve(target, initial)
+
+    assert success
+    np.testing.assert_allclose(joints, 0.1)
+    assert model.model.ik_called
+
+
+def test_ik_delegates_when_initial_orientation_is_outside_tolerance() -> None:
+    class FakeKinematics:
+        def __init__(self) -> None:
+            self.ik_called = False
+
+        def fk(self, _joints, _site):
+            return np.eye(4)
+
+        def ik(self, _target, _site, **kwargs):
+            self.ik_called = True
+            return True, kwargs["init_q"] + 0.2
+
+    model = IkModel.__new__(IkModel)
+    model.model = FakeKinematics()
+    model.max_iters = 40
+    model.pos_threshold = 1e-3
+    model.ori_threshold = 2e-3
+    target = np.eye(4)
+    angle = 2.1e-3
+    target[:3, :3] = [
+        [math.cos(angle), -math.sin(angle), 0.0],
+        [math.sin(angle), math.cos(angle), 0.0],
+        [0.0, 0.0, 1.0],
+    ]
+    initial = np.zeros(6)
+
+    success, joints = model.solve(target, initial)
+
+    assert success
+    np.testing.assert_allclose(joints, 0.2)
+    assert model.model.ik_called
 
 
 @pytest.mark.parametrize(

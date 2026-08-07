@@ -39,9 +39,8 @@ finalized dataset to the Hugging Face Hub.
   the next E enable.
 - Repeated Z/E/disable cycles start and commit additional episodes without restarting the source,
   controller, cameras, CAN connections, or dataset writer.
-- Passing `--move-to-ready` explicitly starts the first episode immediately before the first
-  startup-motion command. Every startup observation and bounded joint command is recorded, and the
-  first successful `E` enable continues that same episode.
+- Passing `--move-to-ready` explicitly performs an unrecorded startup motion. RECORD still starts
+  teleoperation and the first dataset episode together after a valid ZERO.
 - Passing `--move-to-base` explicitly performs an unrecorded startup parking operation.
 - ZERO while armed, CANCEL, source restart, stale telemetry, tracking loss, a configured persistent
   IK-hold timeout, camera failure, or process shutdown discards the active episode. Ordinary
@@ -98,6 +97,13 @@ The integration is pinned to the tested AfterQuery LeRobot revision used by the
 YAM policy client. The recording extra requires Python 3.12. Existing Windows,
 UMI source Pi, monitor-only, simulation, and non-recording YAM commands retain
 their current dependencies and behavior.
+
+Dataset creation, append/resume, frame insertion, episode save/discard, finalization, reopening,
+and Hub upload use the public `LeRobotDataset` API documented by Hugging Face. The default PNG
+staging path does not patch LeRobot. The opt-in streaming encoder optimization adapts the pinned
+revision's private `_CameraEncoderThread` to defer RGB statistics, and live queue-depth diagnostics
+inspect the writer's internal queues. Those version-pinned optimizations do not replace LeRobot's
+public dataset lifecycle or on-disk format.
 
 ## Verification
 

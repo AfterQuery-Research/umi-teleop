@@ -167,12 +167,36 @@ def recorder_fixture(
 def test_dataset_sampling_decimates_100_hz_control_to_30_hz(tmp_path) -> None:
     recorder, _dataset, _cameras = recorder_fixture(tmp_path, control_hz=100.0)
     recorder.start_episode()
-    decisions = [recorder.should_sample() for _ in range(100)]
+    decisions = [recorder.should_sample(index / 100.0) for index in range(100)]
     recorder.finish_episode(commit=False, reason="test")
     recorder.close()
 
     assert sum(decisions) == 30
     assert decisions[0]
+
+
+def test_dataset_sampling_uses_elapsed_time_without_catchup_bursts(tmp_path) -> None:
+    recorder, _dataset, _cameras = recorder_fixture(tmp_path, control_hz=120.0)
+    recorder.start_episode()
+
+    decisions = [
+        recorder.should_sample(timestamp) for timestamp in (0.0, 0.010, 0.034, 0.200, 0.201, 0.234)
+    ]
+
+    recorder.finish_episode(commit=False, reason="test")
+    recorder.close()
+    assert decisions == [True, False, True, True, False, True]
+
+
+def test_dataset_sampling_rejects_nonfinite_clock(tmp_path) -> None:
+    recorder, _dataset, _cameras = recorder_fixture(tmp_path, control_hz=100.0)
+    recorder.start_episode()
+
+    with pytest.raises(DatasetRecordingError, match="sample time must be finite"):
+        recorder.should_sample(float("nan"))
+
+    recorder.finish_episode(commit=False, reason="test")
+    recorder.close()
 
 
 def add_frame(recorder, measured_offset: float = 0.0, command_offset: float = 0.5) -> None:

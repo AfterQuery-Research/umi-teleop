@@ -166,6 +166,32 @@ def test_unreachable_target_reports_only_after_complete_fallback_sweep():
     assert third.search_exhausted
 
 
+def test_fallback_sweep_freezes_one_target_while_exact_retry_uses_latest():
+    attempted_x: list[float] = []
+
+    def solve(target, initial):
+        attempted_x.append(float(target[0, 3]))
+        return False, initial
+
+    solver = FallbackIkSolver(
+        solve,
+        lambda _joints: None,
+        line_search_alphas=(1.0, 0.5),
+        orientation_relaxations=(1.0, 0.0),
+        fallback_attempts_per_cycle=1,
+    )
+
+    first = solver.solve_target(pose(1.0), pose(), np.zeros(6))
+    second = solver.solve_target(pose(2.0), pose(), np.zeros(6))
+    third = solver.solve_target(pose(3.0), pose(), np.zeros(6))
+
+    assert not first.search_exhausted and not second.search_exhausted
+    assert third.search_exhausted
+    # Exact retries follow the live target, while the bounded fallback grid proves one fixed
+    # target unreachable instead of combining candidates from unrelated tracker samples.
+    assert attempted_x == pytest.approx([1.0, 1.0, 2.0, 0.5, 3.0, 0.5])
+
+
 def test_degraded_preference_is_reused_after_trying_one_better_candidate():
     attempted_x = []
 
@@ -277,6 +303,7 @@ def test_async_solver_keeps_only_latest_pending_target():
 
         assert first_id < latest_id
         assert completions[-1].request_id == latest_id
+        np.testing.assert_allclose(completions[-1].desired_pose, pose(3.0))
         np.testing.assert_allclose(completions[-1].outcome.joints, 3.0)
         assert attempted_x == [1.0, 3.0]
     finally:

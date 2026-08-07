@@ -158,6 +158,34 @@ def _tracking_status(poses: dict[str, dict[str, Any]], serials: dict[str, str]) 
     return " ".join(parts)
 
 
+def _stale_input_status(
+    cfg: Config,
+    poses: dict[str, dict[str, Any]],
+    widths: dict[str, dict[str, Any]],
+    *,
+    poses_fresh: bool,
+    widths_fresh: bool,
+    pi_fresh: bool,
+    pi_age: float | None,
+) -> str:
+    """Name every stale sensor and its configured freshness limit."""
+    reasons = []
+    if not poses_fresh:
+        ages = " ".join(
+            f"{name}={_status_value(poses.get(name, {}), 'age_s')}s" for name in ARM_NAMES
+        )
+        reasons.append(f"Vive pose age[{ages}] limit={cfg.max_pose_age_s:.3f}s")
+    if not pi_fresh:
+        age = "--" if pi_age is None else f"{float(pi_age):.3f}"
+        reasons.append(f"Pi heartbeat age={age}s limit={cfg.pi_heartbeat_timeout_s:.3f}s")
+    if not widths_fresh:
+        ages = " ".join(
+            f"{name}={_status_value(widths.get(name, {}), 'age_s')}s" for name in ARM_NAMES
+        )
+        reasons.append(f"ArUco width age[{ages}] limit={cfg.max_width_age_s:.3f}s")
+    return "; ".join(reasons) or "freshness state unavailable"
+
+
 def run(cfg: Config) -> None:
     if (
         cfg.send_hz <= 0
@@ -458,7 +486,18 @@ def run(cfg: Config) -> None:
             if state.requested_enabled and not inputs_fresh:
                 state.safety_disarm()
                 enable_guard.force_block(now)
-                log.warning("sensor input stale while enabled; source disarmed")
+                log.warning(
+                    "sensor input stale while enabled; source disarmed; %s",
+                    _stale_input_status(
+                        cfg,
+                        poses,
+                        widths,
+                        poses_fresh=poses_fresh,
+                        widths_fresh=widths_fresh,
+                        pi_fresh=pi_fresh,
+                        pi_age=pi_age,
+                    ),
+                )
             if (
                 enable_action := enable_guard.update(
                     state,

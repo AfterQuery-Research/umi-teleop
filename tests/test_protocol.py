@@ -191,6 +191,26 @@ def test_pi_event_consumer_baselines_history_and_preserves_new_safety_events():
     assert events == [Event.CANCEL]
 
 
+def test_stale_input_status_names_each_failed_freshness_gate():
+    cfg = Config(max_pose_age_s=0.25, max_width_age_s=0.5, pi_heartbeat_timeout_s=0.4)
+    poses = {"left": {"age_s": 0.31}, "right": {"age_s": 0.02}}
+    widths = {"left": {"age_s": 0.72}, "right": {"age_s": 0.03}}
+
+    status = source_module._stale_input_status(
+        cfg,
+        poses,
+        widths,
+        poses_fresh=False,
+        widths_fresh=False,
+        pi_fresh=False,
+        pi_age=0.65,
+    )
+
+    assert "Vive pose age[left=0.310s right=0.020s] limit=0.250s" in status
+    assert "Pi heartbeat age=0.650s limit=0.400s" in status
+    assert "ArUco width age[left=0.720s right=0.030s] limit=0.500s" in status
+
+
 def test_enable_guard_requires_a_quiet_period_and_fresh_inputs():
     state = ButtonState(session_id="guard")
     guard = EnableRequestGuard(delay_s=3.0, cooldown_s=5.0)

@@ -513,7 +513,7 @@ def _effective_encoder_preset(config: DatasetConfig) -> str | None:
 def _default_dataset_factory(config: DatasetConfig, features: dict[str, dict[str, Any]]) -> Dataset:
     try:
         from lerobot.configs import RGBEncoderConfig
-        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+        from lerobot.datasets import LeRobotDataset
 
         from umi_teleop.streaming_encoder import install_streaming_encoder_optimization
     except ImportError as exc:
@@ -565,7 +565,7 @@ def _default_dataset_factory(config: DatasetConfig, features: dict[str, dict[str
 
 def _default_upload_validator(config: DatasetConfig, dataset: Dataset) -> None:
     try:
-        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+        from lerobot.datasets import LeRobotDataset
     except ImportError as exc:
         raise DatasetRecordingError("cannot validate finalized dataset without LeRobot") from exc
     root = getattr(dataset, "root", config.root)
@@ -922,8 +922,7 @@ class DatasetRecorder:
         self._active = False
         self._episode_frames = 0
         self._control_hz = float(control_hz)
-        self._sample_accumulator = 0.0
-        self._sample_started = False
+        self._next_sample_s: float | None = None
         self._saved_episodes = 0
         self._closed = False
         self._thread = Thread(target=self._write_loop, name="umi-dataset-writer", daemon=True)
@@ -1029,8 +1028,7 @@ class DatasetRecorder:
         _check_free_disk(self.config, self.dataset)
         self._active = True
         self._episode_frames = 0
-        self._sample_accumulator = 0.0
-        self._sample_started = False
+        self._next_sample_s = None
         print(f"DATASET episode started task={self.config.task!r}", flush=True)
 
     def should_sample(self, now_s: float | None = None) -> bool:
@@ -1038,14 +1036,22 @@ class DatasetRecorder:
         self._check_healthy()
         if not self._active:
             return False
-        del now_s
-        if not self._sample_started:
-            self._sample_started = True
+        if self._control_hz <= self.config.recording_fps + 1e-9:
             return True
-        self._sample_accumulator += self.config.recording_fps
-        if self._sample_accumulator + 1e-9 < self._control_hz:
+        timestamp = time.monotonic() if now_s is None else float(now_s)
+        if not math.isfinite(timestamp):
+            raise DatasetRecordingError("dataset sample time must be finite")
+        sample_period_s = 1.0 / self.config.recording_fps
+        if self._next_sample_s is None:
+            self._next_sample_s = timestamp + sample_period_s
+            return True
+        if timestamp + 1e-9 < self._next_sample_s:
             return False
-        self._sample_accumulator %= self._control_hz
+        elapsed_periods = max(
+            1,
+            math.floor((timestamp - self._next_sample_s) / sample_period_s) + 1,
+        )
+        self._next_sample_s += elapsed_periods * sample_period_s
         return True
 
     def record_frame(
@@ -1125,8 +1131,7 @@ class DatasetRecorder:
         self._put_nowait(_FinishOperation(commit, frame_count, reason))
         self._active = False
         self._episode_frames = 0
-        self._sample_accumulator = 0.0
-        self._sample_started = False
+        self._next_sample_s = None
         disposition = "save queued" if commit else "discard queued"
         print(
             f"DATASET episode {disposition} frames={frame_count} reason={reason}",
