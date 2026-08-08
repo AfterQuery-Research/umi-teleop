@@ -58,3 +58,28 @@ Both interfaces must report all of the following:
 
 Do not start robot control if an interface is missing or reports `DOWN`,
 `STOPPED`, `ERROR-PASSIVE`, `BUS-OFF`, or a different bitrate.
+
+## 5. Calibrate the grippers
+
+Gripper calibration applies torque and deliberately moves one gripper through
+its full travel. Clear the workspace, keep hands away, and calibrate only one
+side at a time:
+
+```bash
+uv run umi-calibrate-gripper --side left
+uv run umi-calibrate-gripper --side right
+```
+
+The endpoint-detection torque is applied only to gripper motor `0x07`. The six
+arm joints remain in gravity-compensation idle and receive no position targets.
+The command refuses to start unless the selected CAN adapter is healthy.
+
+Calibration is stored outside the repository at:
+
+```text
+~/.cache/umi-teleop-fixed/calibration/grippers/afterquery-dual-yam-01.json
+```
+
+If `XDG_CACHE_HOME` is set, it replaces `~/.cache`. Recalibrate after replacing
+or mechanically changing a gripper, motor, or encoder. Normal startup must load
+these cached endpoints and must never trigger calibration implicitly.

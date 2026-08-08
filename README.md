@@ -2,8 +2,9 @@
 
 A clean UMI teleoperation implementation for the YAM robot on `aq-yam`.
 
-The first supported operation is safe SocketCAN discovery and setup. It resolves
-the arms by USB adapter serial rather than assuming that `can0` is always left.
+The first supported operations are safe SocketCAN setup and supervised YAM
+gripper calibration. Hardware access uses i2rt directly; this package does not
+import or depend on LeRobot.
 
 ## Development
 
@@ -17,4 +18,3 @@ uv run pytest
 ## Robot setup
 
 Follow [docs/robot-setup.md](docs/robot-setup.md).
-
