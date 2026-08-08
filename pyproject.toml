@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "umi-teleop-fixed"
+version = "0.1.0"
+description = "A small, hardware-first UMI teleoperation stack."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "tyro>=0.9,<2",
+]
+
+[project.scripts]
+umi-setup-can = "umi_teleop_fixed.setup_can:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<9",
+    "ruff>=0.12",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "SIM", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
