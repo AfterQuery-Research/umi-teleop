@@ -66,9 +66,7 @@ its full travel. Clear the workspace, keep hands away, and calibrate only one
 side at a time:
 
 ```bash
-set -a
 source .env
-set +a
 
 uv run umi-calibrate-gripper \
     --robot-id "$ROBOT_ID" \
@@ -84,7 +82,8 @@ uv run umi-calibrate-gripper \
 All three arguments are required. There are no built-in robot or adapter
 defaults, so the command cannot silently select hardware from a different
 machine or robot. The local `.env` contains the `aq-yam` values and is ignored
-by Git; `.env.example` documents the required variable names.
+by Git. Its values use explicit `export` statements, so `source .env` is all
+that is needed to load them into the environment.
 
 The endpoint-detection torque is applied only to gripper motor `0x07`. The six
 arm joints remain in gravity-compensation idle and receive no position targets.
