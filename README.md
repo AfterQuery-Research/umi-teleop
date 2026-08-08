@@ -3,6 +3,29 @@
 A standalone UMI teleoperation stack for YAM robots. It uses i2rt directly and
 does not import or depend on LeRobot.
 
+## Vive trackers
+
+Install libsurvive, turn on both trackers and base stations, then discover and
+validate two live poses:
+
+```bash
+uv run umi-trackers
+```
+
+The command prints each tracker's stable serial, raw libsurvive-frame pose,
+update rate, and pose age. If libsurvive is not installed in a standard system
+or user-local path, pass `--libsurvive-path /path/to/libsurvive.so`. Once the
+physical left/right assignment is known, validate it explicitly:
+
+```bash
+uv run umi-trackers \
+    --left-tracker-serial LEFT_TRACKER_SERIAL \
+    --right-tracker-serial RIGHT_TRACKER_SERIAL
+```
+
+Tracking is read-only and never connects to the robot. Libsurvive configuration
+is stored under `~/.cache/umi-teleop-fixed/libsurvive/config.json` by default.
+
 ## CAN
 
 CAN adapters are selected by USB serial because Linux `canN` names can change
