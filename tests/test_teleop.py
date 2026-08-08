@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import numpy as np
 import pytest
 
-from umi_teleop_fixed.robot import ArmState
+from umi_teleop_fixed.robot import DEFAULT_START_POSITION, ArmState
 from umi_teleop_fixed.teleop import Args, TeleopController, control_loop, run
 from umi_teleop_fixed.trackers import TrackerPose, TrackerSample
 
@@ -90,6 +90,7 @@ class FakeBackend:
         self.commands = []
         self.idle_count = 0
         self.read_count = 0
+        self.move_calls = []
 
     def read_states(self):
         self.read_count += 1
@@ -103,6 +104,9 @@ class FakeBackend:
 
     def idle(self):
         self.idle_count += 1
+
+    def move_to_position(self, position, **_kwargs):
+        self.move_calls.append(tuple(position))
 
     def __enter__(self):
         return self
@@ -171,6 +175,8 @@ def test_args_reject_duplicate_hardware_ids_and_nonpositive_limits():
         _args(right_tracker_serial="left-tracker").validate()
     with pytest.raises(ValueError, match="control_rate_hz"):
         _args(control_rate_hz=0).validate()
+    with pytest.raises(ValueError, match="14 finite"):
+        _args(start_position=(0.0,) * 13).validate()
 
 
 def test_run_integrates_background_tracking_backend_and_active_loop():
@@ -214,5 +220,36 @@ def test_run_integrates_background_tracking_backend_and_active_loop():
     )
 
     assert len(backend.commands) == 1
+    assert backend.move_calls == [DEFAULT_START_POSITION, DEFAULT_START_POSITION]
     assert backend.closed is True
     assert source.closed is True
+
+    class FailingKeys(ContextKeys):
+        def poll(self):
+            raise RuntimeError("terminal failed")
+
+    failing_source = CyclingSource()
+    failing_backend = FakeBackend()
+    with pytest.raises(RuntimeError, match="terminal failed"):
+        run(
+            _args("active"),
+            backend_factory=lambda _args: failing_backend,
+            source_factory=lambda _args: failing_source,
+            keyboard_factory=lambda: FailingKeys([]),
+            emit=lambda _line: None,
+        )
+    assert failing_backend.move_calls == [DEFAULT_START_POSITION, DEFAULT_START_POSITION]
+    assert failing_backend.closed is True
+    assert failing_source.closed is True
+
+    dry_source = CyclingSource()
+    dry_backend = FakeBackend()
+    run(
+        _args("dry-run"),
+        backend_factory=lambda _args: dry_backend,
+        source_factory=lambda _args: dry_source,
+        keyboard_factory=lambda: ContextKeys([("q",)]),
+        emit=lambda _line: None,
+    )
+    assert dry_backend.move_calls == []
+    assert dry_backend.commands == []

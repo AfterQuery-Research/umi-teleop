@@ -83,7 +83,8 @@ must load them and never recalibrate implicitly.
 First identify which tracker is physically left and right by moving one tracker
 at a time while watching `umi-trackers`. Start with the full control path in
 dry-run mode; it connects both arms in gravity compensation and computes live
-FK, relative targets, and IK, but sends no position commands:
+FK, relative targets, and IK, but sends no position commands. It validates the
+configured start position without executing either trajectory:
 
 ```bash
 uv run umi-teleop \
@@ -110,8 +111,16 @@ uv run umi-teleop \
     --right-adapter-serial RIGHT_ADAPTER_SERIAL \
     --left-tracker-serial LEFT_TRACKER_SERIAL \
     --right-tracker-serial RIGHT_TRACKER_SERIAL \
+    --start-position 0 0 0 0 0 0 1 0 0 0 0 0 0 1 \
     --mode active
 ```
+
+`start-position` is ordered as six left joints, left gripper, six right joints,
+and right gripper. Its default is the value above. Active mode validates the
+target, moves both arms there in measured 0.01-unit steps at 30 Hz, and only
+then accepts `e`. On shutdown or Ctrl-C it disengages teleoperation and returns
+both arms to the same position before closing. A failed trajectory immediately
+returns both arms to gravity compensation and reports an error.
 
 Defaults are 60 Hz, 1:1 translation and rotation, 0.2 m/s and 1.0 rad/s rate
 limits, and engage-relative bounds of 0.3 m and 1.57 rad. Run

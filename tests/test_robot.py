@@ -10,7 +10,14 @@ from umi_teleop_fixed.calibration import (
     save_gripper_calibration,
 )
 from umi_teleop_fixed.can import CANInterfaceInfo
-from umi_teleop_fixed.robot import ArmState, DualYamBackend, I2RTArm, YamKinematics
+from umi_teleop_fixed.robot import (
+    DEFAULT_START_POSITION,
+    ArmState,
+    DualYamBackend,
+    I2RTArm,
+    YamKinematics,
+    validate_dual_position,
+)
 
 
 def _ready(name: str, serial: str) -> CANInterfaceInfo:
@@ -155,3 +162,74 @@ def test_i2rt_arm_rejects_state_when_a_control_worker_has_died():
 
     with pytest.raises(RuntimeError, match="CAN worker"):
         arm.read_state()
+
+
+@dataclass
+class MovingArm(FakeArm):
+    joints: np.ndarray = field(default_factory=lambda: np.full(6, 0.025))
+    gripper: float = 0.95
+    apply_commands: bool = True
+
+    def read_state(self):
+        return ArmState(self.joints.copy(), self.gripper, np.eye(4), 1.0)
+
+    def command(self, joints, gripper):
+        super().command(joints, gripper)
+        if self.apply_commands:
+            self.joints = joints.copy()
+            self.gripper = gripper
+
+
+def test_move_to_position_bounds_steps_and_verifies_both_arms():
+    arms = {"left": MovingArm(), "right": MovingArm(gripper=0.05)}
+    backend = DualYamBackend(arms)
+
+    backend.move_to_position(
+        DEFAULT_START_POSITION,
+        rate_hz=10_000,
+        sleep=lambda _delay: None,
+        emit=lambda _line: None,
+    )
+
+    for side, arm in arms.items():
+        initial = np.append(np.full(6, 0.025), 0.95 if side == "left" else 0.05)
+        commands = np.asarray([np.append(joints, gripper) for joints, gripper in arm.commands])
+        trajectory = np.vstack((initial, commands))
+        assert np.max(np.abs(np.diff(trajectory, axis=0))) <= 0.0100001
+        assert commands[-1] == pytest.approx(
+            np.asarray(DEFAULT_START_POSITION[:7])
+            if side == "left"
+            else np.asarray(DEFAULT_START_POSITION[7:])
+        )
+    assert arms["left"].joints == pytest.approx(np.zeros(6))
+    assert arms["right"].gripper == pytest.approx(1.0)
+
+
+def test_move_to_position_timeout_idles_both_arms():
+    arms = {
+        "left": MovingArm(apply_commands=False),
+        "right": MovingArm(apply_commands=False),
+    }
+    backend = DualYamBackend(arms)
+    clock = iter((0.0, 0.0, 0.0, 1.0))
+
+    with pytest.raises(TimeoutError, match="timed out"):
+        backend.move_to_position(
+            DEFAULT_START_POSITION,
+            timeout_seconds=0.5,
+            monotonic=lambda: next(clock),
+            sleep=lambda _delay: None,
+            emit=lambda _line: None,
+        )
+
+    assert all(arm.idle_count == 1 for arm in arms.values())
+
+
+def test_start_position_requires_14_in_limit_values():
+    assert validate_dual_position(DEFAULT_START_POSITION).shape == (14,)
+    with pytest.raises(ValueError, match="14 finite"):
+        validate_dual_position((0.0,) * 13)
+    invalid = list(DEFAULT_START_POSITION)
+    invalid[1] = -0.1
+    with pytest.raises(ValueError, match="left joint 2"):
+        validate_dual_position(invalid)

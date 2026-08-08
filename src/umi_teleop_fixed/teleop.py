@@ -19,7 +19,13 @@ import tyro
 from numpy.typing import NDArray
 
 from umi_teleop_fixed.calibration import cache_root
-from umi_teleop_fixed.robot import SIDES, ArmState, DualYamBackend
+from umi_teleop_fixed.robot import (
+    DEFAULT_START_POSITION,
+    SIDES,
+    ArmState,
+    DualYamBackend,
+    validate_dual_position,
+)
 from umi_teleop_fixed.se3 import (
     PoseMatrix,
     pose_matrix,
@@ -54,6 +60,9 @@ class Args:
 
     right_tracker_serial: str
     """Libsurvive serial of the physical right tracker."""
+
+    start_position: tuple[float, ...] = DEFAULT_START_POSITION
+    """Left joints/gripper followed by right joints/gripper; 14 values total."""
 
     mode: Literal["dry-run", "active"] = "dry-run"
     """Dry-run computes full IK but sends no position commands."""
@@ -120,6 +129,7 @@ class Args:
         for name, value in positive.items():
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be positive")
+        validate_dual_position(self.start_position)
 
     def resolved_config_path(self) -> Path:
         if self.config_path is not None:
@@ -298,6 +308,7 @@ def control_loop(
     sleep: Callable[[float], None] = time.sleep,
     emit: Callable[[str], None] = print,
     max_cycles: int | None = None,
+    initial_idle: bool = True,
 ) -> None:
     """Run an already-connected system; dependency injection keeps E2E tests deterministic."""
     controller = TeleopController(args)
@@ -306,7 +317,8 @@ def control_loop(
     status_started = next_tick
     successful_updates = 0
     cycles = 0
-    backend.idle()
+    if initial_idle:
+        backend.idle()
     emit(f"Ready in {args.mode} mode. Keys: e engage, d disengage, r re-zero, q quit.")
     try:
         while max_cycles is None or cycles < max_cycles:
@@ -428,22 +440,57 @@ def run(
         else:
             raise RuntimeError(f"trackers were not ready after 5 seconds: {last_error}")
 
-        with backend_factory(args) as backend, keyboard_factory() as keyboard:
-            control_loop(
-                args,
-                backend=backend,
-                trackers=reader,
-                keys=keyboard,
-                monotonic=monotonic,
-                sleep=sleep,
-                emit=emit,
-            )
+        with backend_factory(args) as backend:
+            if args.mode == "dry-run":
+                emit(
+                    "Dry-run validated start_position; startup and teardown trajectories "
+                    "will not send commands."
+                )
+                with keyboard_factory() as keyboard:
+                    control_loop(
+                        args,
+                        backend=backend,
+                        trackers=reader,
+                        keys=keyboard,
+                        monotonic=monotonic,
+                        sleep=sleep,
+                        emit=emit,
+                    )
+            else:
+                backend.move_to_position(
+                    args.start_position,
+                    monotonic=monotonic,
+                    sleep=sleep,
+                    emit=emit,
+                )
+                try:
+                    with keyboard_factory() as keyboard:
+                        control_loop(
+                            args,
+                            backend=backend,
+                            trackers=reader,
+                            keys=keyboard,
+                            monotonic=monotonic,
+                            sleep=sleep,
+                            emit=emit,
+                            initial_idle=False,
+                        )
+                finally:
+                    emit("Returning both arms to start_position before shutdown...")
+                    backend.move_to_position(
+                        args.start_position,
+                        monotonic=monotonic,
+                        sleep=sleep,
+                        emit=emit,
+                    )
 
 
 def main() -> None:
     """CLI entry point."""
     try:
         run(tyro.cli(Args))
+    except KeyboardInterrupt as error:
+        raise SystemExit(130) from error
     except (ImportError, OSError, RuntimeError, ValueError) as error:
         raise SystemExit(f"error: {error}") from error
 

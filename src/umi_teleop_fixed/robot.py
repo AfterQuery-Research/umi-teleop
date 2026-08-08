@@ -23,6 +23,19 @@ from umi_teleop_fixed.i2rt_runtime import close_i2rt_robot, new_control_threads
 from umi_teleop_fixed.se3 import PoseMatrix
 
 SIDES = ("left", "right")
+YAM_JOINT_LIMITS = (
+    (-2.61799, 3.14159),
+    (0.0, 3.66519),
+    (0.0, 3.14159),
+    (-1.69297, 1.5708),
+    (-1.5708, 1.5708),
+    (-2.0944, 2.0944),
+)
+DEFAULT_START_POSITION = (*([0.0] * 6), 1.0, *([0.0] * 6), 1.0)
+START_MOVE_STEP_SIZE = 0.01
+START_MOVE_RATE_HZ = 30.0
+START_MOVE_TOLERANCE = 0.035
+START_MOVE_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -94,6 +107,33 @@ def _validated_joints(values: object) -> NDArray[np.float64]:
     if joints.shape != (6,) or not np.all(np.isfinite(joints)):
         raise RuntimeError("YAM arm state must contain six finite joint positions")
     return joints.copy()
+
+
+def validate_dual_position(values: object) -> NDArray[np.float64]:
+    """Validate six joints and one normalized gripper target for each arm."""
+    position = np.asarray(values, dtype=np.float64)
+    if position.shape != (14,) or not np.all(np.isfinite(position)):
+        raise ValueError("start_position must contain 14 finite values")
+    for offset, side in ((0, "left"), (7, "right")):
+        for index, (lower, upper) in enumerate(YAM_JOINT_LIMITS):
+            value = float(position[offset + index])
+            if value < lower or value > upper:
+                raise ValueError(
+                    f"start_position {side} joint {index + 1} is outside [{lower}, {upper}]"
+                )
+        gripper = float(position[offset + 6])
+        if gripper < 0.0 or gripper > 1.0:
+            raise ValueError(f"start_position {side} gripper must be within [0, 1]")
+    return position.copy()
+
+
+def _position_targets(
+    values: object,
+) -> tuple[dict[str, NDArray[np.float64]], dict[str, float]]:
+    position = validate_dual_position(values)
+    joints = {"left": position[:6], "right": position[7:13]}
+    grippers = {"left": float(position[6]), "right": float(position[13])}
+    return joints, grippers
 
 
 class I2RTArm:
@@ -255,6 +295,98 @@ class DualYamBackend:
     ) -> None:
         for side in SIDES:
             self._arms[side].command(joint_targets[side], gripper_targets[side])
+
+    def move_to_position(
+        self,
+        position: object,
+        *,
+        step_size: float = START_MOVE_STEP_SIZE,
+        rate_hz: float = START_MOVE_RATE_HZ,
+        tolerance: float = START_MOVE_TOLERANCE,
+        timeout_seconds: float = START_MOVE_TIMEOUT_SECONDS,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+        emit: Callable[[str], None] = print,
+    ) -> None:
+        """Smoothly move both arms to one measured, validated joint position."""
+        for name, value in (
+            ("step_size", step_size),
+            ("rate_hz", rate_hz),
+            ("tolerance", tolerance),
+            ("timeout_seconds", timeout_seconds),
+        ):
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be positive")
+        target_joints, target_grippers = _position_targets(position)
+        try:
+            states = self.read_states()
+            start_joints = {side: states[side].joint_positions for side in SIDES}
+            start_grippers = {side: states[side].gripper_position for side in SIDES}
+            maximum_delta = max(
+                *(
+                    float(np.max(np.abs(target_joints[side] - start_joints[side])))
+                    for side in SIDES
+                ),
+                *(abs(target_grippers[side] - start_grippers[side]) for side in SIDES),
+            )
+            steps = max(1, int(np.ceil(maximum_delta / step_size)))
+            emit(
+                f"Moving both arms to start_position in {steps} steps "
+                f"at {rate_hz:.0f} Hz."
+            )
+            started = monotonic()
+            next_step = started
+            for step_index in range(1, steps + 1):
+                if monotonic() - started >= timeout_seconds:
+                    raise TimeoutError("timed out while moving both arms to start_position")
+                alpha = step_index / steps
+                waypoint_joints = {
+                    side: start_joints[side]
+                    + alpha * (target_joints[side] - start_joints[side])
+                    for side in SIDES
+                }
+                waypoint_grippers = {
+                    side: start_grippers[side]
+                    + alpha * (target_grippers[side] - start_grippers[side])
+                    for side in SIDES
+                }
+                self.command(waypoint_joints, waypoint_grippers)
+                self.read_states()
+                next_step += 1.0 / rate_hz
+                sleep(max(0.0, next_step - monotonic()))
+
+            while True:
+                states = self.read_states()
+                maximum_error = max(
+                    *(
+                        float(
+                            np.max(
+                                np.abs(target_joints[side] - states[side].joint_positions)
+                            )
+                        )
+                        for side in SIDES
+                    ),
+                    *(
+                        abs(target_grippers[side] - states[side].gripper_position)
+                        for side in SIDES
+                    ),
+                )
+                if maximum_error <= tolerance:
+                    # Keep the exact target active while waiting for teleoperation.
+                    self.command(target_joints, target_grippers)
+                    emit(f"Reached start_position (maximum error {maximum_error:.4f}).")
+                    return
+                if monotonic() - started >= timeout_seconds:
+                    raise TimeoutError(
+                        "both arms did not reach start_position within "
+                        f"{timeout_seconds:.1f}s (maximum error {maximum_error:.4f})"
+                    )
+                self.command(target_joints, target_grippers)
+                next_step += 1.0 / rate_hz
+                sleep(max(0.0, next_step - monotonic()))
+        except BaseException:
+            self.idle()
+            raise
 
     def idle(self) -> None:
         errors = []
