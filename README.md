@@ -1,7 +1,7 @@
 # umi-teleop-fixed
 
-A standalone UMI teleoperation stack for the YAM robot on `aq-yam`. It uses
-i2rt directly and does not import or depend on LeRobot.
+A standalone UMI teleoperation stack for YAM robots. It uses i2rt directly and
+does not import or depend on LeRobot.
 
 ## CAN
 
@@ -13,19 +13,21 @@ link state or sending CAN frames:
 uv run umi-setup-can
 ```
 
-The current `aq-yam` mapping is:
+Identify which discovered USB adapter is connected to each arm, then set a
+stable robot name and the two returned serials in your current shell:
 
-| Side | Adapter serial |
-| --- | --- |
-| Left | `209D378045465008` |
-| Right | `206237A845465006` |
+```bash
+ROBOT_ID=YOUR_ROBOT_ID
+LEFT_CAN=LEFT_ADAPTER_SERIAL
+RIGHT_CAN=RIGHT_ADAPTER_SERIAL
+```
 
 Configure and verify both classic CAN links at 1 Mbps:
 
 ```bash
 uv run umi-setup-can \
-    --left-adapter-serial 209D378045465008 \
-    --right-adapter-serial 206237A845465006
+    --left-adapter-serial "$LEFT_CAN" \
+    --right-adapter-serial "$RIGHT_CAN"
 ```
 
 Run this after a reboot or adapter replug. Do not start robot control unless
@@ -38,13 +40,13 @@ keep hands away.
 
 ```bash
 uv run umi-calibrate-gripper \
-    --robot-id afterquery-dual-yam-01 \
-    --adapter-serial 209D378045465008 \
+    --robot-id "$ROBOT_ID" \
+    --adapter-serial "$LEFT_CAN" \
     --side left
 
 uv run umi-calibrate-gripper \
-    --robot-id afterquery-dual-yam-01 \
-    --adapter-serial 206237A845465006 \
+    --robot-id "$ROBOT_ID" \
+    --adapter-serial "$RIGHT_CAN" \
     --side right
 ```
 

@@ -104,7 +104,7 @@ def authorize_link_changes(runner: CommandRunner = subprocess.run) -> None:
     message = result.stderr.strip() or f"exit status {result.returncode}"
     raise RuntimeError(
         "sudo authorization is required before changing CAN links. "
-        "Run this command in an interactive aq-yam shell.\n"
+        "Run this command in an interactive shell.\n"
         f"{message}"
     )
 

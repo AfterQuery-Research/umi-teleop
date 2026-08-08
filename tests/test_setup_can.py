@@ -76,7 +76,7 @@ def test_authorization_is_checked_before_link_changes():
         commands.append(command)
         return SimpleNamespace(returncode=1, stderr="password required")
 
-    with pytest.raises(RuntimeError, match="interactive aq-yam shell"):
+    with pytest.raises(RuntimeError, match="interactive shell"):
         setup_can.authorize_link_changes(runner=fake_run)
 
     assert commands == [["sudo", "-v"]]
