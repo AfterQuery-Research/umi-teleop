@@ -22,9 +22,6 @@ from umi_teleop_fixed.can import (
     resolve_can_interface,
 )
 
-DEFAULT_ROBOT_ID = "afterquery-dual-yam-01"
-DEFAULT_LEFT_CAN_SERIAL = "209D378045465008"
-DEFAULT_RIGHT_CAN_SERIAL = "206237A845465006"
 GRIPPER_TYPE = "linear_4310"
 
 LimitDetector = Callable[[str], tuple[float, float]]
@@ -34,27 +31,23 @@ LimitDetector = Callable[[str], tuple[float, float]]
 class Args:
     """Calibrate exactly one YAM gripper and cache its raw endpoints."""
 
+    robot_id: str
+    """Stable robot identity used to scope the cache file."""
+
+    adapter_serial: str
+    """USB serial of the CAN adapter connected to the selected gripper."""
+
     side: Literal["left", "right"]
     """The only gripper that is allowed to move."""
 
-    robot_id: str = DEFAULT_ROBOT_ID
-    """Stable robot identity used to scope the cache file."""
-
-    left_adapter_serial: str = DEFAULT_LEFT_CAN_SERIAL
-    """Stable USB serial for the left arm's CAN adapter."""
-
-    right_adapter_serial: str = DEFAULT_RIGHT_CAN_SERIAL
-    """Stable USB serial for the right arm's CAN adapter."""
-
-    def adapter_serial(self) -> str:
-        serial = (
-            self.left_adapter_serial if self.side == "left" else self.right_adapter_serial
-        ).strip()
+    def validated_ids(self) -> tuple[str, str]:
+        robot_id = self.robot_id.strip()
+        serial = self.adapter_serial.strip()
+        if not robot_id:
+            raise ValueError("robot_id must not be empty")
         if not serial:
-            raise ValueError(f"{self.side}_adapter_serial must not be empty")
-        if self.left_adapter_serial.casefold() == self.right_adapter_serial.casefold():
-            raise ValueError("left and right adapter serials must be different")
-        return serial
+            raise ValueError("adapter_serial must not be empty")
+        return robot_id, serial
 
 
 def _detect_i2rt_limits(channel: str) -> tuple[float, float]:
@@ -92,8 +85,8 @@ def run(
     if countdown_seconds < 0:
         raise ValueError("countdown_seconds must be non-negative")
 
-    serial = args.adapter_serial()
-    target_path = calibration_path(args.robot_id, root=root)
+    robot_id, serial = args.validated_ids()
+    target_path = calibration_path(robot_id, root=root)
     interfaces = discover_can_interfaces()
     interface = resolve_can_interface(serial, interfaces=interfaces)
     error = readiness_error(interface, bitrate=1_000_000)
@@ -126,7 +119,7 @@ def run(
     )
     save_gripper_calibration(
         target_path,
-        robot_id=args.robot_id,
+        robot_id=robot_id,
         side=args.side,
         calibration=calibration,
     )
