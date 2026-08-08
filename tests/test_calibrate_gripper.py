@@ -1,5 +1,7 @@
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 from umi_teleop_fixed import calibrate_gripper
 from umi_teleop_fixed.calibration import load_gripper_calibrations
@@ -20,7 +22,7 @@ def _ready_interface() -> CANInterfaceInfo:
     )
 
 
-def test_calibration_moves_only_selected_fake_gripper_and_saves(monkeypatch, tmp_path):
+def test_calibration_moves_only_selected_fake_gripper_and_saves(monkeypatch, tmp_path, capsys):
     opened_channels = []
     monkeypatch.setattr(calibrate_gripper, "discover_can_interfaces", lambda: [_ready_interface()])
 
@@ -36,15 +38,48 @@ def test_calibration_moves_only_selected_fake_gripper_and_saves(monkeypatch, tmp
         ),
         limit_detector=detector,
         root=tmp_path,
-        countdown_seconds=0,
         now=lambda: datetime(2026, 8, 8, 12, 30, tzinfo=UTC),
     )
 
     assert opened_channels == ["can7"]
+    assert "Starting in" not in capsys.readouterr().out
     loaded = load_gripper_calibrations(path, expected_robot_id="robot-01")
     assert loaded["left"].gripper_limits == (6.5, 1.2)
     assert loaded["left"].adapter_serial == "LEFT"
     assert loaded["left"].calibrated_at_utc == "2026-08-08T12:30:00Z"
+
+
+def test_i2rt_control_thread_stops_before_robot_closes():
+    chain = SimpleNamespace(running=True)
+    server_stop = threading.Event()
+    stopped = threading.Event()
+
+    def server_loop():
+        server_stop.wait()
+
+    def control_loop():
+        while chain.running:
+            stopped.wait(0.001)
+        stopped.set()
+
+    server_thread = threading.Thread(target=server_loop, name="robot-server")
+    control_thread = threading.Thread(target=control_loop, name="i2rt-control-loop")
+    server_thread.start()
+    control_thread.start()
+
+    class FakeRobot:
+        motor_chain = chain
+        _stop_event = server_stop
+        _server_thread = server_thread
+
+        def close(self):
+            assert not server_thread.is_alive()
+            assert stopped.is_set()
+
+    calibrate_gripper._close_i2rt_robot(FakeRobot(), (control_thread,))
+
+    assert not server_thread.is_alive()
+    assert not control_thread.is_alive()
 
 
 def test_calibration_identifiers_must_not_be_empty():
