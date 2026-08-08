@@ -1,4 +1,6 @@
 import math
+import queue
+import time
 
 import pytest
 
@@ -100,3 +102,64 @@ def test_run_closes_source_when_tracking_raises():
         )
 
     assert source.closed is True
+
+
+def test_background_reader_selects_roles_and_enforces_freshness():
+    sentinel = object()
+
+    class Source:
+        def __init__(self):
+            self.poses = queue.Queue()
+            self.closed = False
+
+        def next_pose(self):
+            value = self.poses.get(timeout=0.1)
+            return None if value is sentinel else value
+
+        def close(self):
+            self.closed = True
+
+    source = Source()
+    reader = trackers.TrackerReader(
+        source,
+        serials={"left": "LEFT", "right": "RIGHT"},
+    )
+    reader.start()
+    source.poses.put(_pose("OTHER"))
+    source.poses.put(_pose("LEFT"))
+    source.poses.put(_pose("RIGHT"))
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        try:
+            samples = reader.snapshot(now=time.monotonic(), stale_after_seconds=1.0)
+            break
+        except RuntimeError:
+            time.sleep(0.001)
+    else:
+        raise AssertionError("reader did not publish both tracker poses")
+
+    assert set(samples) == {"left", "right"}
+    with pytest.raises(RuntimeError, match="stale"):
+        reader.snapshot(now=time.monotonic() + 2.0, stale_after_seconds=0.1)
+    source.poses.put(sentinel)
+    reader.close()
+    assert source.closed is True
+
+
+def test_background_reader_surfaces_worker_failure():
+    class Source:
+        def next_pose(self):
+            raise ValueError("USB failed")
+
+        def close(self):
+            pass
+
+    reader = trackers.TrackerReader(
+        Source(),
+        serials={"left": "LEFT", "right": "RIGHT"},
+    )
+    reader.start()
+    reader._thread.join(timeout=1.0)
+    with pytest.raises(RuntimeError, match="USB failed"):
+        reader.snapshot(now=1.0, stale_after_seconds=0.1)
+    reader.close()

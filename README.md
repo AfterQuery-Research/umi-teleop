@@ -78,6 +78,45 @@ Endpoints are cached under
 `~/.cache/umi-teleop-fixed/calibration/grippers/<robot-id>.json`; normal startup
 must load them and never recalibrate implicitly.
 
+## Teleoperation
+
+First identify which tracker is physically left and right by moving one tracker
+at a time while watching `umi-trackers`. Start with the full control path in
+dry-run mode; it connects both arms in gravity compensation and computes live
+FK, relative targets, and IK, but sends no position commands:
+
+```bash
+uv run umi-teleop \
+    --robot-id YOUR_ROBOT_ID \
+    --left-adapter-serial LEFT_ADAPTER_SERIAL \
+    --right-adapter-serial RIGHT_ADAPTER_SERIAL \
+    --left-tracker-serial LEFT_TRACKER_SERIAL \
+    --right-tracker-serial RIGHT_TRACKER_SERIAL
+```
+
+The controls are `e` to engage at the current tracker and robot poses, `d` to
+return both arms to gravity compensation, `r` to re-zero, and `q` to disengage
+and quit. While dry-running, move one tracker at a time and confirm that only
+the corresponding `left` or `right` Cartesian delta changes. The grippers hold
+their measured positions. A stale pose, failed IK, dead robot worker, or
+engage-relative workspace violation disengages both arms.
+
+After dry-run validation, enable robot position commands explicitly:
+
+```bash
+uv run umi-teleop \
+    --robot-id YOUR_ROBOT_ID \
+    --left-adapter-serial LEFT_ADAPTER_SERIAL \
+    --right-adapter-serial RIGHT_ADAPTER_SERIAL \
+    --left-tracker-serial LEFT_TRACKER_SERIAL \
+    --right-tracker-serial RIGHT_TRACKER_SERIAL \
+    --mode active
+```
+
+Defaults are 60 Hz, 1:1 translation and rotation, 0.2 m/s and 1.0 rad/s rate
+limits, and engage-relative bounds of 0.3 m and 1.57 rad. Run
+`uv run umi-teleop --help` to tune them.
+
 ## Development
 
 ```bash

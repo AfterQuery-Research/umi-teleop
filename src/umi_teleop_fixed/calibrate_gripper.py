@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 import tyro
 
@@ -21,11 +20,11 @@ from umi_teleop_fixed.can import (
     readiness_error,
     resolve_can_interface,
 )
+from umi_teleop_fixed.i2rt_runtime import close_i2rt_robot, new_control_threads
 
 GRIPPER_TYPE = "linear_4310"
 
 LimitDetector = Callable[[str], tuple[float, float]]
-I2RT_CONTROL_THREAD = "_set_torques_and_update_state"
 
 
 @dataclass(frozen=True)
@@ -51,24 +50,7 @@ class Args:
         return robot_id, serial
 
 
-def _close_i2rt_robot(
-    robot: Any,
-    control_threads: tuple[threading.Thread, ...],
-) -> None:
-    """Stop i2rt's worker threads before its close method shuts down the socket."""
-    robot._stop_event.set()
-    robot._server_thread.join(timeout=2.0)
-
-    robot.motor_chain.running = False
-    for thread in control_threads:
-        thread.join(timeout=2.0)
-
-    worker_threads = (robot._server_thread, *control_threads)
-    stuck_threads = [thread.name for thread in worker_threads if thread.is_alive()]
-    robot.close()
-    if stuck_threads:
-        names = ", ".join(stuck_threads)
-        raise RuntimeError(f"i2rt CAN control thread did not stop cleanly: {names}")
+_close_i2rt_robot = close_i2rt_robot
 
 
 def _detect_i2rt_limits(channel: str) -> tuple[float, float]:
@@ -79,6 +61,8 @@ def _detect_i2rt_limits(channel: str) -> tuple[float, float]:
     except ImportError as error:
         raise ImportError("The pinned i2rt dependency is required for calibration") from error
 
+    import threading
+
     existing_threads = set(threading.enumerate())
     robot = get_yam_robot(
         channel=channel,
@@ -88,11 +72,7 @@ def _detect_i2rt_limits(channel: str) -> tuple[float, float]:
         gripper_limits_override=None,
         enable_auto_recovery=False,
     )
-    control_threads = tuple(
-        thread
-        for thread in threading.enumerate()
-        if thread not in existing_threads and I2RT_CONTROL_THREAD in thread.name
-    )
+    control_threads = new_control_threads(existing_threads)
     try:
         return robot.get_robot_info()["gripper_limits"]
     finally:

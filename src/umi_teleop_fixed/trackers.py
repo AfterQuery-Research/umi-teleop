@@ -6,6 +6,7 @@ import ctypes
 import ctypes.util
 import math
 import os
+import threading
 import time
 from collections.abc import Callable
 from contextlib import closing
@@ -197,6 +198,98 @@ class PoseSource(Protocol):
     def next_pose(self) -> TrackerPose | None: ...
 
     def close(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class TrackerSample:
+    """Latest pose plus the local monotonic time at which it arrived."""
+
+    pose: TrackerPose
+    received_at: float
+
+
+class TrackerReader:
+    """Continuously drain libsurvive so the control loop never blocks on tracking."""
+
+    def __init__(
+        self,
+        source: PoseSource,
+        *,
+        serials: dict[str, str],
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        normalized = {side: serial.strip() for side, serial in serials.items()}
+        if set(normalized) != {"left", "right"} or any(not value for value in normalized.values()):
+            raise ValueError("tracker reader requires non-empty left and right serials")
+        if normalized["left"].casefold() == normalized["right"].casefold():
+            raise ValueError("left and right tracker serials must be different")
+        self._source = source
+        self._roles = {serial.casefold(): side for side, serial in normalized.items()}
+        self._monotonic = monotonic
+        self._lock = threading.Lock()
+        self._samples: dict[str, TrackerSample] = {}
+        self._error: BaseException | None = None
+        self._stop = threading.Event()
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._read_loop,
+            name="umi-libsurvive-reader",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _read_loop(self) -> None:
+        try:
+            while not self._stop.is_set():
+                pose = self._source.next_pose()
+                if pose is None:
+                    continue
+                side = self._roles.get(pose.serial.casefold())
+                if side is None:
+                    continue
+                sample = TrackerSample(pose=pose, received_at=self._monotonic())
+                with self._lock:
+                    previous = self._samples.get(side)
+                    if previous is None or pose.timestamp > previous.pose.timestamp:
+                        self._samples[side] = sample
+        except BaseException as error:
+            if not self._stop.is_set():
+                with self._lock:
+                    self._error = error
+
+    def snapshot(self, *, now: float, stale_after_seconds: float) -> dict[str, TrackerSample]:
+        with self._lock:
+            if self._error is not None:
+                raise RuntimeError(f"libsurvive reader failed: {self._error}") from self._error
+            samples = dict(self._samples)
+        missing = [side for side in ("left", "right") if side not in samples]
+        if missing:
+            raise RuntimeError(f"no live pose for {', '.join(missing)} tracker")
+        for side, sample in samples.items():
+            age = max(0.0, now - sample.received_at)
+            if age > stale_after_seconds:
+                raise RuntimeError(f"{side} tracker pose is stale ({age:.3f}s old)")
+        return samples
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._stop.set()
+        self._thread.join(timeout=0.5)
+        self._source.close()
+        self._thread.join(timeout=1.0)
+        if self._thread.is_alive():
+            raise RuntimeError("libsurvive reader did not stop cleanly")
+
+    def __enter__(self) -> TrackerReader:
+        self.start()
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.close()
 
 
 def _load_libsurvive(path: Path | None) -> ctypes.CDLL:
