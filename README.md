@@ -53,9 +53,9 @@ visible to every Lighthouse:
 
 ```bash
 uv run umi-calibrate-tracking \
-    --robot-id YOUR_ROBOT_ID \
-    --tracker-serial TRACKER_SERIAL \
-    --expected-lighthouses LIGHTHOUSE_COUNT
+    --robot-id "$ROBOT_ID" \
+    --tracker-serial "$TRACKER_SERIAL" \
+    --expected-lighthouses "$LIGHTHOUSE_COUNT"
 ```
 
 First keep the tracker stationary while MPFIT solves the Lighthouse poses. The
@@ -91,8 +91,8 @@ assignment is known, validate it explicitly:
 
 ```bash
 uv run umi-trackers \
-    --left-tracker-serial LEFT_TRACKER_SERIAL \
-    --right-tracker-serial RIGHT_TRACKER_SERIAL \
+    --left-tracker-serial "$LEFT_TRACKER_SERIAL" \
+    --right-tracker-serial "$RIGHT_TRACKER_SERIAL" \
     --duration-seconds 60
 ```
 
@@ -161,11 +161,11 @@ camera's fisheye calibration:
 
 ```bash
 uv run umi-gripper-stream \
-    --target-host ROBOT_COMPUTER \
-    --left-camera LEFT_CAMERA_BY_PATH \
-    --left-intrinsics LEFT_CAMERA_CALIBRATION.npz \
-    --right-camera RIGHT_CAMERA_BY_PATH \
-    --right-intrinsics RIGHT_CAMERA_CALIBRATION.npz
+    --target-host "$ROBOT_COMPUTER" \
+    --left-camera "$LEFT_CAMERA" \
+    --left-intrinsics "$LEFT_CAMERA_CALIBRATION" \
+    --right-camera "$RIGHT_CAMERA" \
+    --right-intrinsics "$RIGHT_CAMERA_CALIBRATION"
 ```
 
 The standard left UMI tags are `2 3`, the standard right UMI tags are `0 1`,
@@ -178,7 +178,7 @@ hardware test.
 On the robot computer, validate the same UDP receiver used by teleoperation:
 
 ```bash
-uv run umi-grippers --sender-ip UMI_PI_IP
+uv run umi-grippers --sender-ip "$UMI_PI_IP"
 ```
 
 Stop the diagnostic before starting `umi-teleop`, because both commands bind
@@ -189,8 +189,8 @@ the UMI gripper geometry changes:
 
 ```bash
 uv run umi-calibrate-umi-grippers \
-    --robot-id YOUR_ROBOT_ID \
-    --sender-ip UMI_PI_IP
+    --robot-id "$ROBOT_ID" \
+    --sender-ip "$UMI_PI_IP"
 ```
 
 Fully open both UMI grippers before starting the command. This establishes a
@@ -217,11 +217,11 @@ executing the startup or zero-return trajectory:
 
 ```bash
 uv run umi-teleop \
-    --robot-id YOUR_ROBOT_ID \
-    --left-adapter-serial LEFT_ADAPTER_SERIAL \
-    --right-adapter-serial RIGHT_ADAPTER_SERIAL \
-    --left-tracker-serial LEFT_TRACKER_SERIAL \
-    --right-tracker-serial RIGHT_TRACKER_SERIAL
+    --robot-id "$ROBOT_ID" \
+    --left-adapter-serial "$LEFT_CAN" \
+    --right-adapter-serial "$RIGHT_CAN" \
+    --left-tracker-serial "$LEFT_TRACKER_SERIAL" \
+    --right-tracker-serial "$RIGHT_TRACKER_SERIAL"
 ```
 
 The controls are `e` to engage at the current tracker and robot poses, `d` to
@@ -238,11 +238,11 @@ full gripper stroke:
 
 ```bash
 uv run umi-teleop \
-    --robot-id YOUR_ROBOT_ID \
-    --left-adapter-serial LEFT_ADAPTER_SERIAL \
-    --right-adapter-serial RIGHT_ADAPTER_SERIAL \
-    --left-tracker-serial LEFT_TRACKER_SERIAL \
-    --right-tracker-serial RIGHT_TRACKER_SERIAL \
+    --robot-id "$ROBOT_ID" \
+    --left-adapter-serial "$LEFT_CAN" \
+    --right-adapter-serial "$RIGHT_CAN" \
+    --left-tracker-serial "$LEFT_TRACKER_SERIAL" \
+    --right-tracker-serial "$RIGHT_TRACKER_SERIAL" \
     --start-position 0 0.2 0.4 0 0 0 1 0 0.2 0.4 0 0 0 1 \
     --mode active \
     --translation-scale 1.0 \
@@ -251,7 +251,7 @@ uv run umi-teleop \
     --max-angular-speed-rad-s 1.75 \
     --max-translation-from-start-m 0.50 \
     --max-rotation-from-start-rad 3.0 \
-    --gripper-sender-ip UMI_PI_IP \
+    --gripper-sender-ip "$UMI_PI_IP" \
     --max-gripper-speed-per-s 4.0 \
     --debug
 ```
