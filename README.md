@@ -187,10 +187,10 @@ process running throughout UMI gripper calibration and teleoperation:
 ```bash
 # Run on the UMI gripper Raspberry Pi.
 uv run umi-gripper-stream \
-    --target-host ROBOT_COMPUTER_IP \
-    --left-camera /dev/v4l/by-path/LEFT_CAMERA-video-index0 \
+    --target-host "$ROBOT_COMPUTER" \
+    --left-camera "$LEFT_CAMERA" \
     --left-intrinsics calibration/cameras/right-umi-vive-teleop/left.npz \
-    --right-camera /dev/v4l/by-path/RIGHT_CAMERA-video-index0 \
+    --right-camera "$RIGHT_CAMERA" \
     --right-intrinsics calibration/cameras/right-umi-vive-teleop/right.npz
 ```
 
