@@ -28,11 +28,47 @@ libsurvive, while a camera-streaming Pi needs Video4Linux camera devices. The
 following sections configure and validate each subsystem before active robot
 control.
 
+### libsurvive on the robot computer
+
+`uv sync` does not install libsurvive. On Debian or Ubuntu, install its build
+dependencies, build the revision validated with this project, and install it in
+the current user's `~/.local` prefix:
+
+```bash
+sudo apt update
+sudo apt install \
+    build-essential cmake git zlib1g-dev libx11-dev libusb-1.0-0-dev \
+    freeglut3-dev liblapacke-dev libopenblas-dev libatlas-base-dev
+
+LIBSURVIVE_SRC="$HOME/.cache/umi-teleop/libsurvive-src"
+git clone https://github.com/collabora/libsurvive.git "$LIBSURVIVE_SRC"
+git -C "$LIBSURVIVE_SRC" checkout f23d298e6f0e69746eae1b7cf847e269d61e35f9
+cmake -S "$LIBSURVIVE_SRC" -B "$LIBSURVIVE_SRC/build" \
+    -DCMAKE_BUILD_TYPE=Release
+cmake --build "$LIBSURVIVE_SRC/build" --parallel
+cmake --install "$LIBSURVIVE_SRC/build" --prefix "$HOME/.local"
+```
+
+Install libsurvive's udev rule once so Vive USB devices are available without
+running teleoperation as root, then unplug and reconnect the tracker dongles:
+
+```bash
+sudo install -m 0644 "$LIBSURVIVE_SRC/useful_files/81-vive.rules" \
+    /etc/udev/rules.d/81-vive.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+The project automatically searches `~/.local/lib/libsurvive.so.0`. A different
+installation can be selected with `--libsurvive-path /path/to/libsurvive.so`.
+Only the robot computer that reads the Vive dongles needs libsurvive; a Pi used
+only for `umi-gripper-stream` does not.
+
 ## Vive trackers
 
-Install libsurvive and turn on at least one tracker and all base stations.
-Whenever a Lighthouse may have moved, run the complete interactive tracking
-calibration with one tracker visible to every Lighthouse:
+Turn on at least one tracker and all base stations. Whenever a Lighthouse may
+have moved, run the complete interactive tracking calibration with one tracker
+visible to every Lighthouse:
 
 ```bash
 uv run umi-calibrate-tracking \
