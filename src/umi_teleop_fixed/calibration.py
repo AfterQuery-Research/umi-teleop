@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
+UMI_GRIPPER_SCHEMA_VERSION = 1
 VALID_SIDES = frozenset({"left", "right"})
 _ROBOT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -75,6 +76,49 @@ class GripperCalibration:
             raise ValueError(f"missing calibration field: {error.args[0]}") from error
 
 
+@dataclass(frozen=True)
+class UmiGripperCalibration:
+    """Physical UMI jaw endpoints used to normalize raw camera widths."""
+
+    sender_ip: str
+    closed_width_mm: float
+    open_width_mm: float
+    calibrated_at_utc: str
+
+    def __post_init__(self) -> None:
+        if not self.sender_ip.strip():
+            raise ValueError("sender_ip must not be empty")
+        values = (float(self.closed_width_mm), float(self.open_width_mm))
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("UMI gripper widths must be finite")
+        if values[0] <= 0 or values[1] <= values[0]:
+            raise ValueError("UMI open width must be greater than its positive closed width")
+        object.__setattr__(self, "closed_width_mm", values[0])
+        object.__setattr__(self, "open_width_mm", values[1])
+        if not self.calibrated_at_utc.strip():
+            raise ValueError("calibrated_at_utc must not be empty")
+
+    @property
+    def span_mm(self) -> float:
+        return self.open_width_mm - self.closed_width_mm
+
+    @classmethod
+    def from_payload(cls, payload: object) -> UmiGripperCalibration:
+        if not isinstance(payload, dict):
+            raise ValueError("UMI gripper calibration entry must be an object")
+        try:
+            return cls(
+                sender_ip=str(payload["sender_ip"]),
+                closed_width_mm=float(payload["closed_width_mm"]),
+                open_width_mm=float(payload["open_width_mm"]),
+                calibrated_at_utc=str(payload["calibrated_at_utc"]),
+            )
+        except KeyError as error:
+            raise ValueError(f"missing UMI calibration field: {error.args[0]}") from error
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"invalid UMI calibration field: {error}") from error
+
+
 def cache_root() -> Path:
     """Return the platform cache root, respecting XDG_CACHE_HOME."""
     configured = os.environ.get("XDG_CACHE_HOME")
@@ -86,6 +130,13 @@ def calibration_path(robot_id: str, *, root: Path | None = None) -> Path:
     identity = validate_robot_id(robot_id)
     base = cache_root() if root is None else root
     return base / "umi-teleop-fixed" / "calibration" / "grippers" / f"{identity}.json"
+
+
+def umi_gripper_calibration_path(robot_id: str, *, root: Path | None = None) -> Path:
+    """Return the paired UMI endpoint-calibration file for one robot setup."""
+    identity = validate_robot_id(robot_id)
+    base = cache_root() if root is None else root
+    return base / "umi-teleop-fixed" / "calibration" / "umi_grippers" / f"{identity}.json"
 
 
 def load_gripper_calibrations(
@@ -132,6 +183,72 @@ def save_gripper_calibration(
         "grippers": {name: asdict(value) for name, value in sorted(calibrations.items())},
     }
 
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(payload, output, indent=2)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        temporary_path.chmod(0o600)
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def load_umi_gripper_calibrations(
+    path: Path,
+    *,
+    expected_robot_id: str,
+    expected_sender_ip: str,
+) -> dict[str, UmiGripperCalibration]:
+    """Load complete left/right UMI endpoints and verify their source."""
+    if not path.exists():
+        raise RuntimeError(
+            f"missing UMI gripper calibration {path}; run umi-calibrate-umi-grippers"
+        )
+    try:
+        payload: Any = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Could not read UMI calibration file {path}: {error}") from error
+    if not isinstance(payload, dict):
+        raise ValueError("UMI calibration file must contain an object")
+    if payload.get("schema_version") != UMI_GRIPPER_SCHEMA_VERSION:
+        raise ValueError(f"unsupported UMI gripper calibration schema in {path}")
+    if payload.get("robot_id") != expected_robot_id:
+        raise ValueError(f"UMI calibration robot_id does not match {expected_robot_id!r}")
+    grippers = payload.get("grippers")
+    if not isinstance(grippers, dict) or set(grippers) != VALID_SIDES:
+        raise ValueError("UMI calibration must contain exactly left and right grippers")
+    result = {
+        side: UmiGripperCalibration.from_payload(value) for side, value in grippers.items()
+    }
+    mismatched = [side for side, value in result.items() if value.sender_ip != expected_sender_ip]
+    if mismatched:
+        raise ValueError(
+            f"UMI calibration sender IP does not match {expected_sender_ip} for "
+            f"{', '.join(sorted(mismatched))}"
+        )
+    return result
+
+
+def save_umi_gripper_calibrations(
+    path: Path,
+    *,
+    robot_id: str,
+    calibrations: dict[str, UmiGripperCalibration],
+) -> None:
+    """Atomically replace the paired UMI endpoint calibration."""
+    identity = validate_robot_id(robot_id)
+    if set(calibrations) != VALID_SIDES:
+        raise ValueError("UMI calibration must contain exactly left and right grippers")
+    payload = {
+        "schema_version": UMI_GRIPPER_SCHEMA_VERSION,
+        "robot_id": identity,
+        "grippers": {name: asdict(value) for name, value in sorted(calibrations.items())},
+    }
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary_path = Path(temporary_name)

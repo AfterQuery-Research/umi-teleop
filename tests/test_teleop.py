@@ -6,6 +6,8 @@ import numpy as np
 import pytest
 
 from umi_teleop_fixed import teleop
+from umi_teleop_fixed.calibration import UmiGripperCalibration
+from umi_teleop_fixed.gripper_receiver import ReceivedGripperSample
 from umi_teleop_fixed.robot import DEFAULT_START_POSITION, ZERO_POSITION, ArmState
 from umi_teleop_fixed.teleop import Args, TeleopController, control_loop, run
 from umi_teleop_fixed.trackers import TrackerPose, TrackerSample
@@ -43,6 +45,34 @@ def _samples(x=0.0, received_at=1.0):
 
 def _states():
     return {side: ArmState(np.zeros(6), 0.4, np.eye(4), 1.0) for side in ("left", "right")}
+
+
+def _gripper_samples(left=120.0, right=120.0, *, stream_id="stream-a", received_at=1.0):
+    return {
+        side: ReceivedGripperSample(
+            width_mm=left if side == "left" else right,
+            visible_tag_ids=(2, 3) if side == "left" else (0, 1),
+            received_at=received_at,
+            camera_age_seconds=0.01,
+            sequence=1,
+            stream_id=stream_id,
+            sender="umi-pi",
+            source_ip="10.0.0.2",
+        )
+        for side in ("left", "right")
+    }
+
+
+def _umi_calibrations(span_mm=80.0):
+    return {
+        side: UmiGripperCalibration(
+            sender_ip="10.0.0.2",
+            closed_width_mm=40.0,
+            open_width_mm=40.0 + span_mm,
+            calibrated_at_utc="2026-08-08T12:00:00Z",
+        )
+        for side in ("left", "right")
+    }
 
 
 def test_teleop_defaults_to_scene_solving_poser():
@@ -125,6 +155,59 @@ def test_controller_captures_a_no_jump_baseline_and_rate_limits():
     assert "command_mm=[+20.0,+0.0,+0.0]" in summary
 
 
+def test_gripper_mapping_is_engage_relative_clamped_and_rate_limited():
+    controller = TeleopController(
+        _args(
+            gripper_sender_ip="10.0.0.2",
+            max_gripper_speed_per_s=1.5,
+        ),
+        gripper_calibrations=_umi_calibrations(),
+    )
+    controller.engage(_states(), _samples(), _gripper_samples())
+
+    initial = controller.propose_grippers(_gripper_samples(), dt=0.1)
+    moved = controller.propose_grippers(_gripper_samples(left=140.0, right=80.0), dt=0.1)
+
+    assert initial.command == pytest.approx({"left": 0.4, "right": 0.4})
+    assert moved.requested == pytest.approx({"left": 0.65, "right": 0.0})
+    assert moved.command == pytest.approx({"left": 0.55, "right": 0.25})
+
+
+def test_gripper_stream_restart_latches_until_rezero():
+    controller = TeleopController(
+        _args(gripper_sender_ip="10.0.0.2"),
+        gripper_calibrations=_umi_calibrations(),
+    )
+    controller.engage(_states(), _samples(), _gripper_samples())
+
+    restarted = controller.propose_grippers(
+        _gripper_samples(left=140.0, stream_id="stream-b"), dt=0.1
+    )
+    recovered = controller.propose_grippers(_gripper_samples(left=140.0), dt=0.1)
+
+    assert restarted.command["left"] == 0.4
+    assert "re-zero required" in recovered.status["left"]
+
+
+def test_ordinary_gripper_staleness_holds_then_automatically_recovers():
+    controller = TeleopController(
+        _args(gripper_sender_ip="10.0.0.2"),
+        gripper_calibrations=_umi_calibrations(),
+    )
+    controller.engage(_states(), _samples(), _gripper_samples())
+
+    held = controller.propose_grippers(
+        {},
+        dt=0.1,
+        unavailable_reasons={"left": "stale", "right": "stale"},
+    )
+    recovered = controller.propose_grippers(_gripper_samples(left=128.0), dt=0.1)
+
+    assert held.command == {"left": 0.4, "right": 0.4}
+    assert recovered.status["left"] == "tracking"
+    assert recovered.command["left"] > 0.4
+
+
 def test_controller_applies_fixed_tracker_to_robot_basis():
     controller = TeleopController(
         _args(
@@ -188,6 +271,21 @@ class FakeTrackers:
         if self.fail_after is not None and self.calls >= self.fail_after:
             raise RuntimeError("left tracker pose is stale")
         return _samples(received_at=0.0)
+
+
+class FakeGrippers:
+    def __init__(self, *, baseline=None, current=None, errors=None):
+        self.baseline = baseline or _gripper_samples(received_at=0.0)
+        self.current = current or self.baseline
+        self.errors = errors or {}
+
+    def snapshot(self, **_kwargs):
+        if isinstance(self.baseline, Exception):
+            raise self.baseline
+        return self.baseline
+
+    def read(self, **_kwargs):
+        return self.current, self.errors
 
 
 class FakeBackend:
@@ -255,6 +353,65 @@ def test_active_mode_commands_only_after_both_ik_solutions():
     assert set(backend.commands[0][0]) == {"left", "right"}
 
 
+def test_active_mode_commands_relative_streamed_gripper_widths():
+    backend = FakeBackend()
+    control_loop(
+        _args(
+            "active",
+            gripper_sender_ip="10.0.0.2",
+            max_gripper_speed_per_s=60.0,
+        ),
+        backend=backend,
+        trackers=FakeTrackers(),
+        grippers=FakeGrippers(current=_gripper_samples(left=128.0, right=112.0)),
+        gripper_calibrations=_umi_calibrations(),
+        keys=FakeKeys([("e",), ("q",)]),
+        monotonic=lambda: 0.0,
+        sleep=lambda _delay: None,
+        emit=lambda _line: None,
+    )
+
+    assert backend.commands[0][1] == pytest.approx({"left": 0.5, "right": 0.3})
+
+
+def test_gripper_dropout_freezes_grippers_without_stopping_arms():
+    backend = FakeBackend()
+    control_loop(
+        _args("active", gripper_sender_ip="10.0.0.2"),
+        backend=backend,
+        trackers=FakeTrackers(),
+        grippers=FakeGrippers(current={}, errors={"left": "stale", "right": "stale"}),
+        gripper_calibrations=_umi_calibrations(),
+        keys=FakeKeys([("e",), (), ("q",)]),
+        monotonic=lambda: 0.0,
+        sleep=lambda _delay: None,
+        emit=lambda _line: None,
+    )
+
+    assert len(backend.commands) == 2
+    assert all(command[1] == {"left": 0.4, "right": 0.4} for command in backend.commands)
+    assert backend.idle_count == 2
+
+
+def test_engage_is_refused_without_fresh_gripper_widths():
+    backend = FakeBackend()
+    output = []
+    control_loop(
+        _args("active", gripper_sender_ip="10.0.0.2"),
+        backend=backend,
+        trackers=FakeTrackers(),
+        grippers=FakeGrippers(baseline=RuntimeError("no gripper packets received")),
+        gripper_calibrations=_umi_calibrations(),
+        keys=FakeKeys([("e",), ("q",)]),
+        monotonic=lambda: 0.0,
+        sleep=lambda _delay: None,
+        emit=output.append,
+    )
+
+    assert backend.commands == []
+    assert any("ENGAGE REFUSED" in line for line in output)
+
+
 def test_stale_tracker_disengages_both_arms():
     backend = FakeBackend()
     output = []
@@ -305,6 +462,7 @@ def test_args_reject_duplicate_hardware_ids_and_nonpositive_limits():
         _args(tracker_to_robot_rpy_degrees=(0.0, math.nan, 0.0)).validate()
     with pytest.raises(ValueError, match="requires --debug"):
         _args(debug_log_path="debug.jsonl").validate()
+    _args(gripper_sender_ip="10.0.0.2").validate()
 
 
 def test_run_integrates_background_tracking_backend_and_active_loop(tmp_path):

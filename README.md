@@ -109,6 +109,54 @@ Endpoints are cached under
 `~/.cache/umi-teleop-fixed/calibration/grippers/<robot-id>.json`; normal startup
 must load them and never recalibrate implicitly.
 
+## UMI gripper cameras
+
+The Pi streams physical gripper widths in millimetres; it does not normalize
+them or command the robot. Use stable `/dev/v4l/by-path` camera paths and each
+camera's fisheye calibration:
+
+```bash
+uv run umi-gripper-stream \
+    --target-host ROBOT_COMPUTER \
+    --left-camera LEFT_CAMERA_BY_PATH \
+    --left-intrinsics LEFT_CAMERA_CALIBRATION.npz \
+    --right-camera RIGHT_CAMERA_BY_PATH \
+    --right-intrinsics RIGHT_CAMERA_CALIBRATION.npz
+```
+
+The standard left UMI tags are `2 3`, the standard right UMI tags are `0 1`,
+and UDP port `9130` is the default. Every versioned packet contains the latest
+raw width or `null`, validity, visible tag IDs, sequence number, and monotonic
+age metadata for both sides. Camera loss is therefore explicit and never turns
+into a stale or fabricated command. Use `--duration-seconds N` for a bounded
+hardware test.
+
+On the robot computer, validate the same UDP receiver used by teleoperation:
+
+```bash
+uv run umi-grippers --sender-ip UMI_PI_IP
+```
+
+Stop the diagnostic before starting `umi-teleop`, because both commands bind
+the same UDP port.
+
+Calibrate the physical closed/open span after camera setup changes, or whenever
+the UMI gripper geometry changes:
+
+```bash
+uv run umi-calibrate-umi-grippers \
+    --robot-id YOUR_ROBOT_ID \
+    --sender-ip UMI_PI_IP
+```
+
+Fully open both UMI grippers before starting the command. This establishes a
+safe reference and prevents an open endpoint from being mistaken for closed.
+The command asks for left fully closed, left fully open, right fully closed, and
+right fully open, in that order. Move only the instructed gripper and hold each
+endpoint still; it detects stability and advances without key presses. No robot
+connects or moves. The paired endpoints are cached under
+`~/.cache/umi-teleop-fixed/calibration/umi_grippers/`.
+
 ## Teleoperation
 
 First identify which tracker is physically left and right by moving one tracker
@@ -139,7 +187,10 @@ the corresponding `left` or `right` Cartesian delta changes. The grippers hold
 their measured positions. A stale pose, failed IK, dead robot worker, or
 engage-relative workspace violation disengages both arms.
 
-After dry-run validation, enable robot position commands explicitly:
+After dry-run validation, enable robot position commands explicitly. This
+responsive example uses a mildly bent start pose, calibrated gripper streaming,
+35 cm/s Cartesian motion, 100 degrees/s rotation, and a 0.25-second commanded
+full gripper stroke:
 
 ```bash
 uv run umi-teleop \
@@ -148,24 +199,49 @@ uv run umi-teleop \
     --right-adapter-serial RIGHT_ADAPTER_SERIAL \
     --left-tracker-serial LEFT_TRACKER_SERIAL \
     --right-tracker-serial RIGHT_TRACKER_SERIAL \
-    --start-position 0 0.4 0.8 0 0 0 1 0 0.4 0.8 0 0 0 1 \
-    --mode active
+    --start-position 0 0.2 0.4 0 0 0 1 0 0.2 0.4 0 0 0 1 \
+    --mode active \
+    --translation-scale 1.0 \
+    --rotation-scale 1.0 \
+    --max-linear-speed-m-s 0.35 \
+    --max-angular-speed-rad-s 1.75 \
+    --max-translation-from-start-m 0.50 \
+    --max-rotation-from-start-rad 3.0 \
+    --gripper-sender-ip UMI_PI_IP \
+    --max-gripper-speed-per-s 4.0 \
+    --debug
 ```
 
 `start-position` is ordered as six left joints, left gripper, six right joints,
-and right gripper. Its default is the bent ready pose above; the all-zero arm
-pose is not suitable for Cartesian control because it is singular. Active mode validates the
-target, moves both arms there in measured 0.01-unit steps at 30 Hz, and only
-then accepts `e`. On shutdown or Ctrl-C it disengages teleoperation and returns
-both arms to the fixed all-zero joint position with both grippers open,
-independent of `--start-position`, before closing. A failed trajectory
-immediately returns both arms to gravity compensation and reports an error.
+and right gripper. The all-zero arm pose is not suitable for Cartesian control
+because it is singular. Active mode validates the target, moves both arms there
+in measured 0.01-unit steps at 30 Hz, and only then accepts `e`. Fully open both
+UMI grippers and place the trackers comfortably before pressing `e`. That key
+captures the current tracker poses, robot end-effector poses, UMI widths, and
+robot-gripper positions as the relative zero, so motion before `e` is ignored
+and engaging produces no target jump. Press `r` to capture a new reference. On
+shutdown or Ctrl-C, the program disengages teleoperation and returns both arms
+to the fixed all-zero joint position with both grippers open, independent of
+`--start-position`, before closing. A failed trajectory immediately returns
+both arms to gravity compensation and reports an error.
+
+When gripper streaming is enabled, `e` also captures each raw UMI width and
+measured robot-gripper position. Later width changes are mapped relative to
+those baselines using the calibrated physical span for that side, so a complete
+UMI open/close motion maps to a complete normalized robot-gripper travel even
+when the two devices have different widths. Brief tag misses hold the last
+command and resume automatically. A restarted Pi stream freezes the grippers
+until `r` re-zeroes them, without stopping Cartesian arm control.
 
 Defaults are 60 Hz, 1:1 translation and rotation, 0.2 m/s and 1.0 rad/s rate
-limits, and engage-relative bounds of 0.3 m and 1.57 rad. Tracker motion is
-computed in the lighthouse world frame, so physical up commands robot up
-regardless of the UMI orientation at engage. If the room's horizontal axes do
-not match the robot, update the cached teleop frame above.
+limits, and engage-relative bounds of 0.3 m and 1.57 rad. In the responsive
+example, `0.35 m/s` is the end-effector speed limit, `1.75 rad/s` is about 100
+degrees/s, and `4.0` normalized gripper travel/s requests a full stroke in 0.25
+seconds. The `0.50 m` and `3.0 rad` values are workspace bounds, not speed
+limits. Tracker motion is computed in the lighthouse world frame, so physical
+up commands robot up regardless of the UMI orientation at engage. If the
+room's horizontal axes do not match the robot, update the cached teleop frame
+above.
 For a translation-only diagnostic, pass `--rotation-scale 0`; tracker rotation
 is then ignored while tracker translation continues to command the physical
 LINEAR_4310 gripper's `grasp_site`.

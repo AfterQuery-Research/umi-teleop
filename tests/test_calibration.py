@@ -6,9 +6,13 @@ import pytest
 
 from umi_teleop_fixed.calibration import (
     GripperCalibration,
+    UmiGripperCalibration,
     calibration_path,
     load_gripper_calibrations,
+    load_umi_gripper_calibrations,
     save_gripper_calibration,
+    save_umi_gripper_calibrations,
+    umi_gripper_calibration_path,
 )
 
 
@@ -65,3 +69,43 @@ def test_calibration_rejects_invalid_limits(limits):
 
 def test_timestamp_example_is_timezone_aware():
     assert datetime(2026, 8, 8, tzinfo=UTC).isoformat().endswith("+00:00")
+
+
+def test_umi_endpoint_cache_normalizes_different_physical_spans(tmp_path):
+    path = umi_gripper_calibration_path("robot-01", root=tmp_path)
+    calibrations = {
+        "left": UmiGripperCalibration("10.0.0.2", 41.0, 124.0, "2026-08-08T12:00:00Z"),
+        "right": UmiGripperCalibration("10.0.0.2", 50.0, 120.0, "2026-08-08T12:00:00Z"),
+    }
+
+    save_umi_gripper_calibrations(
+        path,
+        robot_id="robot-01",
+        calibrations=calibrations,
+    )
+    loaded = load_umi_gripper_calibrations(
+        path,
+        expected_robot_id="robot-01",
+        expected_sender_ip="10.0.0.2",
+    )
+
+    assert loaded["left"].span_mm == 83.0
+    assert loaded["right"].span_mm == 70.0
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_umi_endpoint_cache_rejects_wrong_sender(tmp_path):
+    path = umi_gripper_calibration_path("robot-01", root=tmp_path)
+    calibration = UmiGripperCalibration("10.0.0.2", 40.0, 120.0, "now")
+    save_umi_gripper_calibrations(
+        path,
+        robot_id="robot-01",
+        calibrations={"left": calibration, "right": calibration},
+    )
+
+    with pytest.raises(ValueError, match="sender IP"):
+        load_umi_gripper_calibrations(
+            path,
+            expected_robot_id="robot-01",
+            expected_sender_ip="10.0.0.3",
+        )

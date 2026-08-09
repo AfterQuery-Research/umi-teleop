@@ -10,12 +10,17 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "i2rt @ git+https://github.com/AfterQuery-Research/i2rt.git@e599e9db90d644db6efe0b16bb6fd7cb87c4272f",
+    "numpy>=2,<3",
+    "opencv-contrib-python-headless>=4.10,<5",
     "tyro>=0.9,<2",
 ]
 
 [project.scripts]
 umi-calibrate-gripper = "umi_teleop_fixed.calibrate_gripper:main"
+umi-calibrate-umi-grippers = "umi_teleop_fixed.calibrate_umi_grippers:main"
 umi-calibrate-tracking = "umi_teleop_fixed.calibrate_tracking:main"
+umi-gripper-stream = "umi_teleop_fixed.gripper_stream:main"
+umi-grippers = "umi_teleop_fixed.grippers:main"
 umi-setup-can = "umi_teleop_fixed.setup_can:main"
 umi-teleop = "umi_teleop_fixed.teleop:main"
 umi-trackers = "umi_teleop_fixed.trackers:main"
