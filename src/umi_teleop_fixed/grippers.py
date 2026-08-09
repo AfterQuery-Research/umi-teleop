@@ -29,6 +29,7 @@ def run(args: Args) -> None:
     args.validate()
     started = time.monotonic()
     next_status = started
+    button_status = "button=waiting"
     with GripperReceiver(
         sender_ip=args.sender_ip,
         port=args.port,
@@ -37,6 +38,20 @@ def run(args: Args) -> None:
         print(f"Listening for UMI gripper widths from {args.sender_ip} on UDP {args.port}.")
         while args.duration_seconds is None or time.monotonic() - started < args.duration_seconds:
             now = time.monotonic()
+            try:
+                button = receiver.poll_button_events(
+                    now=now,
+                    stale_after_seconds=args.timeout_seconds,
+                )
+            except RuntimeError:
+                button_status = "button=unavailable"
+            else:
+                button_status = f"button={'pressed' if button.pressed else 'released'}"
+                if button.engage_count or button.quit_count:
+                    print(
+                        f"GPIO: engage={button.engage_count} quit={button.quit_count}",
+                        flush=True,
+                    )
             if now >= next_status:
                 try:
                     samples = receiver.snapshot(now=now, stale_after_seconds=args.timeout_seconds)
@@ -50,7 +65,7 @@ def run(args: Args) -> None:
                         f"right={right.width_mm:.2f}mm "
                         f"age={right_age:.3f}s "
                         f"packets={stats.packets} malformed={stats.malformed} "
-                        f"out_of_order={stats.out_of_order}",
+                        f"out_of_order={stats.out_of_order} {button_status}",
                         flush=True,
                     )
                 except RuntimeError as error:

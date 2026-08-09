@@ -10,7 +10,8 @@ from pathlib import Path
 import cv2
 import tyro
 
-from .gripper_protocol import GripperPacket, GripperSample, encode_packet
+from .gpio_button import GpioButton
+from .gripper_protocol import ButtonSample, GripperPacket, GripperSample, encode_packet
 from .gripper_vision import (
     FisheyeIntrinsics,
     create_aruco_detector,
@@ -33,6 +34,8 @@ class Args:
     """Stable /dev/v4l/by-path path for the physical right UMI camera."""
     right_intrinsics: Path
     """Fisheye .npz calibration for the right camera."""
+    button_gpio_line: int | None = None
+    """BCM GPIO line for an active-low engage/quit button; omit to disable it."""
     target_port: int = 9130
     left_tag_ids: tuple[int, int] = (2, 3)
     right_tag_ids: tuple[int, int] = (0, 1)
@@ -46,6 +49,8 @@ class Args:
     exposure: float = 100.0
     status_interval_seconds: float = 2.0
     startup_timeout_seconds: float = 5.0
+    button_debounce_seconds: float = 0.05
+    button_hold_seconds: float = 1.0
     duration_seconds: float | None = None
     sender_name: str = socket.gethostname()
 
@@ -199,6 +204,12 @@ def validate_args(args: Args) -> None:
         raise ValueError("status and startup intervals must be positive")
     if args.duration_seconds is not None and args.duration_seconds <= 0:
         raise ValueError("duration_seconds must be positive when provided")
+    if args.button_gpio_line is not None and not 0 <= args.button_gpio_line <= 53:
+        raise ValueError("button_gpio_line must be a BCM line between 0 and 53")
+    if args.button_debounce_seconds <= 0 or args.button_hold_seconds <= 0:
+        raise ValueError("button debounce and hold durations must be positive")
+    if args.button_debounce_seconds >= args.button_hold_seconds:
+        raise ValueError("button_debounce_seconds must be shorter than button_hold_seconds")
     for path in (args.left_intrinsics, args.right_intrinsics):
         if not path.is_file():
             raise ValueError(f"intrinsics file does not exist: {path}")
@@ -242,6 +253,15 @@ def run(args: Args) -> None:
         args=args,
     )
     workers = left_worker, right_worker
+    button = (
+        GpioButton(
+            line=args.button_gpio_line,
+            debounce_seconds=args.button_debounce_seconds,
+            hold_seconds=args.button_hold_seconds,
+        )
+        if args.button_gpio_line is not None
+        else None
+    )
     for worker in workers:
         worker.start()
 
@@ -258,6 +278,12 @@ def run(args: Args) -> None:
             f"at {args.send_rate_hz:g} Hz. Press Ctrl-C to stop.",
             flush=True,
         )
+        if button is not None:
+            print(
+                f"GPIO{args.button_gpio_line}: tap to engage; hold "
+                f"{args.button_hold_seconds:g}s to quit.",
+                flush=True,
+            )
         while args.duration_seconds is None or time.monotonic() - started < args.duration_seconds:
             now_ns = time.monotonic_ns()
             left, left_stats, left_fatal = left_worker.state.snapshot()
@@ -266,6 +292,7 @@ def run(args: Args) -> None:
             if fatal_errors:
                 raise RuntimeError("; ".join(fatal_errors))
             assert left is not None and right is not None
+            button_snapshot = None if button is None else button.snapshot()
             packet = GripperPacket(
                 sequence=sequence,
                 sender=args.sender_name,
@@ -273,6 +300,13 @@ def run(args: Args) -> None:
                 sent_monotonic_ns=now_ns,
                 left=left,
                 right=right,
+                button=None
+                if button_snapshot is None
+                else ButtonSample(
+                    pressed=button_snapshot.pressed,
+                    engage_count=button_snapshot.engage_count,
+                    quit_count=button_snapshot.quit_count,
+                ),
             )
             udp.sendto(encode_packet(packet), (args.target_host, args.target_port))
             sequence += 1
@@ -284,7 +318,13 @@ def run(args: Args) -> None:
                 print(
                     f"left={_format_sample(left)} valid_rate={left_rate:.1f}Hz  "
                     f"right={_format_sample(right)} valid_rate={right_rate:.1f}Hz  "
-                    f"packets={sequence}",
+                    f"packets={sequence}"
+                    + (
+                        ""
+                        if button_snapshot is None
+                        else f"  button={'pressed' if button_snapshot.pressed else 'released'} "
+                        f"engage={button_snapshot.engage_count} quit={button_snapshot.quit_count}"
+                    ),
                     flush=True,
                 )
                 next_status = now + args.status_interval_seconds
@@ -299,6 +339,8 @@ def run(args: Args) -> None:
             worker.stop()
         for worker in workers:
             worker.join()
+        if button is not None:
+            button.close()
 
 
 def main() -> None:

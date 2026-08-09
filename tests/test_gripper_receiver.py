@@ -1,6 +1,7 @@
 import pytest
 
 from umi_teleop_fixed.gripper_protocol import (
+    ButtonSample,
     GripperPacket,
     GripperSample,
     encode_packet,
@@ -14,6 +15,7 @@ def _packet(
     stream_id: str = "stream-a",
     left: GripperSample | None = None,
     right: GripperSample | None = None,
+    button: ButtonSample | None = None,
 ) -> bytes:
     return encode_packet(
         GripperPacket(
@@ -23,6 +25,7 @@ def _packet(
             sent_monotonic_ns=1_000_000_000,
             left=left or GripperSample(120.0, True, (2, 3), 990_000_000),
             right=right or GripperSample(121.0, True, (0, 1), 990_000_000),
+            button=button,
         )
     )
 
@@ -92,3 +95,67 @@ def test_receiver_rejects_malformed_nested_sample() -> None:
 
     assert not receiver.process_datagram(data, source_ip="10.0.0.2", received_at=1.0)
     assert receiver.stats().malformed == 1
+
+
+def test_button_counters_deliver_each_event_once_despite_packet_loss() -> None:
+    receiver = GripperReceiver(sender_ip="10.0.0.2")
+    receiver.process_datagram(
+        _packet(button=ButtonSample(False, 0, 0)),
+        source_ip="10.0.0.2",
+        received_at=1.0,
+    )
+    receiver.process_datagram(
+        _packet(sequence=3, button=ButtonSample(True, 3, 1)),
+        source_ip="10.0.0.2",
+        received_at=1.1,
+    )
+
+    events = receiver.poll_button_events(now=1.11, stale_after_seconds=0.2)
+    assert events.engage_count == 3
+    assert events.quit_count == 1
+    assert events.pressed is True
+    assert events.stream_id == "stream-a"
+
+    repeated = receiver.poll_button_events(now=1.12, stale_after_seconds=0.2)
+    assert repeated.engage_count == 0
+    assert repeated.quit_count == 0
+
+
+def test_new_button_stream_is_baselined_without_replaying_old_actions() -> None:
+    receiver = GripperReceiver(sender_ip="10.0.0.2")
+    receiver.process_datagram(
+        _packet(button=ButtonSample(False, 0, 0)),
+        source_ip="10.0.0.2",
+        received_at=1.0,
+    )
+    receiver.process_datagram(
+        _packet(
+            stream_id="stream-b",
+            button=ButtonSample(False, 8, 4),
+        ),
+        source_ip="10.0.0.2",
+        received_at=1.1,
+    )
+
+    events = receiver.poll_button_events(now=1.11, stale_after_seconds=0.2)
+    assert events.stream_id == "stream-b"
+    assert events.engage_count == 0
+    assert events.quit_count == 0
+
+
+def test_button_receiver_rejects_decreasing_counter_and_staleness() -> None:
+    receiver = GripperReceiver(sender_ip="10.0.0.2")
+    receiver.process_datagram(
+        _packet(button=ButtonSample(False, 2, 1)),
+        source_ip="10.0.0.2",
+        received_at=1.0,
+    )
+    assert not receiver.process_datagram(
+        _packet(sequence=1, button=ButtonSample(False, 1, 1)),
+        source_ip="10.0.0.2",
+        received_at=1.1,
+    )
+    assert receiver.stats().malformed == 1
+
+    with pytest.raises(RuntimeError, match="stale"):
+        receiver.poll_button_events(now=1.3, stale_after_seconds=0.2)

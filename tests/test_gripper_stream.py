@@ -25,6 +25,7 @@ def test_default_protocol_configuration_is_valid(tmp_path: Path) -> None:
     assert args.left_tag_ids == (2, 3)
     assert args.right_tag_ids == (0, 1)
     assert args.target_port == 9130
+    assert args.button_gpio_line is None
 
 
 def test_rejects_shared_camera_device(tmp_path: Path) -> None:
@@ -38,3 +39,29 @@ def test_rejects_shared_camera_device(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="different devices"):
         validate_args(invalid)
+
+
+def test_validates_gpio_line_and_timing(tmp_path: Path) -> None:
+    args = _args(tmp_path)
+    validate_args(
+        Args(
+            target_host=args.target_host,
+            left_camera=args.left_camera,
+            left_intrinsics=args.left_intrinsics,
+            right_camera=args.right_camera,
+            right_intrinsics=args.right_intrinsics,
+            button_gpio_line=16,
+        )
+    )
+
+    with pytest.raises(ValueError, match="button_gpio_line"):
+        validate_args(
+            Args(
+                target_host=args.target_host,
+                left_camera=args.left_camera,
+                left_intrinsics=args.left_intrinsics,
+                right_camera=args.right_camera,
+                right_intrinsics=args.right_intrinsics,
+                button_gpio_line=54,
+            )
+        )

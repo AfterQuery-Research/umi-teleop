@@ -31,7 +31,11 @@ from umi_teleop_fixed.debug import (
     NullDebugRecorder,
     timestamped_debug_path,
 )
-from umi_teleop_fixed.gripper_receiver import GripperReceiver, ReceivedGripperSample
+from umi_teleop_fixed.gripper_receiver import (
+    GripperReceiver,
+    ReceivedButtonEvents,
+    ReceivedGripperSample,
+)
 from umi_teleop_fixed.lighthouses import (
     load_lighthouse_calibration_id,
     require_lighthouse_calibration,
@@ -118,6 +122,9 @@ class Args:
     gripper_sender_ip: str | None = None
     """Expected Pi IPv4 address; omit to hold the robot grippers at engage position."""
 
+    enable_remote_button: bool = False
+    """Allow the Pi GPIO button to engage and quit teleoperation."""
+
     gripper_port: int = 9130
     """UDP port carrying versioned raw-width packets."""
 
@@ -184,6 +191,8 @@ class Args:
             raise ValueError("debug_log_path requires --debug")
         if not 1 <= self.gripper_port <= 65535:
             raise ValueError("gripper_port must be between 1 and 65535")
+        if self.enable_remote_button and not self.gripper_enabled:
+            raise ValueError("enable_remote_button requires --gripper-sender-ip")
 
     @property
     def gripper_enabled(self) -> bool:
@@ -562,6 +571,10 @@ class GripperSnapshots(Protocol):
         self, *, now: float, stale_after_seconds: float
     ) -> tuple[dict[str, ReceivedGripperSample], dict[str, str]]: ...
 
+    def poll_button_events(
+        self, *, now: float, stale_after_seconds: float
+    ) -> ReceivedButtonEvents: ...
+
 
 class KeySource(Protocol):
     def poll(self) -> tuple[str, ...]: ...
@@ -616,63 +629,148 @@ def control_loop(
     successful_updates = 0
     gripper_status_summary = ""
     cycles = 0
+    remote_button_stream_id: str | None = None
+    remote_button_error: str | None = None
+    remote_button_ready = not args.enable_remote_button
     if args.gripper_enabled and grippers is None:
         raise RuntimeError("gripper control is enabled but no receiver is running")
     if initial_idle:
         backend.idle()
     emit(f"Ready in {args.mode} mode. Keys: e engage, d disengage, r re-zero, q quit.")
+    if args.enable_remote_button:
+        emit("Remote GPIO button: tap to engage, hold to quit.")
     debug_log.event("control_loop_start", mode=args.mode, initial_idle=initial_idle)
+
+    def engage(*, rezero: bool, source: str) -> None:
+        nonlocal status_started, successful_updates
+        if args.enable_remote_button and not remote_button_ready:
+            error = remote_button_error or "remote button is not ready"
+            debug_log.event(
+                "engage_refused",
+                cycle=cycles,
+                action="re-zero" if rezero else "engage",
+                source=source,
+                error=error,
+            )
+            emit(f"ENGAGE REFUSED: {error}.")
+            return
+        samples = trackers.snapshot(
+            now=monotonic(),
+            stale_after_seconds=args.tracker_timeout_seconds,
+        )
+        states = backend.read_states()
+        gripper_samples = None
+        if grippers is not None:
+            try:
+                gripper_samples = grippers.snapshot(
+                    now=monotonic(),
+                    stale_after_seconds=args.gripper_timeout_seconds,
+                )
+            except RuntimeError as error:
+                debug_log.event(
+                    "engage_refused",
+                    cycle=cycles,
+                    action="re-zero" if rezero else "engage",
+                    source=source,
+                    error=error,
+                )
+                emit(f"ENGAGE REFUSED: {error}.")
+                return
+        controller.engage(states, samples, gripper_samples)
+        debug_log.event(
+            "engage",
+            cycle=cycles,
+            action="re-zero" if rezero else "engage",
+            source=source,
+            tracker_samples=samples,
+            robot_states=states,
+            gripper_samples=gripper_samples,
+        )
+        status_started = monotonic()
+        successful_updates = 0
+        action = "RE-ZEROED" if rezero else "ENGAGED"
+        suffix = " via GPIO button" if source == "remote_button" else ""
+        emit(f"{action}{suffix}: captured current tracker and robot poses ({args.mode}).")
+
     try:
         while max_cycles is None or cycles < max_cycles:
             cycles += 1
             quit_requested = False
-            for key in keys.poll():
+            remote_engage_requested = False
+            if args.enable_remote_button:
+                assert grippers is not None
+                try:
+                    button_events = grippers.poll_button_events(
+                        now=monotonic(),
+                        stale_after_seconds=args.gripper_timeout_seconds,
+                    )
+                except RuntimeError as error:
+                    message = str(error)
+                    remote_button_ready = False
+                    if remote_button_error is None:
+                        emit(f"REMOTE BUTTON UNAVAILABLE: {message}.")
+                    remote_button_error = message
+                    if controller.engaged:
+                        controller.disengage()
+                        backend.idle()
+                        debug_log.event(
+                            "remote_button_safety_stop",
+                            cycle=cycles,
+                            error=error,
+                        )
+                        emit(
+                            "SAFETY STOP: remote button became unavailable. "
+                            "Both arms returned to gravity compensation."
+                        )
+                else:
+                    if remote_button_error is not None:
+                        emit("REMOTE BUTTON READY.")
+                    remote_button_error = None
+                    remote_button_ready = True
+                    if remote_button_stream_id is None:
+                        remote_button_stream_id = button_events.stream_id
+                    elif button_events.stream_id != remote_button_stream_id:
+                        remote_button_stream_id = button_events.stream_id
+                        if controller.engaged:
+                            controller.disengage()
+                            backend.idle()
+                            emit(
+                                "SAFETY STOP: Pi button stream restarted. "
+                                "Both arms returned to gravity compensation."
+                            )
+                        debug_log.event("remote_button_stream_restart", cycle=cycles)
+                    if button_events.engage_count or button_events.quit_count:
+                        debug_log.event(
+                            "remote_button",
+                            cycle=cycles,
+                            engage_count=button_events.engage_count,
+                            quit_count=button_events.quit_count,
+                            pressed=button_events.pressed,
+                            stream_id=button_events.stream_id,
+                        )
+                    if button_events.quit_count:
+                        quit_requested = True
+                    elif button_events.engage_count and not controller.engaged:
+                        remote_engage_requested = True
+
+            polled_keys = keys.poll()
+            if any(key in {"q", "\x03"} for key in polled_keys):
+                quit_requested = True
+            if quit_requested:
+                debug_log.event("quit", cycle=cycles)
+                return
+
+            for key in polled_keys:
                 debug_log.event("key", cycle=cycles, key=key)
-                if key == "q" or key == "\x03":
-                    quit_requested = True
-                elif key == "d" and controller.engaged:
+                if key == "d" and controller.engaged:
                     controller.disengage()
                     backend.idle()
                     debug_log.event("disengage", cycle=cycles, reason="operator")
                     emit("DISENGAGED: both arms are in gravity compensation.")
                 elif key in {"e", "r"}:
-                    samples = trackers.snapshot(
-                        now=monotonic(),
-                        stale_after_seconds=args.tracker_timeout_seconds,
-                    )
-                    states = backend.read_states()
-                    gripper_samples = None
-                    if grippers is not None:
-                        try:
-                            gripper_samples = grippers.snapshot(
-                                now=monotonic(),
-                                stale_after_seconds=args.gripper_timeout_seconds,
-                            )
-                        except RuntimeError as error:
-                            debug_log.event(
-                                "engage_refused",
-                                cycle=cycles,
-                                action="re-zero" if key == "r" else "engage",
-                                error=error,
-                            )
-                            emit(f"ENGAGE REFUSED: {error}.")
-                            continue
-                    controller.engage(states, samples, gripper_samples)
-                    debug_log.event(
-                        "engage",
-                        cycle=cycles,
-                        action="re-zero" if key == "r" else "engage",
-                        tracker_samples=samples,
-                        robot_states=states,
-                        gripper_samples=gripper_samples,
-                    )
-                    status_started = monotonic()
-                    successful_updates = 0
-                    action = "RE-ZEROED" if key == "r" else "ENGAGED"
-                    emit(f"{action}: captured current tracker and robot poses ({args.mode}).")
-            if quit_requested:
-                debug_log.event("quit", cycle=cycles)
-                return
+                    engage(rezero=key == "r", source="keyboard")
+            if remote_engage_requested and not controller.engaged:
+                engage(rezero=False, source="remote_button")
 
             if controller.engaged:
                 samples = None

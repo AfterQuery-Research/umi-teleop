@@ -7,7 +7,7 @@ import pytest
 
 from umi_teleop_fixed import teleop
 from umi_teleop_fixed.calibration import UmiGripperCalibration
-from umi_teleop_fixed.gripper_receiver import ReceivedGripperSample
+from umi_teleop_fixed.gripper_receiver import ReceivedButtonEvents, ReceivedGripperSample
 from umi_teleop_fixed.robot import DEFAULT_START_POSITION, ZERO_POSITION, ArmState
 from umi_teleop_fixed.teleop import Args, TeleopController, control_loop, run
 from umi_teleop_fixed.trackers import TrackerPose, TrackerSample
@@ -73,6 +73,23 @@ def _umi_calibrations(span_mm=80.0):
         )
         for side in ("left", "right")
     }
+
+
+def _button_events(
+    engage=0,
+    quit=0,
+    *,
+    stream_id="stream-a",
+    pressed=False,
+):
+    return ReceivedButtonEvents(
+        engage_count=engage,
+        quit_count=quit,
+        pressed=pressed,
+        stream_id=stream_id,
+        sender="umi-pi",
+        source_ip="10.0.0.2",
+    )
 
 
 def test_teleop_defaults_to_scene_solving_poser():
@@ -274,10 +291,11 @@ class FakeTrackers:
 
 
 class FakeGrippers:
-    def __init__(self, *, baseline=None, current=None, errors=None):
+    def __init__(self, *, baseline=None, current=None, errors=None, button_events=None):
         self.baseline = baseline or _gripper_samples(received_at=0.0)
         self.current = current or self.baseline
         self.errors = errors or {}
+        self.button_events = list(button_events or [])
 
     def snapshot(self, **_kwargs):
         if isinstance(self.baseline, Exception):
@@ -286,6 +304,14 @@ class FakeGrippers:
 
     def read(self, **_kwargs):
         return self.current, self.errors
+
+    def poll_button_events(self, **_kwargs):
+        if self.button_events:
+            event = self.button_events.pop(0)
+            if isinstance(event, Exception):
+                raise event
+            return event
+        return _button_events()
 
 
 class FakeBackend:
@@ -372,6 +398,118 @@ def test_active_mode_commands_relative_streamed_gripper_widths():
     )
 
     assert backend.commands[0][1] == pytest.approx({"left": 0.5, "right": 0.3})
+
+
+def test_remote_button_tap_engages_and_hold_quits() -> None:
+    backend = FakeBackend()
+    output = []
+    control_loop(
+        _args(
+            "active",
+            gripper_sender_ip="10.0.0.2",
+            enable_remote_button=True,
+        ),
+        backend=backend,
+        trackers=FakeTrackers(),
+        grippers=FakeGrippers(
+            button_events=[_button_events(engage=1), _button_events(quit=1)],
+        ),
+        gripper_calibrations=_umi_calibrations(),
+        keys=FakeKeys([(), ()]),
+        monotonic=lambda: 0.0,
+        sleep=lambda _delay: None,
+        emit=output.append,
+    )
+
+    assert len(backend.commands) == 1
+    assert any("ENGAGED via GPIO button" in line for line in output)
+
+
+def test_remote_button_loss_disengages_an_active_session() -> None:
+    backend = FakeBackend()
+    output = []
+    control_loop(
+        _args(
+            "active",
+            gripper_sender_ip="10.0.0.2",
+            enable_remote_button=True,
+        ),
+        backend=backend,
+        trackers=FakeTrackers(),
+        grippers=FakeGrippers(
+            button_events=[
+                _button_events(engage=1),
+                RuntimeError("Pi button stream is stale"),
+            ],
+        ),
+        gripper_calibrations=_umi_calibrations(),
+        keys=FakeKeys([(), ()]),
+        monotonic=lambda: 0.0,
+        sleep=lambda _delay: None,
+        emit=output.append,
+        max_cycles=2,
+    )
+
+    assert len(backend.commands) == 1
+    assert any("remote button became unavailable" in line for line in output)
+    assert backend.idle_count == 3
+
+
+def test_remote_button_staleness_logs_once_until_recovery() -> None:
+    backend = FakeBackend()
+    output = []
+    control_loop(
+        _args(
+            "dry-run",
+            gripper_sender_ip="10.0.0.2",
+            enable_remote_button=True,
+        ),
+        backend=backend,
+        trackers=FakeTrackers(),
+        grippers=FakeGrippers(
+            button_events=[
+                RuntimeError("Pi button stream is stale (0.501s)"),
+                RuntimeError("Pi button stream is stale (0.518s)"),
+            ],
+        ),
+        gripper_calibrations=_umi_calibrations(),
+        keys=FakeKeys([(), ()]),
+        monotonic=lambda: 0.0,
+        sleep=lambda _delay: None,
+        emit=output.append,
+        max_cycles=2,
+    )
+
+    assert sum("REMOTE BUTTON UNAVAILABLE" in line for line in output) == 1
+
+
+def test_remote_button_stream_restart_disengages_without_replaying_events() -> None:
+    backend = FakeBackend()
+    output = []
+    control_loop(
+        _args(
+            "active",
+            gripper_sender_ip="10.0.0.2",
+            enable_remote_button=True,
+        ),
+        backend=backend,
+        trackers=FakeTrackers(),
+        grippers=FakeGrippers(
+            button_events=[
+                _button_events(engage=1),
+                _button_events(stream_id="stream-b"),
+            ],
+        ),
+        gripper_calibrations=_umi_calibrations(),
+        keys=FakeKeys([(), ()]),
+        monotonic=lambda: 0.0,
+        sleep=lambda _delay: None,
+        emit=output.append,
+        max_cycles=2,
+    )
+
+    assert len(backend.commands) == 1
+    assert any("Pi button stream restarted" in line for line in output)
 
 
 def test_gripper_dropout_freezes_grippers_without_stopping_arms():
@@ -463,6 +601,9 @@ def test_args_reject_duplicate_hardware_ids_and_nonpositive_limits():
     with pytest.raises(ValueError, match="requires --debug"):
         _args(debug_log_path="debug.jsonl").validate()
     _args(gripper_sender_ip="10.0.0.2").validate()
+    with pytest.raises(ValueError, match="requires --gripper-sender-ip"):
+        _args(enable_remote_button=True).validate()
+    _args(gripper_sender_ip="10.0.0.2", enable_remote_button=True).validate()
 
 
 def test_run_integrates_background_tracking_backend_and_active_loop(tmp_path):

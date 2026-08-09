@@ -172,7 +172,7 @@ sudo apt install git v4l-utils
 
 git clone https://github.com/AfterQuery-Research/umi-teleop.git
 cd umi-teleop
-uv sync --no-dev
+uv sync --no-dev --extra pi
 ```
 
 Use stable `/dev/v4l/by-path` camera paths. The repository includes the
@@ -191,15 +191,19 @@ uv run umi-gripper-stream \
     --left-camera "$LEFT_CAMERA" \
     --left-intrinsics calibration/cameras/right-umi-vive-teleop/left.npz \
     --right-camera "$RIGHT_CAMERA" \
-    --right-intrinsics calibration/cameras/right-umi-vive-teleop/right.npz
+    --right-intrinsics calibration/cameras/right-umi-vive-teleop/right.npz \
+    --button-gpio-line "$BUTTON_GPIO_LINE"
 ```
 
+`BUTTON_GPIO_LINE` is a BCM GPIO number; it is `16` on
+`right-umi-vive-teleop`. The active-low button is debounced for 50 ms. A tap is
+classified when released, while a one-second hold produces only a quit event.
 The standard left UMI tags are `2 3`, the standard right UMI tags are `0 1`,
 and UDP port `9130` is the default. Every versioned packet contains the latest
 raw width or `null`, validity, visible tag IDs, sequence number, and monotonic
-age metadata for both sides. Camera loss is therefore explicit and never turns
-into a stale or fabricated command. Use `--duration-seconds N` for a bounded
-hardware test.
+age metadata for both sides, plus cumulative button counters that survive UDP
+packet loss. Camera loss is therefore explicit and never turns into a stale or
+fabricated command. Use `--duration-seconds N` for a bounded hardware test.
 
 On the robot computer, set `UMI_PI_IP` to that Raspberry Pi's IP address and
 validate the same UDP receiver used by teleoperation:
@@ -208,6 +212,8 @@ validate the same UDP receiver used by teleoperation:
 # Run on the robot computer.
 uv run umi-grippers --sender-ip "$UMI_PI_IP"
 ```
+
+The diagnostic prints both gripper widths and GPIO tap/hold events.
 
 Stop the diagnostic before starting `umi-teleop`, because both commands bind
 the same UDP port.
@@ -255,8 +261,11 @@ uv run umi-teleop \
 
 The controls are `e` to engage at the current tracker and robot poses, `d` to
 return both arms to gravity compensation, `r` to re-zero, and `q` to disengage
-and quit. While dry-running, move one tracker at a time and confirm that only
-the corresponding `left` or `right` Cartesian delta changes. The grippers hold
+and quit. With `--enable-remote-button`, tapping the Pi button is equivalent to
+`e` and holding it for one second is equivalent to `q`. A missing, stale, or
+restarted button stream disengages both arms. While dry-running, move one
+tracker at a time and confirm that only the corresponding `left` or `right`
+Cartesian delta changes. The grippers hold
 their measured positions. A stale pose, failed IK, dead robot worker, or
 engage-relative workspace violation disengages both arms.
 
@@ -281,6 +290,7 @@ uv run umi-teleop \
     --max-translation-from-start-m 0.50 \
     --max-rotation-from-start-rad 3.0 \
     --gripper-sender-ip "$UMI_PI_IP" \
+    --enable-remote-button \
     --max-gripper-speed-per-s 4.0 \
     --debug
 ```
@@ -297,6 +307,9 @@ shutdown or Ctrl-C, the program disengages teleoperation and returns both arms
 to the fixed all-zero joint position with both grippers open, independent of
 `--start-position`, before closing. A failed trajectory immediately returns
 both arms to gravity compensation and reports an error.
+
+The GPIO button is a convenience control, not an emergency stop. Holding it to
+quit follows the same commanded zero-return trajectory as `q`.
 
 When gripper streaming is enabled, `e` also captures each raw UMI width and
 measured robot-gripper position. Later width changes are mapped relative to

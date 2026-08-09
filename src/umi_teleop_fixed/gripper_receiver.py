@@ -26,6 +26,23 @@ class ReceivedGripperSample:
 
 
 @dataclass(frozen=True)
+class ReceivedButtonState:
+    pressed: bool
+    engage_count: int
+    quit_count: int
+
+
+@dataclass(frozen=True)
+class ReceivedButtonEvents:
+    engage_count: int
+    quit_count: int
+    pressed: bool
+    stream_id: str
+    sender: str
+    source_ip: str
+
+
+@dataclass(frozen=True)
 class ReceiverStats:
     packets: int
     wrong_source: int
@@ -59,6 +76,12 @@ class GripperReceiver:
         self._stream_id: str | None = None
         self._last_sequence = -1
         self._last_packet_at: float | None = None
+        self._button_state: ReceivedButtonState | None = None
+        self._button_stream_id: str | None = None
+        self._button_sender: str | None = None
+        self._button_source_ip: str | None = None
+        self._pending_engage = 0
+        self._pending_quit = 0
         self._packets = 0
         self._wrong_source = 0
         self._malformed = 0
@@ -134,21 +157,45 @@ class GripperReceiver:
                 )
                 for side in SIDES
             }
+            button = self._decode_button(payload["button"])
         except (KeyError, TypeError, ValueError):
             with self._lock:
                 self._malformed += 1
             return False
 
         with self._lock:
-            if stream_id != self._stream_id:
+            new_stream = stream_id != self._stream_id
+            if new_stream:
                 self._stream_id = stream_id
                 self._last_sequence = -1
                 self._latest.clear()
             if sequence <= self._last_sequence:
                 self._out_of_order += 1
                 return False
+            if not new_stream:
+                if (button is None) != (self._button_state is None):
+                    self._malformed += 1
+                    return False
+                if button is not None and self._button_state is not None:
+                    if (
+                        button.engage_count < self._button_state.engage_count
+                        or button.quit_count < self._button_state.quit_count
+                    ):
+                        self._malformed += 1
+                        return False
+                    self._pending_engage += (
+                        button.engage_count - self._button_state.engage_count
+                    )
+                    self._pending_quit += button.quit_count - self._button_state.quit_count
+            else:
+                self._pending_engage = 0
+                self._pending_quit = 0
             self._last_sequence = sequence
             self._last_packet_at = received_at
+            self._button_state = button
+            self._button_stream_id = stream_id
+            self._button_sender = sender
+            self._button_source_ip = source_ip
             self._packets += 1
             for side, sample in samples.items():
                 if sample is None:
@@ -156,6 +203,26 @@ class GripperReceiver:
                 else:
                     self._latest[side] = sample
         return True
+
+    @staticmethod
+    def _decode_button(value: object) -> ReceivedButtonState | None:
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise ValueError("button must be an object or null")
+        pressed = value.get("pressed")
+        engage_count = value.get("engage_count")
+        quit_count = value.get("quit_count")
+        if not isinstance(pressed, bool):
+            raise ValueError("button pressed must be boolean")
+        for name, count in (("engage_count", engage_count), ("quit_count", quit_count)):
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise ValueError(f"button {name} must be a non-negative integer")
+        return ReceivedButtonState(
+            pressed=pressed,
+            engage_count=engage_count,
+            quit_count=quit_count,
+        )
 
     @staticmethod
     def _decode_sample(
@@ -210,6 +277,35 @@ class GripperReceiver:
         if errors:
             raise RuntimeError("; ".join(errors[side] for side in SIDES if side in errors))
         return samples
+
+    def poll_button_events(
+        self, *, now: float, stale_after_seconds: float
+    ) -> ReceivedButtonEvents:
+        """Return each cumulative GPIO action exactly once despite UDP packet loss."""
+        if not math.isfinite(stale_after_seconds) or stale_after_seconds <= 0:
+            raise ValueError("button stale_after_seconds must be positive")
+        with self._lock:
+            if self._last_packet_at is None:
+                raise RuntimeError("no Pi packets received")
+            age = now - self._last_packet_at
+            if age > stale_after_seconds:
+                raise RuntimeError(f"Pi button stream is stale ({age:.3f}s)")
+            if self._button_state is None:
+                raise RuntimeError("Pi stream does not contain a GPIO button")
+            assert self._button_stream_id is not None
+            assert self._button_sender is not None
+            assert self._button_source_ip is not None
+            events = ReceivedButtonEvents(
+                engage_count=self._pending_engage,
+                quit_count=self._pending_quit,
+                pressed=self._button_state.pressed,
+                stream_id=self._button_stream_id,
+                sender=self._button_sender,
+                source_ip=self._button_source_ip,
+            )
+            self._pending_engage = 0
+            self._pending_quit = 0
+            return events
 
     def read(
         self, *, now: float, stale_after_seconds: float
