@@ -161,11 +161,16 @@ must load them and never recalibrate implicitly.
 
 ## UMI gripper cameras
 
-The Pi streams physical gripper widths in millimetres; it does not normalize
-them or command the robot. Use stable `/dev/v4l/by-path` camera paths and each
-camera's fisheye calibration:
+Run `umi-gripper-stream` on the UMI gripper Raspberry Pi: the computer
+physically connected to both gripper cameras. Clone and install this repository
+on that Pi, use stable `/dev/v4l/by-path` camera paths and each camera's fisheye
+calibration, and set `ROBOT_COMPUTER` to the robot computer's reachable IP
+address or hostname. The Pi measures both physical gripper widths in
+millimetres and streams them to the robot computer over UDP; it never commands
+the robot directly.
 
 ```bash
+# Run on the UMI gripper Raspberry Pi.
 uv run umi-gripper-stream \
     --target-host "$ROBOT_COMPUTER" \
     --left-camera "$LEFT_CAMERA" \
@@ -181,9 +186,11 @@ age metadata for both sides. Camera loss is therefore explicit and never turns
 into a stale or fabricated command. Use `--duration-seconds N` for a bounded
 hardware test.
 
-On the robot computer, validate the same UDP receiver used by teleoperation:
+On the robot computer, set `UMI_PI_IP` to that Raspberry Pi's IP address and
+validate the same UDP receiver used by teleoperation:
 
 ```bash
+# Run on the robot computer.
 uv run umi-grippers --sender-ip "$UMI_PI_IP"
 ```
 
@@ -194,6 +201,7 @@ Calibrate the physical closed/open span after camera setup changes, or whenever
 the UMI gripper geometry changes:
 
 ```bash
+# Run on the robot computer while umi-gripper-stream remains active on the Pi.
 uv run umi-calibrate-umi-grippers \
     --robot-id "$ROBOT_ID" \
     --sender-ip "$UMI_PI_IP"
