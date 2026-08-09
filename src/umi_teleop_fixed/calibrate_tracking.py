@@ -47,7 +47,7 @@ class Args:
     tracker_serial: str
     """One visible Vive tracker used for both calibration stages."""
 
-    expected_lighthouses: int = 2
+    expected_lighthouses: int
     """Number of powered Lighthouses that must be solved."""
 
     lighthouse_timeout_seconds: float = 60.0

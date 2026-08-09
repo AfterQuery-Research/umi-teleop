@@ -141,6 +141,7 @@ def test_combined_run_automatically_advances_and_saves_a_paired_frame(
         calibrate_tracking.Args(
             robot_id="robot-01",
             tracker_serial="TRACKER",
+            expected_lighthouses=2,
             config_path=config_path,
             gesture_timeout_seconds=5.0,
             minimum_motion_m=0.08,
@@ -197,6 +198,7 @@ def test_combined_run_retries_directions_without_repeating_lighthouse_solve(
         calibrate_tracking.Args(
             robot_id="robot-01",
             tracker_serial="TRACKER",
+            expected_lighthouses=2,
             config_path=config_path,
             gesture_timeout_seconds=5.0,
             minimum_motion_m=0.08,
@@ -220,6 +222,7 @@ def test_args_keep_stability_and_center_thresholds_separate():
         calibrate_tracking.Args(
             robot_id="robot",
             tracker_serial="TRACKER",
+            expected_lighthouses=2,
             stable_radius_m=0.04,
             center_return_radius_m=0.03,
         ).validate()

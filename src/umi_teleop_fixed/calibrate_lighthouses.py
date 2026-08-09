@@ -39,6 +39,9 @@ class Args:
     tracker_serial: str
     """Vive tracker serial used to validate the calibration, such as LHR-1234ABCD."""
 
+    expected_lighthouses: int
+    """Number of powered lighthouses that must be solved."""
+
     timeout_seconds: float = 30.0
     """Maximum time allowed to find and solve all expected lighthouses."""
 
@@ -47,9 +50,6 @@ class Args:
 
     min_tracker_rate_hz: float = 20.0
     """Minimum acceptable pose update rate for the selected tracker."""
-
-    expected_lighthouses: int = 2
-    """Number of powered lighthouses that must be solved."""
 
     libsurvive_path: Path | None = None
     """Path to libsurvive.so when it is not installed in a standard path."""

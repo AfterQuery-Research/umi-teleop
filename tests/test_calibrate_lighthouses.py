@@ -80,6 +80,7 @@ def test_calibration_atomically_installs_fresh_candidate(tmp_path):
     status = calibrate_lighthouses.run(
         calibrate_lighthouses.Args(
             tracker_serial="LEFT",
+            expected_lighthouses=2,
             timeout_seconds=2.0,
             settle_seconds=0.3,
             min_tracker_rate_hz=1.0,
@@ -109,6 +110,7 @@ def test_failed_calibration_preserves_existing_config(tmp_path):
         calibrate_lighthouses.run(
             calibrate_lighthouses.Args(
                 tracker_serial="LEFT",
+                expected_lighthouses=2,
                 timeout_seconds=0.5,
                 settle_seconds=0.1,
                 min_tracker_rate_hz=1.0,
@@ -144,6 +146,7 @@ def test_calibration_uses_only_the_required_tracker(tmp_path):
         calibrate_lighthouses.run(
             calibrate_lighthouses.Args(
                 tracker_serial="SELECTED",
+                expected_lighthouses=2,
                 timeout_seconds=2.0,
                 settle_seconds=0.3,
                 min_tracker_rate_hz=1.0,
@@ -193,7 +196,13 @@ def test_calibration_supports_three_lighthouses(tmp_path):
 
 def test_calibration_args_require_tracker_and_supported_lighthouse_count():
     for args, message in (
-        (calibrate_lighthouses.Args(tracker_serial=" "), "tracker_serial"),
+        (
+            calibrate_lighthouses.Args(
+                tracker_serial=" ",
+                expected_lighthouses=2,
+            ),
+            "tracker_serial",
+        ),
         (
             calibrate_lighthouses.Args(tracker_serial="TRACKER", expected_lighthouses=9),
             "between 2 and 8",

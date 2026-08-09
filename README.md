@@ -37,7 +37,8 @@ calibration with one tracker visible to every Lighthouse:
 ```bash
 uv run umi-calibrate-tracking \
     --robot-id YOUR_ROBOT_ID \
-    --tracker-serial TRACKER_SERIAL
+    --tracker-serial TRACKER_SERIAL \
+    --expected-lighthouses LIGHTHOUSE_COUNT
 ```
 
 First keep the tracker stationary while MPFIT solves the Lighthouse poses. The
@@ -50,11 +51,12 @@ then advances automatically. No key presses, measuring, or counting are needed.
 The six directions align Lighthouse-world axes with robot-base axes; the robot
 never connects or moves during this process.
 
-The command expects two Lighthouses by default. For a larger SteamVR 2.0 setup,
-pass `--expected-lighthouses N` (libsurvive supports up to eight safely through
-its current MPFIT calibration path). Lighthouse geometry and the directional
-frame are paired, so teleoperation refuses a stale frame after a new Lighthouse
-solve. The Lighthouses must not move between calibration and teleoperation.
+`--expected-lighthouses` is required and must match the number of powered base
+stations in the tracking area. Values from two through eight are supported by
+libsurvive's current MPFIT calibration path. Lighthouse geometry and the
+directional frame are paired, so teleoperation refuses a stale frame after a
+new Lighthouse solve. The Lighthouses must not move between calibration and
+teleoperation.
 
 Then discover and validate two live tracker poses:
 
