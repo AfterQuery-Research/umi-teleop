@@ -1264,10 +1264,14 @@ name = "umi-teleop-fixed"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "i2rt" },
     { name = "numpy" },
     { name = "opencv-contrib-python-headless" },
     { name = "tyro" },
+]
+
+[package.optional-dependencies]
+robot = [
+    { name = "i2rt" },
 ]
 
 [package.dev-dependencies]
@@ -1278,11 +1282,12 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "i2rt", git = "https://github.com/AfterQuery-Research/i2rt.git?rev=e599e9db90d644db6efe0b16bb6fd7cb87c4272f" },
+    { name = "i2rt", marker = "extra == 'robot'", git = "https://github.com/AfterQuery-Research/i2rt.git?rev=e599e9db90d644db6efe0b16bb6fd7cb87c4272f" },
     { name = "numpy", specifier = ">=2,<3" },
     { name = "opencv-contrib-python-headless", specifier = ">=4.10,<5" },
     { name = "tyro", specifier = ">=0.9,<2" },
 ]
+provides-extras = ["robot"]
 
 [package.metadata.requires-dev]
 dev = [

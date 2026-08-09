@@ -9,10 +9,14 @@ description = "A small, hardware-first UMI teleoperation stack."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "i2rt @ git+https://github.com/AfterQuery-Research/i2rt.git@e599e9db90d644db6efe0b16bb6fd7cb87c4272f",
     "numpy>=2,<3",
     "opencv-contrib-python-headless>=4.10,<5",
     "tyro>=0.9,<2",
+]
+
+[project.optional-dependencies]
+robot = [
+    "i2rt @ git+https://github.com/AfterQuery-Research/i2rt.git@e599e9db90d644db6efe0b16bb6fd7cb87c4272f",
 ]
 
 [project.scripts]

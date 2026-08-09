@@ -6,12 +6,12 @@ does not import or depend on LeRobot.
 ## Installation
 
 Install [Git](https://git-scm.com/), [uv](https://docs.astral.sh/uv/), and
-Python 3.12 or newer, then create the project environment:
+Python 3.12 or newer, then create the robot-computer environment:
 
 ```bash
 git clone https://github.com/AfterQuery-Research/umi-teleop.git
 cd umi-teleop
-uv sync --dev
+uv sync --dev --extra robot
 ```
 
 ### libsurvive on the robot computer
@@ -162,16 +162,39 @@ must load them and never recalibrate implicitly.
 ## UMI gripper cameras
 
 Run `umi-gripper-stream` on the UMI gripper Raspberry Pi: the computer
-physically connected to both gripper cameras. Clone and install this repository
-on that Pi, use stable `/dev/v4l/by-path` camera paths and each camera's fisheye
-calibration, and set `ROBOT_COMPUTER` to the robot computer's reachable IP
-address or hostname. The Pi measures both physical gripper widths in
-millimetres and streams them to the robot computer over UDP; it never commands
-the robot directly.
+physically connected to both gripper cameras. The Pi requires only the camera
+dependencies, not i2rt, CAN, or libsurvive. Install its environment separately:
 
 ```bash
 # Run on the UMI gripper Raspberry Pi.
-uv run umi-gripper-stream \
+sudo apt update
+sudo apt install curl git v4l-utils
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+git clone https://github.com/AfterQuery-Research/umi-teleop.git
+cd umi-teleop
+"$HOME/.local/bin/uv" sync --no-dev
+```
+
+Use stable `/dev/v4l/by-path` camera paths and each camera's fisheye calibration
+file. Set `ROBOT_COMPUTER` to the robot computer's reachable IP address or
+hostname, then set the four camera values for this Pi:
+
+```bash
+ROBOT_COMPUTER=ROBOT_COMPUTER_IP
+LEFT_CAMERA=/dev/v4l/by-path/LEFT_CAMERA-video-index0
+LEFT_CAMERA_CALIBRATION=/path/to/left-camera-calibration.npz
+RIGHT_CAMERA=/dev/v4l/by-path/RIGHT_CAMERA-video-index0
+RIGHT_CAMERA_CALIBRATION=/path/to/right-camera-calibration.npz
+```
+
+The Pi measures both physical gripper widths in millimetres and streams them to
+the robot computer over UDP; it never commands the robot directly. Keep this
+process running throughout UMI gripper calibration and teleoperation:
+
+```bash
+# Run on the UMI gripper Raspberry Pi.
+"$HOME/.local/bin/uv" run umi-gripper-stream \
     --target-host "$ROBOT_COMPUTER" \
     --left-camera "$LEFT_CAMERA" \
     --left-intrinsics "$LEFT_CAMERA_CALIBRATION" \
