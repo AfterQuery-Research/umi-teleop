@@ -175,16 +175,20 @@ cd umi-teleop
 uv sync --no-dev
 ```
 
-Use stable `/dev/v4l/by-path` camera paths and each camera's fisheye calibration
-file. Set `ROBOT_COMPUTER` to the robot computer's reachable IP address or
-hostname, then set the four camera values for this Pi:
+Use stable `/dev/v4l/by-path` camera paths. The repository includes the
+fisheye intrinsics measured for the two cameras on `right-umi-vive-teleop`.
+These files are specific to that physical camera pair; calibrate and add a new
+device-named directory for a different UMI camera rig. Set `ROBOT_COMPUTER` to
+the robot computer's reachable IP address or hostname, then set the camera
+values for this Pi:
 
 ```bash
 ROBOT_COMPUTER=ROBOT_COMPUTER_IP
 LEFT_CAMERA=/dev/v4l/by-path/LEFT_CAMERA-video-index0
-LEFT_CAMERA_CALIBRATION=/path/to/left-camera-calibration.npz
 RIGHT_CAMERA=/dev/v4l/by-path/RIGHT_CAMERA-video-index0
-RIGHT_CAMERA_CALIBRATION=/path/to/right-camera-calibration.npz
+CAMERA_CALIBRATION_DIR="$PWD/calibration/cameras/right-umi-vive-teleop"
+LEFT_CAMERA_CALIBRATION="$CAMERA_CALIBRATION_DIR/left.npz"
+RIGHT_CAMERA_CALIBRATION="$CAMERA_CALIBRATION_DIR/right.npz"
 ```
 
 The Pi measures both physical gripper widths in millimetres and streams them to
