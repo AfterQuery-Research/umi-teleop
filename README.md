@@ -14,20 +14,6 @@ cd umi-teleop
 uv sync --dev
 ```
 
-Confirm that the command-line entry points are installed:
-
-```bash
-uv run umi-teleop --help
-uv run umi-setup-can --help
-uv run umi-trackers --help
-```
-
-No `.env` file or global Python installation is required. Hardware support is
-provided by the host system: the robot computer needs Linux SocketCAN and
-libsurvive, while a camera-streaming Pi needs Video4Linux camera devices. The
-following sections configure and validate each subsystem before active robot
-control.
-
 ### libsurvive on the robot computer
 
 `uv sync` does not install libsurvive. On Debian or Ubuntu, install its build
@@ -58,11 +44,6 @@ sudo install -m 0644 "$LIBSURVIVE_SRC/useful_files/81-vive.rules" \
 sudo udevadm control --reload-rules
 sudo udevadm trigger
 ```
-
-The project automatically searches `~/.local/lib/libsurvive.so.0`. A different
-installation can be selected with `--libsurvive-path /path/to/libsurvive.so`.
-Only the robot computer that reads the Vive dongles needs libsurvive; a Pi used
-only for `umi-gripper-stream` does not.
 
 ## Vive trackers
 
