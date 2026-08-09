@@ -12,6 +12,7 @@ from umi_teleop_fixed.calibration import (
 from umi_teleop_fixed.can import CANInterfaceInfo
 from umi_teleop_fixed.robot import (
     DEFAULT_START_POSITION,
+    READY_ARM_JOINTS,
     ArmState,
     DualYamBackend,
     I2RTArm,
@@ -151,6 +152,42 @@ def test_arm_only_i2rt_fk_ik_round_trip():
     assert kinematics.fk(solved) == pytest.approx(pose, abs=5e-4)
 
 
+def test_kinematics_uses_physical_linear_gripper_tcp():
+    from i2rt.robots.get_robot import combine_arm_and_gripper_xml
+    from i2rt.robots.kinematics import Kinematics
+    from i2rt.robots.utils import ArmType, GripperType
+
+    joints = np.asarray(READY_ARM_JOINTS)
+    actual = YamKinematics().fk(joints)
+    linear_path = combine_arm_and_gripper_xml(ArmType.YAM, GripperType.LINEAR_4310)
+    expected = Kinematics(linear_path, "grasp_site").fk(np.append(joints, (0.0, 0.0)))
+    no_gripper_path = combine_arm_and_gripper_xml(ArmType.YAM, GripperType.NO_GRIPPER)
+    wrong_tcp = Kinematics(no_gripper_path, "grasp_site").fk(joints)
+
+    assert actual == pytest.approx(expected)
+    assert np.linalg.norm(actual[:3, 3] - wrong_tcp[:3, 3]) > 0.1
+
+
+def test_ready_pose_has_a_convergent_cartesian_neighborhood():
+    kinematics = YamKinematics()
+    joints = np.asarray(READY_ARM_JOINTS)
+    pose = kinematics.fk(joints)
+
+    for offset in (
+        (0.005, 0.0, 0.0),
+        (-0.005, 0.0, 0.0),
+        (0.0, 0.005, 0.0),
+        (0.0, -0.005, 0.0),
+        (0.0, 0.0, 0.005),
+        (0.0, 0.0, -0.005),
+        (0.003, -0.002, 0.004),
+    ):
+        target = pose.copy()
+        target[:3, 3] += offset
+        solved = kinematics.ik(target, joints)
+        assert kinematics.fk(solved) == pytest.approx(target, abs=5e-4)
+
+
 def test_i2rt_arm_rejects_state_when_a_control_worker_has_died():
     dead_thread = SimpleNamespace(name="CAN worker", is_alive=lambda: False)
     live_thread = SimpleNamespace(name="server", is_alive=lambda: True)
@@ -201,7 +238,7 @@ def test_move_to_position_bounds_steps_and_verifies_both_arms():
             if side == "left"
             else np.asarray(DEFAULT_START_POSITION[7:])
         )
-    assert arms["left"].joints == pytest.approx(np.zeros(6))
+    assert arms["left"].joints == pytest.approx(READY_ARM_JOINTS)
     assert arms["right"].gripper == pytest.approx(1.0)
 
 

@@ -4,11 +4,14 @@ import numpy as np
 import pytest
 
 from umi_teleop_fixed.se3 import (
+    matrix_to_rpy_degrees,
     pose_matrix,
     rate_limit_pose,
     rotation_distance,
+    rpy_degrees_to_matrix,
     scaled_relative_target,
     workspace_error,
+    world_frame_delta,
 )
 
 
@@ -46,6 +49,64 @@ def test_relative_mapping_scales_translation_and_rotation():
 
     assert target[:3, 3] == pytest.approx((1.1, 2.0, 3.0))
     assert rotation_distance(robot_start, target) == pytest.approx(math.pi / 4)
+
+
+def test_zero_rotation_scale_produces_translation_only_target():
+    tracker_start = pose_matrix((0.0, 0.0, 0.0), _z_rotation(0.0))
+    tracker_now = pose_matrix((0.0, 0.0, 0.1), _z_rotation(math.pi / 2))
+    robot_start = pose_matrix((0.3, 0.1, 0.4), _z_rotation(-0.7))
+
+    target = scaled_relative_target(
+        tracker_start,
+        tracker_now,
+        robot_start,
+        translation_scale=0.5,
+        rotation_scale=0.0,
+    )
+
+    assert target[:3, 3] == pytest.approx(robot_start[:3, 3] + (0.0, 0.0, 0.05))
+    assert target[:3, :3] == pytest.approx(robot_start[:3, :3])
+
+
+def test_physical_up_does_not_depend_on_tracker_or_robot_orientation():
+    tracker_start = pose_matrix((1.0, 2.0, 3.0), _z_rotation(math.pi / 2))
+    tracker_up = pose_matrix((1.0, 2.0, 3.05), _z_rotation(math.pi / 2))
+    robot_start = pose_matrix((0.3, 0.1, 0.4), _z_rotation(-0.7))
+
+    delta = world_frame_delta(tracker_start, tracker_up)
+    target = scaled_relative_target(
+        tracker_start,
+        tracker_up,
+        robot_start,
+        translation_scale=1.0,
+        rotation_scale=1.0,
+    )
+
+    assert delta[:3, 3] == pytest.approx((0.0, 0.0, 0.05))
+    assert target[:3, 3] == pytest.approx(robot_start[:3, 3] + (0.0, 0.0, 0.05))
+    assert target[:3, :3] == pytest.approx(robot_start[:3, :3])
+
+
+def test_fixed_basis_maps_tracker_world_axes_to_robot_base_axes():
+    tracker_start = pose_matrix((0.0, 0.0, 0.0), _z_rotation(0.0))
+    tracker_now = pose_matrix((0.1, 0.0, 0.0), _z_rotation(0.0))
+    basis = rpy_degrees_to_matrix((0.0, 0.0, 90.0))
+
+    delta = world_frame_delta(tracker_start, tracker_now, basis)
+
+    assert delta[:3, 3] == pytest.approx((0.0, 0.1, 0.0), abs=1e-9)
+
+
+@pytest.mark.parametrize(
+    "rpy",
+    ((0.0, 0.0, -150.0), (20.0, -30.0, 75.0), (-45.0, 89.0, 120.0)),
+)
+def test_rotation_matrix_round_trips_through_rpy(rpy):
+    rotation = rpy_degrees_to_matrix(rpy)
+
+    reconstructed = rpy_degrees_to_matrix(matrix_to_rpy_degrees(rotation))
+
+    assert reconstructed == pytest.approx(rotation, abs=1e-9)
 
 
 def test_rate_limiter_bounds_one_update():

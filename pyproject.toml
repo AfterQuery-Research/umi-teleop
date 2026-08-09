@@ -15,6 +15,7 @@ dependencies = [
 
 [project.scripts]
 umi-calibrate-gripper = "umi_teleop_fixed.calibrate_gripper:main"
+umi-calibrate-tracking = "umi_teleop_fixed.calibrate_tracking:main"
 umi-setup-can = "umi_teleop_fixed.setup_can:main"
 umi-teleop = "umi_teleop_fixed.teleop:main"
 umi-trackers = "umi_teleop_fixed.trackers:main"

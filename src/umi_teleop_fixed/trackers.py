@@ -17,6 +17,10 @@ from typing import Protocol
 import tyro
 
 from umi_teleop_fixed.calibration import cache_root
+from umi_teleop_fixed.lighthouses import (
+    load_lighthouse_status,
+    require_lighthouse_calibration,
+)
 
 _POSE_EVENT = 3
 _SHUTDOWN_EVENT = 4
@@ -104,6 +108,14 @@ class TrackerReport:
     age_seconds: float
 
 
+@dataclass(frozen=True)
+class TrackerDelta:
+    """Pose displacement from a per-tracker reference sample."""
+
+    translation_mm: tuple[float, float, float]
+    rotation_degrees: float
+
+
 @dataclass
 class _TrackerState:
     role: str | None
@@ -178,19 +190,14 @@ class TrackerMonitor:
                     errors.append(f"no poses received for {role} tracker")
         elif len(reports) != expected_count:
             errors.append(
-                f"expected {expected_count} tracked devices, "
-                f"received poses from {len(reports)}"
+                f"expected {expected_count} tracked devices, received poses from {len(reports)}"
             )
         for report in reports:
             label = report.role or report.pose.serial
             if report.age_seconds > stale_after_seconds:
-                errors.append(
-                    f"{label} tracker pose is stale ({report.age_seconds:.3f}s old)"
-                )
+                errors.append(f"{label} tracker pose is stale ({report.age_seconds:.3f}s old)")
             if report.rate_hz < min_rate_hz:
-                errors.append(
-                    f"{label} tracker update rate is too low ({report.rate_hz:.1f} Hz)"
-                )
+                errors.append(f"{label} tracker update rate is too low ({report.rate_hz:.1f} Hz)")
         return tuple(errors)
 
 
@@ -323,6 +330,36 @@ def _load_libsurvive(path: Path | None) -> ctypes.CDLL:
     )
 
 
+def _libsurvive_arguments(
+    *,
+    config_path: Path,
+    poser: str,
+    disable_calibration: bool,
+    force_calibration: bool,
+    lighthouse_count: int | None = None,
+) -> list[bytes]:
+    if disable_calibration and force_calibration:
+        raise ValueError("calibration cannot be both disabled and forced")
+    if lighthouse_count is not None and lighthouse_count <= 0:
+        raise ValueError("lighthouse_count must be positive")
+    arguments = [
+        b"umi-teleop-fixed",
+        b"-p",
+        poser.encode(),
+        b"-c",
+        os.fsencode(config_path),
+        b"--v",
+        b"0",
+    ]
+    if disable_calibration:
+        arguments.extend((b"--disable-calibrate", b"1"))
+    if force_calibration:
+        arguments.extend((b"--force-calibrate", b"1"))
+    if lighthouse_count is not None:
+        arguments.extend((b"-l", str(lighthouse_count).encode()))
+    return arguments
+
+
 class LibsurviveSource:
     """Minimal ctypes binding to libsurvive's thread-safe event interface."""
 
@@ -332,19 +369,20 @@ class LibsurviveSource:
         library_path: Path | None,
         config_path: Path,
         poser: str,
+        disable_calibration: bool = False,
+        force_calibration: bool = False,
+        lighthouse_count: int | None = None,
     ) -> None:
         self._library = _load_libsurvive(library_path)
         self._configure_functions()
         config_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        arguments = [
-            b"umi-trackers",
-            b"-p",
-            poser.encode(),
-            b"-c",
-            os.fsencode(config_path),
-            b"--v",
-            b"0",
-        ]
+        arguments = _libsurvive_arguments(
+            config_path=config_path,
+            poser=poser,
+            disable_calibration=disable_calibration,
+            force_calibration=force_calibration,
+            lighthouse_count=lighthouse_count,
+        )
         self._argv = (ctypes.c_char_p * len(arguments))(*arguments)
         self._context = self._library.survive_simple_init(len(arguments), self._argv)
         if not self._context:
@@ -365,9 +403,7 @@ class LibsurviveSource:
             ctypes.POINTER(_SurviveEvent),
         ]
         library.survive_simple_wait_for_event.restype = ctypes.c_int
-        library.survive_simple_get_pose_updated_event.argtypes = [
-            ctypes.POINTER(_SurviveEvent)
-        ]
+        library.survive_simple_get_pose_updated_event.argtypes = [ctypes.POINTER(_SurviveEvent)]
         library.survive_simple_get_pose_updated_event.restype = ctypes.POINTER(_PoseEvent)
         library.survive_simple_object_get_type.argtypes = [ctypes.c_void_p]
         library.survive_simple_object_get_type.restype = ctypes.c_int
@@ -382,16 +418,12 @@ class LibsurviveSource:
         if self._context is None:
             raise RuntimeError("libsurvive source is closed")
         event = _SurviveEvent()
-        event_type = self._library.survive_simple_wait_for_event(
-            self._context, ctypes.byref(event)
-        )
+        event_type = self._library.survive_simple_wait_for_event(self._context, ctypes.byref(event))
         if event_type == _SHUTDOWN_EVENT:
             raise RuntimeError("libsurvive stopped while tracking")
         if event_type != _POSE_EVENT:
             return None
-        updated = self._library.survive_simple_get_pose_updated_event(
-            ctypes.byref(event)
-        )
+        updated = self._library.survive_simple_get_pose_updated_event(ctypes.byref(event))
         if not updated:
             return None
         pose_event = updated.contents
@@ -442,7 +474,7 @@ class Args:
     config_path: Path | None = None
     """Libsurvive configuration path; defaults to the user cache."""
 
-    poser: str = "KalmanOnly"
+    poser: str = "MPFIT"
     """Libsurvive poser plugin."""
 
     def validated_serials(self) -> tuple[str | None, str | None]:
@@ -474,23 +506,93 @@ SourceFactory = Callable[[Args], PoseSource]
 
 
 def _create_source(args: Args) -> PoseSource:
+    config_path = args.resolved_config_path()
+    require_lighthouse_calibration(config_path)
     return LibsurviveSource(
         library_path=args.libsurvive_path,
-        config_path=args.resolved_config_path(),
+        config_path=config_path,
         poser=args.poser,
+        disable_calibration=True,
     )
 
 
-def _format_report(report: TrackerReport) -> str:
+def tracker_delta(pose: TrackerPose, reference: TrackerPose) -> TrackerDelta:
+    """Return translation and shortest rotation displacement from a reference pose."""
+    if pose.serial.casefold() != reference.serial.casefold():
+        raise ValueError("pose and reference must belong to the same tracker")
+    translation_mm = tuple(
+        (current - initial) * 1000.0
+        for current, initial in zip(pose.position, reference.position, strict=True)
+    )
+    dot = sum(
+        current * initial
+        for current, initial in zip(
+            pose.quaternion_wxyz,
+            reference.quaternion_wxyz,
+            strict=True,
+        )
+    )
+    rotation_degrees = math.degrees(2.0 * math.acos(min(1.0, abs(dot))))
+    return TrackerDelta(
+        translation_mm=translation_mm,
+        rotation_degrees=rotation_degrees,
+    )
+
+
+def _lighthouse_position_counts(config_path: Path) -> tuple[int, int] | None:
+    try:
+        status = load_lighthouse_status(config_path)
+    except (RuntimeError, ValueError):
+        return None
+    return status.configured_count, len(status.lighthouses)
+
+
+def _lighthouse_warning(config_path: Path) -> str | None:
+    """Describe an explicitly unsolved lighthouse scene in libsurvive's config."""
+    if counts := _lighthouse_position_counts(config_path):
+        configured, total = counts
+        if configured == total:
+            return None
+        return (
+            "WARNING: libsurvive has world poses for "
+            f"{configured}/{total} lighthouses (PositionSet). "
+            "Absolute and translational tracking are not trustworthy yet."
+        )
+    return None
+
+
+def _format_report(report: TrackerReport, reference: TrackerPose | None = None) -> str:
     pose = report.pose
     label = report.role or "tracker"
     position = " ".join(f"{value:+.4f}" for value in pose.position)
     quaternion = " ".join(f"{value:+.4f}" for value in pose.quaternion_wxyz)
-    return (
+    formatted = (
         f"{label:7} {pose.serial} ({pose.name}) rate={report.rate_hz:6.1f}Hz "
         f"age={report.age_seconds * 1000:5.1f}ms pos=[{position}] "
         f"quat_wxyz=[{quaternion}]"
     )
+    if reference is not None:
+        delta = tracker_delta(pose, reference)
+        translation = " ".join(f"{value:+7.1f}" for value in delta.translation_mm)
+        formatted += f" dxyz_mm=[{translation}] drot={delta.rotation_degrees:6.1f}deg"
+    return formatted
+
+
+def _format_separation(reports: tuple[TrackerReport, ...]) -> str | None:
+    if len(reports) != 2:
+        return None
+    first, second = reports
+    separation_mm = 1000.0 * math.sqrt(
+        sum(
+            (left - right) ** 2
+            for left, right in zip(
+                first.pose.position,
+                second.pose.position,
+                strict=True,
+            )
+        )
+    )
+    return f"tracker separation={separation_mm:.1f}mm"
 
 
 def run(
@@ -503,22 +605,34 @@ def run(
     """Observe tracker poses, enforce health thresholds, and return a final report."""
     left, right = args.validated_serials()
     monitor = TrackerMonitor(left_serial=left, right_serial=right)
+    references: dict[str, TrackerPose] = {}
     started = monotonic()
     deadline = started + args.duration_seconds
     next_print = started + 1.0 / args.print_rate_hz
+
+    if warning := _lighthouse_warning(args.resolved_config_path()):
+        emit(warning)
+    emit("Relative motion is measured from each tracker's first pose (dxyz_mm, drot).")
 
     with closing(source_factory(args)) as source:
         while monotonic() < deadline:
             pose = source.next_pose()
             now = monotonic()
-            if pose is not None:
-                monitor.observe(pose, received_at=now)
+            if pose is not None and monitor.observe(pose, received_at=now):
+                references.setdefault(pose.serial.casefold(), pose)
             if now >= next_print:
-                for report in monitor.reports(now=now):
-                    emit(_format_report(report))
+                reports = monitor.reports(now=now)
+                for report in reports:
+                    emit(_format_report(report, references[report.pose.serial.casefold()]))
+                if separation := _format_separation(reports):
+                    emit(separation)
                 next_print = now + 1.0 / args.print_rate_hz
 
     finished = monotonic()
+    if counts := _lighthouse_position_counts(args.resolved_config_path()):
+        configured, total = counts
+        emit(f"Lighthouse world poses configured: {configured}/{total}.")
+
     errors = monitor.health_errors(
         now=finished,
         expected_count=2,
@@ -531,7 +645,9 @@ def run(
     reports = monitor.reports(now=finished)
     emit("Pose streaming verified:")
     for report in reports:
-        emit(_format_report(report))
+        emit(_format_report(report, references[report.pose.serial.casefold()]))
+    if separation := _format_separation(reports):
+        emit(separation)
     return reports
 
 

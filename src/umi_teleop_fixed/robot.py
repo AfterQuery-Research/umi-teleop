@@ -31,7 +31,10 @@ YAM_JOINT_LIMITS = (
     (-1.5708, 1.5708),
     (-2.0944, 2.0944),
 )
-DEFAULT_START_POSITION = (*([0.0] * 6), 1.0, *([0.0] * 6), 1.0)
+READY_ARM_JOINTS = (0.0, 0.4, 0.8, 0.0, 0.0, 0.0)
+DEFAULT_START_POSITION = (*READY_ARM_JOINTS, 1.0, *READY_ARM_JOINTS, 1.0)
+ZERO_ARM_JOINTS = (0.0,) * 6
+ZERO_POSITION = (*ZERO_ARM_JOINTS, 1.0, *ZERO_ARM_JOINTS, 1.0)
 START_MOVE_STEP_SIZE = 0.01
 START_MOVE_RATE_HZ = 30.0
 START_MOVE_TOLERANCE = 0.035
@@ -63,7 +66,7 @@ class Arm(Protocol):
 
 
 class YamKinematics:
-    """FK/IK for the six arm joints; the gripper is deliberately excluded."""
+    """Six-arm-joint FK/IK at the physical LINEAR_4310 grasp site."""
 
     def __init__(self) -> None:
         try:
@@ -74,17 +77,26 @@ class YamKinematics:
         except ImportError as error:
             raise ImportError("The pinned i2rt dependency is required for robot control") from error
 
-        model_path = combine_arm_and_gripper_xml(ArmType.YAM, GripperType.NO_GRIPPER)
+        model_path = combine_arm_and_gripper_xml(ArmType.YAM, GripperType.LINEAR_4310)
         self._kinematics = Kinematics(model_path, "grasp_site")
         model = mujoco.MjModel.from_xml_path(model_path)
+        if model.nq != 8:
+            raise RuntimeError(
+                f"expected the YAM + LINEAR_4310 model to have 8 coordinates, got {model.nq}"
+            )
         self._joint_limits = np.asarray(model.jnt_range[:6], dtype=np.float64).copy()
 
+    @staticmethod
+    def _model_configuration(joints: object) -> NDArray[np.float64]:
+        """Append fixed finger coordinates required by the physical gripper model."""
+        return np.concatenate((_validated_joints(joints), np.zeros(2, dtype=np.float64)))
+
     def fk(self, joints: NDArray[np.float64]) -> PoseMatrix:
-        values = _validated_joints(joints)
-        return np.asarray(self._kinematics.fk(values), dtype=np.float64).copy()
+        configuration = self._model_configuration(joints)
+        return np.asarray(self._kinematics.fk(configuration), dtype=np.float64).copy()
 
     def ik(self, target: PoseMatrix, seed: NDArray[np.float64]) -> NDArray[np.float64]:
-        initial = _validated_joints(seed)
+        initial = self._model_configuration(seed)
         success, solution = self._kinematics.ik(
             target,
             "grasp_site",
@@ -93,7 +105,10 @@ class YamKinematics:
             pos_threshold=5e-4,
             ori_threshold=5e-4,
         )
-        result = _validated_joints(solution)
+        model_result = np.asarray(solution, dtype=np.float64)
+        if model_result.shape != (8,) or not np.all(np.isfinite(model_result)):
+            raise RuntimeError("YAM + LINEAR_4310 IK must return eight finite coordinates")
+        result = _validated_joints(model_result[:6])
         if not success:
             raise RuntimeError("IK did not converge")
         lower, upper = self._joint_limits[:, 0], self._joint_limits[:, 1]
@@ -300,6 +315,7 @@ class DualYamBackend:
         self,
         position: object,
         *,
+        position_name: str = "start_position",
         step_size: float = START_MOVE_STEP_SIZE,
         rate_hz: float = START_MOVE_RATE_HZ,
         tolerance: float = START_MOVE_TOLERANCE,
@@ -309,6 +325,8 @@ class DualYamBackend:
         emit: Callable[[str], None] = print,
     ) -> None:
         """Smoothly move both arms to one measured, validated joint position."""
+        if not position_name.strip():
+            raise ValueError("position_name must not be empty")
         for name, value in (
             ("step_size", step_size),
             ("rate_hz", rate_hz),
@@ -331,14 +349,14 @@ class DualYamBackend:
             )
             steps = max(1, int(np.ceil(maximum_delta / step_size)))
             emit(
-                f"Moving both arms to start_position in {steps} steps "
+                f"Moving both arms to {position_name} in {steps} steps "
                 f"at {rate_hz:.0f} Hz."
             )
             started = monotonic()
             next_step = started
             for step_index in range(1, steps + 1):
                 if monotonic() - started >= timeout_seconds:
-                    raise TimeoutError("timed out while moving both arms to start_position")
+                    raise TimeoutError(f"timed out while moving both arms to {position_name}")
                 alpha = step_index / steps
                 waypoint_joints = {
                     side: start_joints[side]
@@ -374,11 +392,11 @@ class DualYamBackend:
                 if maximum_error <= tolerance:
                     # Keep the exact target active while waiting for teleoperation.
                     self.command(target_joints, target_grippers)
-                    emit(f"Reached start_position (maximum error {maximum_error:.4f}).")
+                    emit(f"Reached {position_name} (maximum error {maximum_error:.4f}).")
                     return
                 if monotonic() - started >= timeout_seconds:
                     raise TimeoutError(
-                        "both arms did not reach start_position within "
+                        f"both arms did not reach {position_name} within "
                         f"{timeout_seconds:.1f}s (maximum error {maximum_error:.4f})"
                     )
                 self.command(target_joints, target_grippers)

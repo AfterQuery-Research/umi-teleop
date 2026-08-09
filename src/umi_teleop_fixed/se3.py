@@ -85,6 +85,80 @@ def rotation_distance(first: PoseMatrix, second: PoseMatrix) -> float:
     return float(np.linalg.norm(_rotation_vector(relative)))
 
 
+def checked_rotation_matrix(
+    rotation: NDArray[np.float64], name: str = "rotation"
+) -> NDArray[np.float64]:
+    """Return a finite, proper 3-D rotation matrix."""
+    result = np.asarray(rotation, dtype=np.float64)
+    if result.shape != (3, 3) or not np.all(np.isfinite(result)):
+        raise ValueError(f"{name} must be a finite 3x3 matrix")
+    if not np.allclose(result.T @ result, np.eye(3), atol=1e-6, rtol=0.0):
+        raise ValueError(f"{name} must be orthonormal")
+    if not math.isclose(float(np.linalg.det(result)), 1.0, abs_tol=1e-6):
+        raise ValueError(f"{name} must be a proper rotation")
+    return result.copy()
+
+
+def rpy_degrees_to_matrix(rpy_degrees: tuple[float, float, float]) -> NDArray[np.float64]:
+    """Return a fixed input-to-robot basis from extrinsic XYZ roll, pitch, yaw."""
+    values = np.asarray(rpy_degrees, dtype=np.float64)
+    if values.shape != (3,) or not np.all(np.isfinite(values)):
+        raise ValueError("tracker_to_robot_rpy_degrees must contain three finite values")
+    roll, pitch, yaw = np.radians(values)
+    cx, sx = math.cos(roll), math.sin(roll)
+    cy, sy = math.cos(pitch), math.sin(pitch)
+    cz, sz = math.cos(yaw), math.sin(yaw)
+    rotate_x = np.array(((1, 0, 0), (0, cx, -sx), (0, sx, cx)), dtype=np.float64)
+    rotate_y = np.array(((cy, 0, sy), (0, 1, 0), (-sy, 0, cy)), dtype=np.float64)
+    rotate_z = np.array(((cz, -sz, 0), (sz, cz, 0), (0, 0, 1)), dtype=np.float64)
+    return rotate_z @ rotate_y @ rotate_x
+
+
+def matrix_to_rpy_degrees(rotation: NDArray[np.float64]) -> tuple[float, float, float]:
+    """Return extrinsic XYZ roll, pitch, yaw for a proper rotation matrix."""
+    result = checked_rotation_matrix(rotation)
+    pitch = math.asin(float(np.clip(-result[2, 0], -1.0, 1.0)))
+    if abs(math.cos(pitch)) > 1e-8:
+        roll = math.atan2(float(result[2, 1]), float(result[2, 2]))
+        yaw = math.atan2(float(result[1, 0]), float(result[0, 0]))
+    else:
+        # At gimbal lock, choose roll=0 and preserve the observable combined yaw.
+        roll = 0.0
+        yaw = math.atan2(float(-result[0, 1]), float(result[1, 1]))
+    return tuple(math.degrees(value) for value in (roll, pitch, yaw))
+
+
+def world_frame_delta(
+    tracker_at_engage: PoseMatrix,
+    tracker_now: PoseMatrix,
+    input_to_robot_rotation: NDArray[np.float64] | None = None,
+) -> PoseMatrix:
+    """Map tracker-world motion into robot-base axes.
+
+    Translation is ``p - p0`` and rotation is ``R R0.T``. This intentionally
+    avoids ``inv(T0) @ T``, which makes physical motion depend on how the UMI
+    handle happened to be oriented when teleoperation was engaged.
+    """
+    start = np.asarray(tracker_at_engage, dtype=np.float64)
+    current = np.asarray(tracker_now, dtype=np.float64)
+    if start.shape != (4, 4) or current.shape != (4, 4):
+        raise ValueError("tracker poses must be 4x4 matrices")
+    if not np.all(np.isfinite(start)) or not np.all(np.isfinite(current)):
+        raise ValueError("tracker poses must be finite")
+    basis = checked_rotation_matrix(
+        np.eye(3) if input_to_robot_rotation is None else input_to_robot_rotation,
+        "input_to_robot_rotation",
+    )
+    start_rotation = checked_rotation_matrix(start[:3, :3], "engage tracker rotation")
+    current_rotation = checked_rotation_matrix(current[:3, :3], "current tracker rotation")
+
+    delta = np.eye(4, dtype=np.float64)
+    delta[:3, 3] = basis @ (current[:3, 3] - start[:3, 3])
+    tracker_world_rotation = current_rotation @ start_rotation.T
+    delta[:3, :3] = basis @ tracker_world_rotation @ basis.T
+    return delta
+
+
 def scaled_relative_target(
     tracker_at_engage: PoseMatrix,
     tracker_now: PoseMatrix,
@@ -92,15 +166,23 @@ def scaled_relative_target(
     *,
     translation_scale: float,
     rotation_scale: float,
+    input_to_robot_rotation: NDArray[np.float64] | None = None,
 ) -> PoseMatrix:
-    """Apply scaled tracker-local motion to the robot pose captured at engage."""
-    relative = np.linalg.inv(tracker_at_engage) @ tracker_now
-    scaled = np.eye(4, dtype=np.float64)
-    scaled[:3, 3] = relative[:3, 3] * translation_scale
-    scaled[:3, :3] = _rotation_from_vector(
-        _rotation_vector(relative[:3, :3]) * rotation_scale
+    """Apply scaled tracker-world motion to the robot pose captured at engage."""
+    delta = world_frame_delta(
+        tracker_at_engage,
+        tracker_now,
+        input_to_robot_rotation,
     )
-    return robot_at_engage @ scaled
+    scaled_rotation = _rotation_from_vector(
+        _rotation_vector(delta[:3, :3]) * rotation_scale
+    )
+    target = np.asarray(robot_at_engage, dtype=np.float64).copy()
+    if target.shape != (4, 4) or not np.all(np.isfinite(target)):
+        raise ValueError("robot_at_engage must be a finite 4x4 matrix")
+    target[:3, 3] += delta[:3, 3] * translation_scale
+    target[:3, :3] = scaled_rotation @ target[:3, :3]
+    return target
 
 
 def rate_limit_pose(

@@ -10,7 +10,7 @@ import termios
 import time
 import tty
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -19,9 +19,21 @@ import tyro
 from numpy.typing import NDArray
 
 from umi_teleop_fixed.calibration import cache_root
+from umi_teleop_fixed.debug import (
+    DebugRecorder,
+    JsonlDebugRecorder,
+    NullDebugRecorder,
+    timestamped_debug_path,
+)
+from umi_teleop_fixed.lighthouses import (
+    load_lighthouse_calibration_id,
+    require_lighthouse_calibration,
+)
 from umi_teleop_fixed.robot import (
     DEFAULT_START_POSITION,
     SIDES,
+    YAM_JOINT_LIMITS,
+    ZERO_POSITION,
     ArmState,
     DualYamBackend,
     validate_dual_position,
@@ -31,9 +43,11 @@ from umi_teleop_fixed.se3 import (
     pose_matrix,
     rate_limit_pose,
     rotation_distance,
+    rpy_degrees_to_matrix,
     scaled_relative_target,
     workspace_error,
 )
+from umi_teleop_fixed.teleop_frame import load_teleop_frame, teleop_frame_path
 from umi_teleop_fixed.trackers import (
     LibsurviveSource,
     PoseSource,
@@ -74,7 +88,10 @@ class Args:
     """Multiplier for translation relative to the engage pose."""
 
     rotation_scale: float = 1.0
-    """Multiplier for rotation relative to the engage pose."""
+    """Multiplier for rotation relative to engage; use 0 for translation-only control."""
+
+    tracker_to_robot_rpy_degrees: tuple[float, float, float] | None = None
+    """Explicit room-frame override; defaults to the robot's cached calibration."""
 
     max_linear_speed_m_s: float = 0.2
     """Maximum Cartesian target speed per arm."""
@@ -97,8 +114,14 @@ class Args:
     config_path: Path | None = None
     """Libsurvive config path; defaults to the user cache."""
 
-    poser: str = "KalmanOnly"
+    poser: str = "MPFIT"
     """Libsurvive poser plugin."""
+
+    debug: bool = False
+    """Write per-cycle structured telemetry for post-run debugging."""
+
+    debug_log_path: Path | None = None
+    """Debug JSONL destination; defaults to the user cache when --debug is set."""
 
     def validate(self) -> None:
         identifiers = {
@@ -119,7 +142,6 @@ class Args:
         positive = {
             "control_rate_hz": self.control_rate_hz,
             "translation_scale": self.translation_scale,
-            "rotation_scale": self.rotation_scale,
             "max_linear_speed_m_s": self.max_linear_speed_m_s,
             "max_angular_speed_rad_s": self.max_angular_speed_rad_s,
             "max_translation_from_start_m": self.max_translation_from_start_m,
@@ -129,21 +151,51 @@ class Args:
         for name, value in positive.items():
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be positive")
+        if not math.isfinite(self.rotation_scale) or self.rotation_scale < 0:
+            raise ValueError("rotation_scale must be nonnegative")
+        if self.tracker_to_robot_rpy_degrees is not None:
+            rpy_degrees_to_matrix(self.tracker_to_robot_rpy_degrees)
         validate_dual_position(self.start_position)
+        if self.debug_log_path is not None and not self.debug:
+            raise ValueError("debug_log_path requires --debug")
 
     def resolved_config_path(self) -> Path:
         if self.config_path is not None:
             return self.config_path.expanduser()
         return cache_root() / "umi-teleop-fixed" / "libsurvive" / "config.json"
 
+    def resolved_debug_log_path(self) -> Path:
+        if self.debug_log_path is not None:
+            return self.debug_log_path.expanduser()
+        return timestamped_debug_path(cache_root() / "umi-teleop-fixed")
+
+    def resolved_tracker_to_robot_rpy_degrees(self) -> tuple[float, float, float]:
+        if self.tracker_to_robot_rpy_degrees is not None:
+            return self.tracker_to_robot_rpy_degrees
+        require_lighthouse_calibration(self.resolved_config_path())
+        calibration = load_teleop_frame(
+            teleop_frame_path(self.robot_id),
+            expected_robot_id=self.robot_id,
+            expected_lighthouse_calibration_id=load_lighthouse_calibration_id(
+                self.resolved_config_path()
+            ),
+        )
+        return calibration.rpy_degrees
+
 
 @dataclass
 class _EngagedSide:
     tracker_pose: PoseMatrix
     robot_pose: PoseMatrix
+    last_requested: PoseMatrix
     last_target: PoseMatrix
     last_joints: NDArray[np.float64]
+    joint_correction: NDArray[np.float64]
     gripper_position: float
+
+
+JOINT_TRACKING_INTEGRAL_GAIN_PER_SECOND = 1.5
+MAX_JOINT_TRACKING_CORRECTION_RAD = 0.05
 
 
 class TeleopController:
@@ -151,6 +203,11 @@ class TeleopController:
 
     def __init__(self, args: Args) -> None:
         self._args = args
+        if args.tracker_to_robot_rpy_degrees is None:
+            raise RuntimeError("teleop frame must be resolved before constructing the controller")
+        self._input_to_robot_rotation = rpy_degrees_to_matrix(
+            args.tracker_to_robot_rpy_degrees
+        )
         self._engaged: dict[str, _EngagedSide] | None = None
 
     @property
@@ -168,33 +225,40 @@ class TeleopController:
             self._engaged[side] = _EngagedSide(
                 tracker_pose=pose_matrix(tracker.position, tracker.quaternion_wxyz),
                 robot_pose=states[side].ee_pose.copy(),
+                last_requested=states[side].ee_pose.copy(),
                 last_target=states[side].ee_pose.copy(),
                 last_joints=states[side].joint_positions.copy(),
+                joint_correction=np.zeros(6, dtype=np.float64),
                 gripper_position=states[side].gripper_position,
             )
 
     def disengage(self) -> None:
         self._engaged = None
 
-    def propose(
+    def propose_detailed(
         self,
         samples: Mapping[str, TrackerSample],
         *,
         dt: float,
-    ) -> dict[str, PoseMatrix]:
+    ) -> TargetProposal:
         if self._engaged is None:
             raise RuntimeError("teleoperation is not engaged")
-        targets = {}
+        requested_targets = {}
         for side in SIDES:
             baseline = self._engaged[side]
             tracker = samples[side].pose
-            requested = scaled_relative_target(
+            requested_targets[side] = scaled_relative_target(
                 baseline.tracker_pose,
                 pose_matrix(tracker.position, tracker.quaternion_wxyz),
                 baseline.robot_pose,
                 translation_scale=self._args.translation_scale,
                 rotation_scale=self._args.rotation_scale,
+                input_to_robot_rotation=self._input_to_robot_rotation,
             )
+        command_targets = {}
+        for side in SIDES:
+            baseline = self._engaged[side]
+            requested = requested_targets[side]
             error = workspace_error(
                 baseline.robot_pose,
                 requested,
@@ -202,15 +266,24 @@ class TeleopController:
                 max_rotation_rad=self._args.max_rotation_from_start_rad,
             )
             if error is not None:
-                raise RuntimeError(f"{side} tracker target left the safe workspace: {error}")
-            targets[side] = rate_limit_pose(
+                raise WorkspaceViolation(side, error, requested_targets)
+            command_targets[side] = rate_limit_pose(
                 baseline.last_target,
                 requested,
                 dt=dt,
                 max_linear_speed_m_s=self._args.max_linear_speed_m_s,
                 max_angular_speed_rad_s=self._args.max_angular_speed_rad_s,
             )
-        return targets
+        return TargetProposal(requested=requested_targets, command=command_targets)
+
+    def propose(
+        self,
+        samples: Mapping[str, TrackerSample],
+        *,
+        dt: float,
+    ) -> dict[str, PoseMatrix]:
+        """Return only rate-limited targets for simple callers and tests."""
+        return self.propose_detailed(samples, dt=dt).command
 
     def seeds(self) -> dict[str, NDArray[np.float64]]:
         if self._engaged is None:
@@ -222,14 +295,72 @@ class TeleopController:
             raise RuntimeError("teleoperation is not engaged")
         return {side: self._engaged[side].gripper_position for side in SIDES}
 
+    def validate_measured_workspace(self, states: Mapping[str, ArmState]) -> None:
+        """Stop if feedback shows that a physical TCP has left the engage workspace."""
+        if self._engaged is None:
+            raise RuntimeError("teleoperation is not engaged")
+        for side in SIDES:
+            error = workspace_error(
+                self._engaged[side].robot_pose,
+                states[side].ee_pose,
+                max_translation_m=self._args.max_translation_from_start_m,
+                max_rotation_rad=self._args.max_rotation_from_start_rad,
+            )
+            if error is not None:
+                raise RuntimeError(f"{side} measured physical TCP left the safe workspace: {error}")
+
+    def compensated_joint_commands(
+        self,
+        desired: Mapping[str, NDArray[np.float64]],
+        states: Mapping[str, ArmState],
+        *,
+        dt: float,
+    ) -> dict[str, NDArray[np.float64]]:
+        """Close the steady-state joint-error loop around i2rt's position controller."""
+        if self._engaged is None:
+            raise RuntimeError("teleoperation is not engaged")
+        if not math.isfinite(dt) or dt <= 0:
+            raise ValueError("dt must be positive")
+        limits = np.asarray(YAM_JOINT_LIMITS, dtype=np.float64)
+        commands = {}
+        for side in SIDES:
+            target = np.asarray(desired[side], dtype=np.float64)
+            measured = np.asarray(states[side].joint_positions, dtype=np.float64)
+            if target.shape != (6,) or measured.shape != (6,):
+                raise RuntimeError("joint compensation requires six arm joints per side")
+            engaged = self._engaged[side]
+            engaged.joint_correction += (
+                JOINT_TRACKING_INTEGRAL_GAIN_PER_SECOND * dt * (target - measured)
+            )
+            engaged.joint_correction = np.clip(
+                engaged.joint_correction,
+                -MAX_JOINT_TRACKING_CORRECTION_RAD,
+                MAX_JOINT_TRACKING_CORRECTION_RAD,
+            )
+            commands[side] = np.clip(
+                target + engaged.joint_correction,
+                limits[:, 0],
+                limits[:, 1],
+            )
+        return commands
+
+    def joint_corrections(self) -> dict[str, NDArray[np.float64]]:
+        if self._engaged is None:
+            raise RuntimeError("teleoperation is not engaged")
+        return {side: self._engaged[side].joint_correction.copy() for side in SIDES}
+
     def commit(
         self,
         targets: Mapping[str, PoseMatrix],
         joint_targets: Mapping[str, NDArray[np.float64]],
+        *,
+        requested_targets: Mapping[str, PoseMatrix] | None = None,
     ) -> None:
         if self._engaged is None:
             raise RuntimeError("teleoperation is not engaged")
         for side in SIDES:
+            requested = targets[side] if requested_targets is None else requested_targets[side]
+            self._engaged[side].last_requested = requested.copy()
             self._engaged[side].last_target = targets[side].copy()
             self._engaged[side].last_joints = joint_targets[side].copy()
 
@@ -240,11 +371,46 @@ class TeleopController:
         summaries = []
         for side in SIDES:
             state = self._engaged[side]
-            delta_mm = (state.last_target[:3, 3] - state.robot_pose[:3, 3]) * 1000.0
-            rotation_deg = math.degrees(rotation_distance(state.robot_pose, state.last_target))
-            vector = ",".join(f"{value:+.1f}" for value in delta_mm)
-            summaries.append(f"{side} dxyz_mm=[{vector}] drot={rotation_deg:.1f}deg")
+            requested_mm = (
+                state.last_requested[:3, 3] - state.robot_pose[:3, 3]
+            ) * 1000.0
+            command_mm = (state.last_target[:3, 3] - state.robot_pose[:3, 3]) * 1000.0
+            requested_rotation = math.degrees(
+                rotation_distance(state.robot_pose, state.last_requested)
+            )
+            command_rotation = math.degrees(
+                rotation_distance(state.robot_pose, state.last_target)
+            )
+            requested_vector = ",".join(f"{value:+.1f}" for value in requested_mm)
+            command_vector = ",".join(f"{value:+.1f}" for value in command_mm)
+            summaries.append(
+                f"{side} request_mm=[{requested_vector}] request_rot={requested_rotation:.1f}deg "
+                f"command_mm=[{command_vector}] command_rot={command_rotation:.1f}deg"
+            )
         return "  ".join(summaries)
+
+
+@dataclass(frozen=True)
+class TargetProposal:
+    """Raw engage-relative requests and their rate-limited command targets."""
+
+    requested: dict[str, PoseMatrix]
+    command: dict[str, PoseMatrix]
+
+
+class WorkspaceViolation(RuntimeError):
+    """A rejected request carrying the targets needed for post-run diagnosis."""
+
+    def __init__(
+        self,
+        side: str,
+        detail: str,
+        requested_targets: Mapping[str, PoseMatrix],
+    ) -> None:
+        super().__init__(f"{side} tracker target left the safe workspace: {detail}")
+        self.requested_targets = {
+            name: target.copy() for name, target in requested_targets.items()
+        }
 
 
 class Backend(Protocol):
@@ -309,9 +475,11 @@ def control_loop(
     emit: Callable[[str], None] = print,
     max_cycles: int | None = None,
     initial_idle: bool = True,
+    debug_recorder: DebugRecorder | None = None,
 ) -> None:
     """Run an already-connected system; dependency injection keeps E2E tests deterministic."""
     controller = TeleopController(args)
+    debug_log = debug_recorder or NullDebugRecorder()
     period = 1.0 / args.control_rate_hz
     next_tick = monotonic()
     status_started = next_tick
@@ -320,16 +488,19 @@ def control_loop(
     if initial_idle:
         backend.idle()
     emit(f"Ready in {args.mode} mode. Keys: e engage, d disengage, r re-zero, q quit.")
+    debug_log.event("control_loop_start", mode=args.mode, initial_idle=initial_idle)
     try:
         while max_cycles is None or cycles < max_cycles:
             cycles += 1
             quit_requested = False
             for key in keys.poll():
+                debug_log.event("key", cycle=cycles, key=key)
                 if key == "q" or key == "\x03":
                     quit_requested = True
                 elif key == "d" and controller.engaged:
                     controller.disengage()
                     backend.idle()
+                    debug_log.event("disengage", cycle=cycles, reason="operator")
                     emit("DISENGAGED: both arms are in gravity compensation.")
                 elif key in {"e", "r"}:
                     samples = trackers.snapshot(
@@ -338,27 +509,72 @@ def control_loop(
                     )
                     states = backend.read_states()
                     controller.engage(states, samples)
+                    debug_log.event(
+                        "engage",
+                        cycle=cycles,
+                        action="re-zero" if key == "r" else "engage",
+                        tracker_samples=samples,
+                        robot_states=states,
+                    )
                     status_started = monotonic()
                     successful_updates = 0
                     action = "RE-ZEROED" if key == "r" else "ENGAGED"
                     emit(f"{action}: captured current tracker and robot poses ({args.mode}).")
             if quit_requested:
+                debug_log.event("quit", cycle=cycles)
                 return
 
             if controller.engaged:
+                samples = None
+                states = None
                 try:
                     samples = trackers.snapshot(
                         now=monotonic(),
                         stale_after_seconds=args.tracker_timeout_seconds,
                     )
-                    backend.read_states()
-                    targets = controller.propose(samples, dt=period)
-                    joints = backend.solve_ik(targets, controller.seeds())
+                    states = backend.read_states()
+                    seeds = controller.seeds()
+                    proposal = controller.propose_detailed(samples, dt=period)
+                    controller.validate_measured_workspace(states)
+                    joints = backend.solve_ik(proposal.command, seeds)
+                    grippers = controller.grippers()
+                    joint_commands = (
+                        controller.compensated_joint_commands(joints, states, dt=period)
+                        if args.mode == "active"
+                        else {side: joints[side].copy() for side in SIDES}
+                    )
+                    debug_log.event(
+                        "control_update",
+                        cycle=cycles,
+                        tracker_samples=samples,
+                        robot_states=states,
+                        requested_targets=proposal.requested,
+                        command_targets=proposal.command,
+                        ik_seeds=seeds,
+                        ik_solutions=joints,
+                        joint_commands=joint_commands,
+                        joint_corrections=controller.joint_corrections(),
+                        gripper_targets=grippers,
+                        command_requested=args.mode == "active",
+                    )
                     if args.mode == "active":
-                        backend.command(joints, controller.grippers())
-                    controller.commit(targets, joints)
+                        backend.command(joint_commands, grippers)
+                        debug_log.event("command_sent", cycle=cycles)
+                    controller.commit(
+                        proposal.command,
+                        joints,
+                        requested_targets=proposal.requested,
+                    )
                     successful_updates += 1
                 except (RuntimeError, ValueError) as error:
+                    debug_log.event(
+                        "safety_stop",
+                        cycle=cycles,
+                        error=error,
+                        tracker_samples=samples,
+                        robot_states=states,
+                        requested_targets=getattr(error, "requested_targets", None),
+                    )
                     controller.disengage()
                     backend.idle()
                     emit(f"SAFETY STOP: {error}. Both arms returned to gravity compensation.")
@@ -383,6 +599,7 @@ def control_loop(
     finally:
         controller.disengage()
         backend.idle()
+        debug_log.event("control_loop_end", cycles=cycles)
 
 
 BackendFactory = Callable[[Args], DualYamBackend]
@@ -399,14 +616,17 @@ def _create_backend(args: Args) -> DualYamBackend:
 
 
 def _create_source(args: Args) -> PoseSource:
+    config_path = args.resolved_config_path()
+    require_lighthouse_calibration(config_path)
     return LibsurviveSource(
         library_path=args.libsurvive_path,
-        config_path=args.resolved_config_path(),
+        config_path=config_path,
         poser=args.poser,
+        disable_calibration=True,
     )
 
 
-def run(
+def _run_session(
     args: Args,
     *,
     backend_factory: BackendFactory = _create_backend,
@@ -415,9 +635,9 @@ def run(
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     emit: Callable[[str], None] = print,
+    debug_recorder: DebugRecorder,
 ) -> None:
-    """Validate live tracking before connecting both robot arms."""
-    args.validate()
+    """Run one already-validated session with an open debug recorder."""
     source = source_factory(args)
     with TrackerReader(
         source,
@@ -443,7 +663,7 @@ def run(
         with backend_factory(args) as backend:
             if args.mode == "dry-run":
                 emit(
-                    "Dry-run validated start_position; startup and teardown trajectories "
+                    "Dry-run validated start_position; startup and zero-return trajectories "
                     "will not send commands."
                 )
                 with keyboard_factory() as keyboard:
@@ -455,14 +675,17 @@ def run(
                         monotonic=monotonic,
                         sleep=sleep,
                         emit=emit,
+                        debug_recorder=debug_recorder,
                     )
             else:
+                debug_recorder.event("move_to_start_begin", position=args.start_position)
                 backend.move_to_position(
                     args.start_position,
                     monotonic=monotonic,
                     sleep=sleep,
                     emit=emit,
                 )
+                debug_recorder.event("move_to_start_complete", position=args.start_position)
                 try:
                     with keyboard_factory() as keyboard:
                         control_loop(
@@ -474,15 +697,73 @@ def run(
                             sleep=sleep,
                             emit=emit,
                             initial_idle=False,
+                            debug_recorder=debug_recorder,
                         )
                 finally:
-                    emit("Returning both arms to start_position before shutdown...")
+                    emit("Returning both arms to zero_position before shutdown...")
+                    debug_recorder.event("return_to_zero_begin", position=ZERO_POSITION)
                     backend.move_to_position(
-                        args.start_position,
+                        ZERO_POSITION,
+                        position_name="zero_position",
                         monotonic=monotonic,
                         sleep=sleep,
                         emit=emit,
                     )
+                    debug_recorder.event("return_to_zero_complete", position=ZERO_POSITION)
+
+
+def run(
+    args: Args,
+    *,
+    backend_factory: BackendFactory = _create_backend,
+    source_factory: SourceFactory = _create_source,
+    keyboard_factory: KeyboardFactory = KeyboardInput,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    emit: Callable[[str], None] = print,
+) -> None:
+    """Validate live tracking, run teleoperation, and preserve optional debug telemetry."""
+    args.validate()
+    args = replace(
+        args,
+        tracker_to_robot_rpy_degrees=args.resolved_tracker_to_robot_rpy_degrees(),
+    )
+    debug_recorder: DebugRecorder = (
+        JsonlDebugRecorder(args.resolved_debug_log_path())
+        if args.debug
+        else NullDebugRecorder()
+    )
+
+    def logged_emit(message: str) -> None:
+        emit(message)
+        debug_recorder.event("message", message=message)
+
+    outcome = "completed"
+    try:
+        if debug_recorder.path is not None:
+            logged_emit(f"Debug telemetry: {debug_recorder.path}")
+        debug_recorder.event(
+            "run_start",
+            args=args,
+            lighthouse_config=args.resolved_config_path(),
+        )
+        _run_session(
+            args,
+            backend_factory=backend_factory,
+            source_factory=source_factory,
+            keyboard_factory=keyboard_factory,
+            monotonic=monotonic,
+            sleep=sleep,
+            emit=logged_emit,
+            debug_recorder=debug_recorder,
+        )
+    except BaseException as error:
+        outcome = "error"
+        debug_recorder.event("fatal_error", error=error)
+        raise
+    finally:
+        debug_recorder.event("run_end", outcome=outcome)
+        debug_recorder.close()
 
 
 def main() -> None:

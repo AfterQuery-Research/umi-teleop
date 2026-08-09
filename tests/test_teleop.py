@@ -1,9 +1,12 @@
+import json
+import math
 from dataclasses import dataclass
 
 import numpy as np
 import pytest
 
-from umi_teleop_fixed.robot import DEFAULT_START_POSITION, ArmState
+from umi_teleop_fixed import teleop
+from umi_teleop_fixed.robot import DEFAULT_START_POSITION, ZERO_POSITION, ArmState
 from umi_teleop_fixed.teleop import Args, TeleopController, control_loop, run
 from umi_teleop_fixed.trackers import TrackerPose, TrackerSample
 
@@ -15,6 +18,7 @@ def _args(mode="dry-run", **overrides):
         right_adapter_serial="RIGHT-CAN",
         left_tracker_serial="LEFT-TRACKER",
         right_tracker_serial="RIGHT-TRACKER",
+        tracker_to_robot_rpy_degrees=(0.0, 0.0, 0.0),
         mode=mode,
     )
     values.update(overrides)
@@ -38,10 +42,68 @@ def _samples(x=0.0, received_at=1.0):
 
 
 def _states():
-    return {
-        side: ArmState(np.zeros(6), 0.4, np.eye(4), 1.0)
-        for side in ("left", "right")
-    }
+    return {side: ArmState(np.zeros(6), 0.4, np.eye(4), 1.0) for side in ("left", "right")}
+
+
+def test_teleop_defaults_to_scene_solving_poser():
+    assert _args().poser == "MPFIT"
+
+
+def test_teleop_loads_cached_robot_frame_by_default(monkeypatch, tmp_path):
+    from test_lighthouses import lighthouse_config
+
+    from umi_teleop_fixed.lighthouses import save_new_lighthouse_calibration_id
+    from umi_teleop_fixed.teleop_frame import (
+        TeleopFrameCalibration,
+        save_teleop_frame,
+        teleop_frame_path,
+    )
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    args = _args(tracker_to_robot_rpy_degrees=None)
+    config_path = args.resolved_config_path()
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(lighthouse_config())
+    calibration_id = save_new_lighthouse_calibration_id(config_path)
+    path = teleop_frame_path("robot")
+    save_teleop_frame(
+        path,
+        robot_id="robot",
+        calibration=TeleopFrameCalibration(
+            rpy_degrees=(0.0, 0.0, -150.0),
+            calibrated_at_utc="2026-08-08T23:40:00+00:00",
+            source="test",
+            lighthouse_calibration_id=calibration_id,
+        ),
+    )
+
+    assert args.resolved_tracker_to_robot_rpy_degrees() == (0.0, 0.0, -150.0)
+
+
+def test_explicit_robot_frame_does_not_require_cached_calibration(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+
+    args = _args(tracker_to_robot_rpy_degrees=(0.0, 0.0, 30.0))
+
+    assert args.resolved_tracker_to_robot_rpy_degrees() == (0.0, 0.0, 30.0)
+
+
+def test_teleop_requires_and_freezes_lighthouse_calibration(monkeypatch, tmp_path):
+    captured = {}
+    checked = []
+
+    class Source:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(teleop, "require_lighthouse_calibration", checked.append)
+    monkeypatch.setattr(teleop, "LibsurviveSource", Source)
+    config_path = tmp_path / "config.json"
+
+    teleop._create_source(_args(config_path=config_path))
+
+    assert checked == [config_path]
+    assert captured["disable_calibration"] is True
 
 
 def test_controller_captures_a_no_jump_baseline_and_rate_limits():
@@ -49,12 +111,33 @@ def test_controller_captures_a_no_jump_baseline_and_rate_limits():
     controller.engage(_states(), _samples())
 
     initial = controller.propose(_samples(), dt=0.1)
-    moved = controller.propose(_samples(x=0.1), dt=0.1)
+    moved = controller.propose_detailed(_samples(x=0.1), dt=0.1)
 
     assert initial["left"] == pytest.approx(np.eye(4))
-    assert moved["left"][0, 3] == pytest.approx(0.02)
-    controller.commit(moved, controller.seeds())
-    assert "left dxyz_mm=[+20.0,+0.0,+0.0]" in controller.motion_summary()
+    assert moved.command["left"][0, 3] == pytest.approx(0.02)
+    controller.commit(
+        moved.command,
+        controller.seeds(),
+        requested_targets=moved.requested,
+    )
+    summary = controller.motion_summary()
+    assert "left request_mm=[+100.0,+0.0,+0.0]" in summary
+    assert "command_mm=[+20.0,+0.0,+0.0]" in summary
+
+
+def test_controller_applies_fixed_tracker_to_robot_basis():
+    controller = TeleopController(
+        _args(
+            control_rate_hz=10.0,
+            max_linear_speed_m_s=1.0,
+            tracker_to_robot_rpy_degrees=(0.0, 0.0, 90.0),
+        )
+    )
+    controller.engage(_states(), _samples())
+
+    moved = controller.propose(_samples(x=0.1), dt=0.1)
+
+    assert moved["left"][:3, 3] == pytest.approx((0.0, 0.1, 0.0), abs=1e-9)
 
 
 def test_controller_rejects_target_outside_engage_workspace():
@@ -63,6 +146,28 @@ def test_controller_rejects_target_outside_engage_workspace():
 
     with pytest.raises(RuntimeError, match="safe workspace"):
         controller.propose(_samples(x=0.31), dt=1 / 60)
+
+
+def test_controller_compensates_steady_joint_tracking_error_with_a_bound():
+    controller = TeleopController(_args())
+    states = _states()
+    controller.engage(states, _samples())
+    desired = {side: np.full(6, 0.1) for side in ("left", "right")}
+
+    commands = controller.compensated_joint_commands(desired, states, dt=1.0)
+
+    assert commands["left"] == pytest.approx(np.full(6, 0.15))
+    assert controller.joint_corrections()["right"] == pytest.approx(np.full(6, 0.05))
+
+
+def test_controller_checks_the_measured_physical_tcp_workspace():
+    controller = TeleopController(_args(max_translation_from_start_m=0.3))
+    controller.engage(_states(), _samples())
+    moved = _states()
+    moved["right"].ee_pose[0, 3] = 0.31
+
+    with pytest.raises(RuntimeError, match="measured physical TCP"):
+        controller.validate_measured_workspace(moved)
 
 
 @dataclass
@@ -153,6 +258,20 @@ def test_active_mode_commands_only_after_both_ik_solutions():
 def test_stale_tracker_disengages_both_arms():
     backend = FakeBackend()
     output = []
+
+    class Recorder:
+        path = None
+
+        def __init__(self):
+            self.events = []
+
+        def event(self, event_type, **values):
+            self.events.append((event_type, values))
+
+        def close(self):
+            pass
+
+    recorder = Recorder()
     control_loop(
         _args("active"),
         backend=backend,
@@ -161,11 +280,13 @@ def test_stale_tracker_disengages_both_arms():
         monotonic=lambda: 0.0,
         sleep=lambda _delay: None,
         emit=output.append,
+        debug_recorder=recorder,
     )
 
     assert backend.commands == []
     assert backend.idle_count == 3
     assert any("SAFETY STOP" in line and "stale" in line for line in output)
+    assert any(event == "safety_stop" for event, _values in recorder.events)
 
 
 def test_args_reject_duplicate_hardware_ids_and_nonpositive_limits():
@@ -177,9 +298,16 @@ def test_args_reject_duplicate_hardware_ids_and_nonpositive_limits():
         _args(control_rate_hz=0).validate()
     with pytest.raises(ValueError, match="14 finite"):
         _args(start_position=(0.0,) * 13).validate()
+    _args(rotation_scale=0.0).validate()
+    with pytest.raises(ValueError, match="rotation_scale"):
+        _args(rotation_scale=-0.1).validate()
+    with pytest.raises(ValueError, match="three finite"):
+        _args(tracker_to_robot_rpy_degrees=(0.0, math.nan, 0.0)).validate()
+    with pytest.raises(ValueError, match="requires --debug"):
+        _args(debug_log_path="debug.jsonl").validate()
 
 
-def test_run_integrates_background_tracking_backend_and_active_loop():
+def test_run_integrates_background_tracking_backend_and_active_loop(tmp_path):
     import time
 
     class CyclingSource:
@@ -220,7 +348,7 @@ def test_run_integrates_background_tracking_backend_and_active_loop():
     )
 
     assert len(backend.commands) == 1
-    assert backend.move_calls == [DEFAULT_START_POSITION, DEFAULT_START_POSITION]
+    assert backend.move_calls == [DEFAULT_START_POSITION, ZERO_POSITION]
     assert backend.closed is True
     assert source.closed is True
 
@@ -238,7 +366,7 @@ def test_run_integrates_background_tracking_backend_and_active_loop():
             keyboard_factory=lambda: FailingKeys([]),
             emit=lambda _line: None,
         )
-    assert failing_backend.move_calls == [DEFAULT_START_POSITION, DEFAULT_START_POSITION]
+    assert failing_backend.move_calls == [DEFAULT_START_POSITION, ZERO_POSITION]
     assert failing_backend.closed is True
     assert failing_source.closed is True
 
@@ -253,3 +381,33 @@ def test_run_integrates_background_tracking_backend_and_active_loop():
     )
     assert dry_backend.move_calls == []
     assert dry_backend.commands == []
+
+    debug_path = tmp_path / "teleop-debug.jsonl"
+    debug_source = CyclingSource()
+    debug_backend = FakeBackend()
+    run(
+        _args("active", debug=True, debug_log_path=debug_path),
+        backend_factory=lambda _args: debug_backend,
+        source_factory=lambda _args: debug_source,
+        keyboard_factory=lambda: ContextKeys([("e",), ("q",)]),
+        emit=lambda _line: None,
+    )
+    records = [json.loads(line) for line in debug_path.read_text().splitlines()]
+    events = [record["event"] for record in records]
+    assert debug_path.stat().st_mode & 0o777 == 0o600
+    assert "run_start" in events
+    assert "engage" in events
+    assert "control_update" in events
+    assert "command_sent" in events
+    assert events[-1] == "run_end"
+    update = next(record for record in records if record["event"] == "control_update")
+    assert set(update["tracker_samples"]) == {"left", "right"}
+    assert set(update["robot_states"]) == {"left", "right"}
+    assert set(update["requested_targets"]) == {"left", "right"}
+    assert set(update["command_targets"]) == {"left", "right"}
+    assert set(update["ik_solutions"]) == {"left", "right"}
+    assert set(update["joint_commands"]) == {"left", "right"}
+    assert set(update["joint_corrections"]) == {"left", "right"}
+    return_begin = next(record for record in records if record["event"] == "return_to_zero_begin")
+    assert return_begin["position"] == list(ZERO_POSITION)
+    assert "return_to_zero_complete" in events
