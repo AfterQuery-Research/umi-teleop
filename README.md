@@ -178,18 +178,7 @@ uv sync --no-dev
 Use stable `/dev/v4l/by-path` camera paths. The repository includes the
 fisheye intrinsics measured for the two cameras on `right-umi-vive-teleop`.
 These files are specific to that physical camera pair; calibrate and add a new
-device-named directory for a different UMI camera rig. Set `ROBOT_COMPUTER` to
-the robot computer's reachable IP address or hostname, then set the camera
-values for this Pi:
-
-```bash
-ROBOT_COMPUTER=ROBOT_COMPUTER_IP
-LEFT_CAMERA=/dev/v4l/by-path/LEFT_CAMERA-video-index0
-RIGHT_CAMERA=/dev/v4l/by-path/RIGHT_CAMERA-video-index0
-CAMERA_CALIBRATION_DIR="$PWD/calibration/cameras/right-umi-vive-teleop"
-LEFT_CAMERA_CALIBRATION="$CAMERA_CALIBRATION_DIR/left.npz"
-RIGHT_CAMERA_CALIBRATION="$CAMERA_CALIBRATION_DIR/right.npz"
-```
+device-named directory for a different UMI camera rig.
 
 The Pi measures both physical gripper widths in millimetres and streams them to
 the robot computer over UDP; it never commands the robot directly. Keep this
@@ -198,11 +187,11 @@ process running throughout UMI gripper calibration and teleoperation:
 ```bash
 # Run on the UMI gripper Raspberry Pi.
 uv run umi-gripper-stream \
-    --target-host "$ROBOT_COMPUTER" \
-    --left-camera "$LEFT_CAMERA" \
-    --left-intrinsics "$LEFT_CAMERA_CALIBRATION" \
-    --right-camera "$RIGHT_CAMERA" \
-    --right-intrinsics "$RIGHT_CAMERA_CALIBRATION"
+    --target-host ROBOT_COMPUTER_IP \
+    --left-camera /dev/v4l/by-path/LEFT_CAMERA-video-index0 \
+    --left-intrinsics calibration/cameras/right-umi-vive-teleop/left.npz \
+    --right-camera /dev/v4l/by-path/RIGHT_CAMERA-video-index0 \
+    --right-intrinsics calibration/cameras/right-umi-vive-teleop/right.npz
 ```
 
 The standard left UMI tags are `2 3`, the standard right UMI tags are `0 1`,
