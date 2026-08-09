@@ -128,6 +128,12 @@ uv run umi-setup-can \
     --right-adapter-serial "$RIGHT_CAN"
 ```
 
+Inspect the kernel status and error counters for all CAN interfaces:
+
+```bash
+ip -details -statistics link show type can
+```
+
 Run this after a reboot or adapter replug. Do not start robot control unless
 both links report `UP/LOWER_UP`, `ERROR-ACTIVE`, `1000000`, and `Classic CAN`.
 
