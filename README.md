@@ -168,12 +168,11 @@ dependencies, not i2rt, CAN, or libsurvive. Install its environment separately:
 ```bash
 # Run on the UMI gripper Raspberry Pi.
 sudo apt update
-sudo apt install curl git v4l-utils
-curl -LsSf https://astral.sh/uv/install.sh | sh
+sudo apt install git v4l-utils
 
 git clone https://github.com/AfterQuery-Research/umi-teleop.git
 cd umi-teleop
-"$HOME/.local/bin/uv" sync --no-dev
+uv sync --no-dev
 ```
 
 Use stable `/dev/v4l/by-path` camera paths and each camera's fisheye calibration
@@ -194,7 +193,7 @@ process running throughout UMI gripper calibration and teleoperation:
 
 ```bash
 # Run on the UMI gripper Raspberry Pi.
-"$HOME/.local/bin/uv" run umi-gripper-stream \
+uv run umi-gripper-stream \
     --target-host "$ROBOT_COMPUTER" \
     --left-camera "$LEFT_CAMERA" \
     --left-intrinsics "$LEFT_CAMERA_CALIBRATION" \
