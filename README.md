@@ -3,6 +3,31 @@
 A standalone UMI teleoperation stack for YAM robots. It uses i2rt directly and
 does not import or depend on LeRobot.
 
+## Installation
+
+Install [Git](https://git-scm.com/), [uv](https://docs.astral.sh/uv/), and
+Python 3.12 or newer, then create the project environment:
+
+```bash
+git clone https://github.com/AfterQuery-Research/umi-teleop.git
+cd umi-teleop
+uv sync --dev
+```
+
+Confirm that the command-line entry points are installed:
+
+```bash
+uv run umi-teleop --help
+uv run umi-setup-can --help
+uv run umi-trackers --help
+```
+
+No `.env` file or global Python installation is required. Hardware support is
+provided by the host system: the robot computer needs Linux SocketCAN and
+libsurvive, while a camera-streaming Pi needs Video4Linux camera devices. The
+following sections configure and validate each subsystem before active robot
+control.
+
 ## Vive trackers
 
 Install libsurvive and turn on at least one tracker and all base stations.
