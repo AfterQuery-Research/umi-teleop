@@ -51,6 +51,7 @@ from umi_teleop_fixed.robot import (
 )
 from umi_teleop_fixed.se3 import (
     PoseMatrix,
+    compose_child_pose,
     pose_matrix,
     rate_limit_pose,
     rotation_distance,
@@ -100,6 +101,16 @@ class Args:
 
     rotation_scale: float = 1.0
     """Multiplier for rotation relative to engage; use 0 for translation-only control."""
+
+    tracker_to_tip_translation_m: tuple[float, float, float] = (
+        0.0,
+        -0.08370,
+        0.21395247527,
+    )
+    """Tracker origin to UMI tip in raw HTC tracker-local X/Y/Z axes, in metres."""
+
+    tracker_to_tip_rpy_degrees: tuple[float, float, float] = (0.0, 0.0, 90.0)
+    """Raw HTC tracker frame to UMI X-up, Y-right, Z-forward tip frame."""
 
     tracker_to_robot_rpy_degrees: tuple[float, float, float] | None = None
     """Explicit room-frame override; defaults to the robot's cached calibration."""
@@ -184,6 +195,10 @@ class Args:
                 raise ValueError(f"{name} must be positive")
         if not math.isfinite(self.rotation_scale) or self.rotation_scale < 0:
             raise ValueError("rotation_scale must be nonnegative")
+        tracker_to_tip = np.asarray(self.tracker_to_tip_translation_m, dtype=np.float64)
+        if tracker_to_tip.shape != (3,) or not np.all(np.isfinite(tracker_to_tip)):
+            raise ValueError("tracker_to_tip_translation_m must contain three finite values")
+        rpy_degrees_to_matrix(self.tracker_to_tip_rpy_degrees)
         if self.tracker_to_robot_rpy_degrees is not None:
             rpy_degrees_to_matrix(self.tracker_to_robot_rpy_degrees)
         validate_dual_position(self.start_position)
@@ -259,6 +274,13 @@ class TeleopController:
         self._input_to_robot_rotation = rpy_degrees_to_matrix(
             args.tracker_to_robot_rpy_degrees
         )
+        self._tracker_to_tip_translation = np.asarray(
+            args.tracker_to_tip_translation_m,
+            dtype=np.float64,
+        )
+        self._tracker_to_tip_rotation = rpy_degrees_to_matrix(
+            args.tracker_to_tip_rpy_degrees
+        )
         self._engaged: dict[str, _EngagedSide] | None = None
         self._gripper_calibrations = gripper_calibrations
         if args.gripper_enabled and (
@@ -270,6 +292,14 @@ class TeleopController:
     def engaged(self) -> bool:
         return self._engaged is not None
 
+    def _tracker_tip_pose(self, sample: TrackerSample) -> PoseMatrix:
+        tracker = sample.pose
+        return compose_child_pose(
+            pose_matrix(tracker.position, tracker.quaternion_wxyz),
+            self._tracker_to_tip_translation,
+            self._tracker_to_tip_rotation,
+        )
+
     def engage(
         self,
         states: Mapping[str, ArmState],
@@ -280,10 +310,9 @@ class TeleopController:
             raise RuntimeError("fresh gripper widths are required to engage")
         self._engaged = {}
         for side in SIDES:
-            tracker = samples[side].pose
             gripper_sample = None if gripper_samples is None else gripper_samples[side]
             self._engaged[side] = _EngagedSide(
-                tracker_pose=pose_matrix(tracker.position, tracker.quaternion_wxyz),
+                tracker_pose=self._tracker_tip_pose(samples[side]),
                 robot_pose=states[side].ee_pose.copy(),
                 last_requested=states[side].ee_pose.copy(),
                 last_target=states[side].ee_pose.copy(),
@@ -310,10 +339,9 @@ class TeleopController:
         requested_targets = {}
         for side in SIDES:
             baseline = self._engaged[side]
-            tracker = samples[side].pose
             requested_targets[side] = scaled_relative_target(
                 baseline.tracker_pose,
-                pose_matrix(tracker.position, tracker.quaternion_wxyz),
+                self._tracker_tip_pose(samples[side]),
                 baseline.robot_pose,
                 translation_scale=self._args.translation_scale,
                 rotation_scale=self._args.rotation_scale,

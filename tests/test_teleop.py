@@ -27,7 +27,11 @@ def _args(mode="dry-run", **overrides):
     return Args(**values)
 
 
-def _samples(x=0.0, received_at=1.0):
+def _samples(
+    x=0.0,
+    received_at=1.0,
+    quaternion_wxyz=(1.0, 0.0, 0.0, 0.0),
+):
     return {
         side: TrackerSample(
             TrackerPose(
@@ -35,7 +39,7 @@ def _samples(x=0.0, received_at=1.0):
                 serial=f"{side}-tracker",
                 timestamp=1.0 + x,
                 position=(x, 0.0, 0.0),
-                quaternion_wxyz=(1.0, 0.0, 0.0, 0.0),
+                quaternion_wxyz=quaternion_wxyz,
             ),
             received_at,
         )
@@ -94,6 +98,13 @@ def _button_events(
 
 def test_teleop_defaults_to_scene_solving_poser():
     assert _args().poser == "MPFIT"
+
+
+def test_teleop_uses_measured_raw_htc_to_canonical_umi_tip_transform():
+    args = _args()
+
+    assert args.tracker_to_tip_translation_m == (0.0, -0.08370, 0.21395247527)
+    assert args.tracker_to_tip_rpy_degrees == (0.0, 0.0, 90.0)
 
 
 def test_teleop_loads_cached_robot_frame_by_default(monkeypatch, tmp_path):
@@ -170,6 +181,23 @@ def test_controller_captures_a_no_jump_baseline_and_rate_limits():
     summary = controller.motion_summary()
     assert "left request_mm=[+100.0,+0.0,+0.0]" in summary
     assert "command_mm=[+20.0,+0.0,+0.0]" in summary
+
+
+def test_controller_maps_tracker_rotation_to_tip_translation():
+    controller = TeleopController(
+        _args(
+            rotation_scale=0.0,
+            max_linear_speed_m_s=1.0,
+        )
+    )
+    controller.engage(_states(), _samples())
+    quarter_turn = math.sqrt(0.5)
+    rotated = _samples(quaternion_wxyz=(quarter_turn, 0.0, 0.0, quarter_turn))
+
+    moved = controller.propose(rotated, dt=1.0)
+
+    assert moved["left"][:3, 3] == pytest.approx((0.08370, 0.08370, 0.0), abs=1e-9)
+    assert moved["left"][:3, :3] == pytest.approx(np.eye(3), abs=1e-9)
 
 
 def test_gripper_mapping_is_engage_relative_clamped_and_rate_limited():
@@ -596,6 +624,10 @@ def test_args_reject_duplicate_hardware_ids_and_nonpositive_limits():
     _args(rotation_scale=0.0).validate()
     with pytest.raises(ValueError, match="rotation_scale"):
         _args(rotation_scale=-0.1).validate()
+    with pytest.raises(ValueError, match="tracker_to_tip_translation_m"):
+        _args(tracker_to_tip_translation_m=(0.0, math.nan, 0.2)).validate()
+    with pytest.raises(ValueError, match="three finite"):
+        _args(tracker_to_tip_rpy_degrees=(0.0, math.nan, 90.0)).validate()
     with pytest.raises(ValueError, match="three finite"):
         _args(tracker_to_robot_rpy_degrees=(0.0, math.nan, 0.0)).validate()
     with pytest.raises(ValueError, match="requires --debug"):

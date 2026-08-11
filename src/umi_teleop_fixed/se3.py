@@ -39,6 +39,30 @@ def pose_matrix(
     return result
 
 
+def compose_child_pose(
+    parent_pose: PoseMatrix,
+    parent_to_child_translation: tuple[float, float, float] | NDArray[np.float64],
+    parent_to_child_rotation: NDArray[np.float64],
+) -> PoseMatrix:
+    """Return ``T_world_parent @ T_parent_child`` for one rigid child frame."""
+    parent = np.asarray(parent_pose, dtype=np.float64)
+    translation = np.asarray(parent_to_child_translation, dtype=np.float64)
+    if parent.shape != (4, 4) or not np.all(np.isfinite(parent)):
+        raise ValueError("parent_pose must be a finite 4x4 matrix")
+    if translation.shape != (3,) or not np.all(np.isfinite(translation)):
+        raise ValueError("parent_to_child_translation must contain three finite values")
+    parent_rotation = checked_rotation_matrix(parent[:3, :3], "parent pose rotation")
+    child_rotation = checked_rotation_matrix(
+        parent_to_child_rotation,
+        "parent_to_child_rotation",
+    )
+
+    child = parent.copy()
+    child[:3, :3] = parent_rotation @ child_rotation
+    child[:3, 3] = parent[:3, 3] + parent_rotation @ translation
+    return child
+
+
 def _rotation_vector(rotation: NDArray[np.float64]) -> NDArray[np.float64]:
     """Return the shortest axis-angle vector for a proper rotation matrix."""
     trace = float(np.trace(rotation))
