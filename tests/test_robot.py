@@ -19,6 +19,7 @@ from umi_teleop_fixed.robot import (
     YamKinematics,
     validate_dual_position,
 )
+from umi_teleop_fixed.se3 import rpy_degrees_to_matrix
 
 
 def _ready(name: str, serial: str) -> CANInterfaceInfo:
@@ -168,6 +169,20 @@ def test_kinematics_uses_physical_linear_gripper_tcp():
     assert np.linalg.norm(actual[:3, 3] - wrong_tcp[:3, 3]) > 0.1
 
 
+def test_kinematics_uses_220_mm_umi_compatible_grasp_frame():
+    pose = YamKinematics().fk(np.zeros(6))
+    expected = np.array(
+        [
+            [-0.000003673, 0.000003673, 1.0, 0.330597263],
+            [0.000005307, -1.0, 0.000003673, 0.000001793],
+            [1.0, 0.000005307, 0.000003673, 0.173502620],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+
+    np.testing.assert_allclose(pose, expected, atol=1e-8)
+
+
 def test_ready_pose_has_a_convergent_cartesian_neighborhood():
     kinematics = YamKinematics()
     joints = np.asarray(READY_ARM_JOINTS)
@@ -186,6 +201,29 @@ def test_ready_pose_has_a_convergent_cartesian_neighborhood():
         target[:3, 3] += offset
         solved = kinematics.ik(target, joints)
         assert kinematics.fk(solved) == pytest.approx(target, abs=5e-4)
+
+
+@pytest.mark.parametrize(
+    "rpy_degrees",
+    (
+        (1.0, 0.0, 0.0),
+        (-1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, -1.0, 0.0),
+        (0.0, 0.0, 1.0),
+        (0.0, 0.0, -1.0),
+    ),
+)
+def test_ready_pose_has_a_convergent_rotational_neighborhood(rpy_degrees):
+    kinematics = YamKinematics()
+    joints = np.asarray(READY_ARM_JOINTS)
+    pose = kinematics.fk(joints)
+    target = pose.copy()
+    target[:3, :3] = rpy_degrees_to_matrix(rpy_degrees) @ pose[:3, :3]
+
+    solved = kinematics.ik(target, joints)
+
+    assert kinematics.fk(solved) == pytest.approx(target, abs=5e-4)
 
 
 def test_i2rt_arm_rejects_state_when_a_control_worker_has_died():

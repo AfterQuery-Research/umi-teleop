@@ -20,7 +20,7 @@ pi = [
     "lgpio>=0.2.2.0; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'armv6l' or platform_machine == 'armv7l')",
 ]
 robot = [
-    "i2rt @ git+https://github.com/AfterQuery-Research/i2rt.git@e599e9db90d644db6efe0b16bb6fd7cb87c4272f",
+    "i2rt @ git+https://github.com/AfterQuery-Research/i2rt.git@7ed46f4e4e316133a0c39aa6cf34a73d2718e850",
 ]
 
 [project.scripts]

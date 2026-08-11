@@ -331,6 +331,9 @@ above.
 For a translation-only diagnostic, pass `--rotation-scale 0`; tracker rotation
 is then ignored while tracker translation continues to command the physical
 LINEAR_4310 gripper's `grasp_site`.
+The pinned i2rt model places that grasp site 220 mm from the joint-6 mount and
+uses UMI-compatible tool axes: X up, Y right, and Z forward. FK and IK both use
+this same site, while the gripper opening remains a separate normalized command.
 Run
 `uv run umi-teleop --help` to tune them.
 
