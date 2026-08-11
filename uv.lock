@@ -354,7 +354,7 @@ wheels = [
 [[package]]
 name = "i2rt"
 version = "1.1.2"
-source = { git = "https://github.com/AfterQuery-Research/i2rt.git?rev=e599e9db90d644db6efe0b16bb6fd7cb87c4272f#e599e9db90d644db6efe0b16bb6fd7cb87c4272f" }
+source = { git = "https://github.com/AfterQuery-Research/i2rt.git?rev=7ed46f4e4e316133a0c39aa6cf34a73d2718e850#7ed46f4e4e316133a0c39aa6cf34a73d2718e850" }
 dependencies = [
     { name = "click" },
     { name = "crcmod-plus" },
@@ -1320,7 +1320,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "gpiozero", marker = "extra == 'pi'", specifier = ">=2,<3" },
-    { name = "i2rt", marker = "extra == 'robot'", git = "https://github.com/AfterQuery-Research/i2rt.git?rev=e599e9db90d644db6efe0b16bb6fd7cb87c4272f" },
+    { name = "i2rt", marker = "extra == 'robot'", git = "https://github.com/AfterQuery-Research/i2rt.git?rev=7ed46f4e4e316133a0c39aa6cf34a73d2718e850" },
     { name = "lgpio", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'pi') or (platform_machine == 'armv6l' and sys_platform == 'linux' and extra == 'pi') or (platform_machine == 'armv7l' and sys_platform == 'linux' and extra == 'pi')", specifier = ">=0.2.2.0" },
     { name = "numpy", specifier = ">=2,<3" },
     { name = "opencv-contrib-python-headless", specifier = ">=4.10,<5" },

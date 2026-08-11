@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from umi_teleop_fixed.se3 import (
+    compose_child_pose,
     matrix_to_rpy_degrees,
     pose_matrix,
     rate_limit_pose,
@@ -32,6 +33,64 @@ def test_relative_mapping_has_no_jump_at_engage():
     )
 
     assert target == pytest.approx(robot)
+
+
+def test_composed_child_pose_uses_canonical_umi_axes_and_rotates_lever_arm():
+    tracker_to_tip = (0.0, -0.08370, 0.21395247527)
+    tracker = pose_matrix((0.4, -0.2, 1.1), _z_rotation(math.pi / 2))
+    tracker_to_tip_rotation = rpy_degrees_to_matrix((0.0, 0.0, 90.0))
+
+    tip = compose_child_pose(tracker, tracker_to_tip, tracker_to_tip_rotation)
+
+    assert tip[:3, 3] == pytest.approx((0.48370, -0.2, 1.31395247527), abs=1e-12)
+    assert tip[:3, :3] == pytest.approx(rpy_degrees_to_matrix((0.0, 0.0, 180.0)))
+
+
+def test_identity_tracker_maps_umi_x_up_y_right_z_forward():
+    tip = compose_child_pose(
+        np.eye(4),
+        (0.0, -0.08370, 0.21395247527),
+        rpy_degrees_to_matrix((0.0, 0.0, 90.0)),
+    )
+
+    assert tip[:3, 0] == pytest.approx((0.0, 1.0, 0.0), abs=1e-12)
+    assert tip[:3, 1] == pytest.approx((-1.0, 0.0, 0.0), abs=1e-12)
+    assert tip[:3, 2] == pytest.approx((0.0, 0.0, 1.0), abs=1e-12)
+
+
+def test_composed_child_pose_stays_fixed_when_tracker_rotates_about_tip():
+    tracker_to_tip = np.array((0.0, -0.08370, 0.21395247527))
+    tracker_to_tip_rotation = rpy_degrees_to_matrix((0.0, 0.0, 90.0))
+    fixed_tip = np.array((0.6, -0.3, 0.9))
+    tracker_rotation = pose_matrix((0.0, 0.0, 0.0), _z_rotation(math.pi / 2))[:3, :3]
+    tracker_position = fixed_tip - tracker_rotation @ tracker_to_tip
+    tracker = pose_matrix(tuple(tracker_position), _z_rotation(math.pi / 2))
+
+    tip = compose_child_pose(tracker, tracker_to_tip, tracker_to_tip_rotation)
+
+    assert tip[:3, 3] == pytest.approx(fixed_tip, abs=1e-12)
+
+
+@pytest.mark.parametrize(
+    "translation",
+    ((1.0, 2.0), (1.0, 2.0, math.nan), (1.0, 2.0, math.inf)),
+)
+def test_composed_child_pose_rejects_invalid_translation(translation):
+    with pytest.raises(ValueError, match="three finite values"):
+        compose_child_pose(np.eye(4), translation, np.eye(3))
+
+
+def test_fixed_child_orientation_cancels_from_relative_rotation():
+    tracker_start = pose_matrix((0.0, 0.0, 0.0), _z_rotation(0.3))
+    tracker_now = pose_matrix((0.0, 0.0, 0.0), _z_rotation(0.8))
+    tracker_to_tip_rotation = rpy_degrees_to_matrix((0.0, 0.0, 90.0))
+    tip_start = compose_child_pose(tracker_start, (0.0, 0.0, 0.0), tracker_to_tip_rotation)
+    tip_now = compose_child_pose(tracker_now, (0.0, 0.0, 0.0), tracker_to_tip_rotation)
+
+    tracker_delta = tracker_now[:3, :3] @ tracker_start[:3, :3].T
+    tip_delta = tip_now[:3, :3] @ tip_start[:3, :3].T
+
+    assert tip_delta == pytest.approx(tracker_delta, abs=1e-12)
 
 
 def test_relative_mapping_scales_translation_and_rotation():

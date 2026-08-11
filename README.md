@@ -269,6 +269,16 @@ Cartesian delta changes. The grippers hold
 their measured positions. A stale pose, failed IK, dead robot worker, or
 engage-relative workspace violation disengages both arms.
 
+The controller does not treat the Vive tracker center as the UMI control
+point. It composes each live tracker pose with the measured tracker-to-tip
+translation `[0, -0.08370, 0.21395247527]` metres and a fixed `+90` degree
+rotation about raw tracker Z. The resulting UMI tool frame is exactly X up, Y
+right, and Z forward: `X_UMI = +Y_tracker`, `Y_UMI = -X_tracker`, and
+`Z_UMI = +Z_tracker`. This also makes rotation follow the physical tip's
+lever-arm motion. If the mechanical mount changes, override the transform with
+`--tracker-to-tip-translation-m X Y Z` and
+`--tracker-to-tip-rpy-degrees ROLL PITCH YAW`.
+
 After dry-run validation, enable robot position commands explicitly. This
 responsive example uses a mildly bent start pose, calibrated gripper streaming,
 35 cm/s Cartesian motion, 100 degrees/s rotation, and a 0.25-second commanded
@@ -331,6 +341,9 @@ above.
 For a translation-only diagnostic, pass `--rotation-scale 0`; tracker rotation
 is then ignored while tracker translation continues to command the physical
 LINEAR_4310 gripper's `grasp_site`.
+The pinned i2rt model places that grasp site 220 mm from the joint-6 mount and
+uses UMI-compatible tool axes: X up, Y right, and Z forward. FK and IK both use
+this same site, while the gripper opening remains a separate normalized command.
 Run
 `uv run umi-teleop --help` to tune them.
 
